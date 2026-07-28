@@ -128,12 +128,15 @@ function renderCatalogs() {
   if (!rows.length) { el.innerHTML = '<div class="empty">No catalogs yet.</div>'; return; }
   let html = `<table><thead><tr><th>Title</th><th>Auctioneer</th><th>State</th><th>End Date</th><th>Lot Count</th></tr></thead><tbody>`;
   for (const c of rows) {
+    const lotCountCell = c.was_ever_empty
+      ? `${c.lot_count ?? '—'} <span style="color:var(--amber);font-size:11px;" title="This catalog started with zero lots and later got some added — may still be growing, not necessarily final.">⚠️ may still be growing</span>`
+      : (c.lot_count ?? '—');
     html += `<tr>
       <td>${escapeHtml(c.title)}</td>
       <td class="muted">${escapeHtml(c.auctioneer)}</td>
       <td>${escapeHtml(c.state)}</td>
       <td class="muted">${escapeHtml(c.end_date)}</td>
-      <td>${c.lot_count ?? '—'}</td>
+      <td>${lotCountCell}</td>
     </tr>`;
   }
   html += '</tbody></table>';

@@ -252,10 +252,22 @@ def _ingest_one_catalog(supabase_client, business_id: str, catalog_url: str, raw
         else:
             supabase_client.table("bidspotter_catalog_lots").insert(record).execute()
 
+    # Permanent flag, set once and never cleared: did this catalog ever have an
+    # 'empty' upload attempt before this one, at any point? If so, this catalog
+    # is presumed to potentially still be growing even now that it has real
+    # lots -- e.g. an auction house adds 2 lots today, more expected later.
+    # Checked from auction_pdf_uploads history, since an empty catalog never
+    # gets its own auction_catalogs row in the first place (nothing to flag
+    # until the first real ingest happens here).
+    had_prior_empty = supabase_client.table("auction_pdf_uploads").select("id")\
+        .eq("business_id", business_id).eq("catalog_url", catalog_url).eq("status", "empty").limit(1).execute()
+
     catalog_fields = {k: meta[k] for k in ("title", "auctioneer", "end_date", "state") if meta.get(k)}
-    catalog_existing = supabase_client.table("auction_catalogs").select("id")\
+    catalog_existing = supabase_client.table("auction_catalogs").select("id,was_ever_empty")\
         .eq("business_id", business_id).eq("catalog_url", catalog_url).limit(1).execute()
     catalog_fields.update({"lot_count": len(lots), "lot_count_is_estimate": False, "last_checked_at": now_iso})
+    if had_prior_empty.data or (catalog_existing.data and catalog_existing.data[0].get("was_ever_empty")):
+        catalog_fields["was_ever_empty"] = True  # never write False here -- one-way flag, permanent once set
     if catalog_existing.data:
         supabase_client.table("auction_catalogs").update(catalog_fields).eq("id", catalog_existing.data[0]["id"]).execute()
     else:
@@ -453,7 +465,20 @@ async def api_needs_update():
         existing = latest_by_catalog.get(key)
         if not existing or (u.get("uploaded_at") or "") > (existing.get("uploaded_at") or ""):
             latest_by_catalog[key] = u
-    needs_update = [u for u in latest_by_catalog.values() if u.get("status") == "empty"]
+
+    # Cross-check against the actual current data, not just the upload log --
+    # a catalog that now has real lots (even from an earlier upload attempt,
+    # before a later one came back empty by mistake, or before a parsing bug
+    # got fixed) should never show here, no matter what the log alone says.
+    # Real bug this fixes: a catalog could show as both empty AND appear in
+    # the regular Catalogs list at the same time, because the log and the
+    # actual data could disagree with each other.
+    catalog_rows = supabase_client.table("auction_catalogs").select("catalog_url,lot_count")\
+        .eq("business_id", business_id).execute().data or []
+    has_real_lots = {c["catalog_url"] for c in catalog_rows if (c.get("lot_count") or 0) > 0}
+
+    needs_update = [u for u in latest_by_catalog.values()
+                     if u.get("status") == "empty" and u.get("catalog_url") not in has_real_lots]
     needs_update.sort(key=lambda u: u.get("uploaded_at") or "", reverse=True)
     return {"needs_update": needs_update}
 
