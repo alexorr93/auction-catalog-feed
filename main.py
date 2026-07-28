@@ -35,8 +35,16 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 # a raw UUID being hardcoded here (keeps this file portable/readable without
 # needing to already know an opaque id).
 OWNER_EMAIL = os.getenv("OWNER_EMAIL", "precisionindustrialmail@gmail.com")
-_business_row = supabase.table("businesses").select("id").eq("email", OWNER_EMAIL).single().execute()
-BUSINESS_ID = _business_row.data["id"]
+try:
+    _business_row = supabase.table("businesses").select("id").eq("email", OWNER_EMAIL).single().execute()
+    BUSINESS_ID = _business_row.data["id"]
+except Exception as e:
+    raise RuntimeError(
+        f"Could not find a business with email '{OWNER_EMAIL}' in Supabase -- check that the "
+        f"OWNER_EMAIL env var (or the default in main.py) exactly matches an existing row in the "
+        f"businesses table, and that SUPABASE_URL/SUPABASE_KEY point at the right project. "
+        f"Original error: {e}"
+    )
 print(f"Auction Catalog Feed serving business_id={BUSINESS_ID} ({OWNER_EMAIL})")
 
 app = FastAPI()
