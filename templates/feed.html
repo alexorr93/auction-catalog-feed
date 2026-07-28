@@ -308,9 +308,8 @@ async function uploadPdfFile(file) {
     const r = await fetch('/api/upload-pdf', {method: 'POST', body: fd});
     const data = await r.json();
     if (!r.ok) throw new Error(data.detail || 'Upload failed');
-    line.textContent = data.empty
-      ? `⏳ ${file.name} — auction exists but has no lots yet, added to the Needs Update queue`
-      : `✅ ${file.name} — found ${data.lots_parsed} lot(s)`;
+    line.textContent = `⏳ ${file.name} — queued, processing in the background now (watch the Upload Log below)`;
+    startAutoRefresh();
   } catch(e) {
     line.textContent = `❌ ${file.name} — ${e.message}`;
   } finally {

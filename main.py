@@ -468,6 +468,16 @@ def _process_one_pdf(supabase_client, business_id: str, filename: str, contents:
 
 @app.post("/api/upload-pdf")
 async def upload_pdf(request: Request, background_tasks: BackgroundTasks):
+    """Real bug fixed here: this used to await _process_one_pdf directly,
+    holding the HTTP request open for the entire duration -- fine for a
+    small catalog, but now that Gemini is the sole lot extractor (chunked,
+    possibly several sequential API calls for a large catalog), a real
+    700+ lot PDF can take long enough that Railway's proxy or the browser
+    itself kills the connection mid-request ("Failed to fetch", even though
+    the upload was actually still working server-side). The zip-upload
+    endpoint already solved this by running in the background and letting
+    the Upload Log fill in live -- this now does the exact same thing for
+    a single file, instead of blocking the request on it."""
     supabase_client, business_id = _require_config()
 
     form = await request.form()
@@ -481,18 +491,16 @@ async def upload_pdf(request: Request, background_tasks: BackgroundTasks):
     zip_code = (form.get("zip_code") or "").strip()
 
     contents = await file.read()
-    result = _process_one_pdf(supabase_client, business_id, file.filename, contents,
-                               title, auctioneer, end_date, state, zip_code)
-    if not result.get("ok"):
-        raise HTTPException(500, result.get("error", "Unknown error"))
 
-    if result.get("needs_backfill") and result.get("raw_text"):
-        background_tasks.add_task(_backfill_catalog_metadata, supabase_client, business_id, result["catalog_url"],
-                                   result["raw_text"], file.filename, state, zip_code, end_date)
+    def _run_and_backfill():
+        result = _process_one_pdf(supabase_client, business_id, file.filename, contents,
+                                   title, auctioneer, end_date, state, zip_code)
+        if result.get("needs_backfill") and result.get("raw_text"):
+            _backfill_catalog_metadata(supabase_client, business_id, result["catalog_url"],
+                                        result["raw_text"], file.filename, state, zip_code, end_date)
 
-    result.pop("raw_text", None)
-    result.pop("needs_backfill", None)
-    return result
+    background_tasks.add_task(_run_and_backfill)
+    return {"ok": True, "queued": True, "filename": file.filename}
 
 
 def _process_zip_batch(supabase_client, business_id: str, pdf_entries: list) -> None:
