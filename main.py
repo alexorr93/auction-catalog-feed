@@ -24,33 +24,83 @@ from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from supabase import create_client
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise RuntimeError("SUPABASE_URL and SUPABASE_KEY must be set")
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-# This app serves exactly one business's feed -- there's no login to derive
-# that from, so it's resolved once at startup from a known email instead of
-# a raw UUID being hardcoded here (keeps this file portable/readable without
-# needing to already know an opaque id).
-OWNER_EMAIL = os.getenv("OWNER_EMAIL", "precisionindustrialmail@gmail.com")
-try:
-    _business_row = supabase.table("businesses").select("id").eq("email", OWNER_EMAIL).single().execute()
-    BUSINESS_ID = _business_row.data["id"]
-except Exception as e:
-    raise RuntimeError(
-        f"Could not find a business with email '{OWNER_EMAIL}' in Supabase -- check that the "
-        f"OWNER_EMAIL env var (or the default in main.py) exactly matches an existing row in the "
-        f"businesses table, and that SUPABASE_URL/SUPABASE_KEY point at the right project. "
-        f"Original error: {e}"
-    )
-print(f"Auction Catalog Feed serving business_id={BUSINESS_ID} ({OWNER_EMAIL})")
-
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
 if os.path.isdir("static"):
     app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# --- Startup no longer crashes the whole process, on purpose ---------------
+# The previous version connected to Supabase and looked up the business_id
+# at MODULE IMPORT TIME, raising if anything went wrong -- which kills the
+# entire Python process before it can even bind to a port. Railway then just
+# shows "Crashed" with no way to see why without digging through deploy
+# logs, which turned into a real, frustrating dead end with no way to get
+# that information across reliably.
+#
+# Now: the app object above always comes up, unconditionally, no matter what
+# state the environment is in. Supabase connection + business_id lookup are
+# lazy (done on first real use, not at import time) and cached after that.
+# If something IS misconfigured, every route below returns a clear, plain-
+# English explanation of exactly what's wrong, directly in the response --
+# something you can just read by opening the URL in a browser, no logs, no
+# screenshots, no deploy history digging required ever again for this class
+# of problem.
+_config_error = None
+_supabase_client = None
+_business_id = None
+
+
+def _get_supabase_and_business_id():
+    """Lazily connects to Supabase and resolves the business_id on first use,
+    caching the result (or the error) for every request after that. Never
+    raises -- callers check the returned error string instead."""
+    global _config_error, _supabase_client, _business_id
+    if _supabase_client is not None or _config_error is not None:
+        return _supabase_client, _business_id, _config_error
+
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_key = os.getenv("SUPABASE_KEY")
+    if not supabase_url or not supabase_key:
+        _config_error = (
+            "SUPABASE_URL and/or SUPABASE_KEY environment variables are not set on this "
+            "Railway service. Go to the service's Variables tab and add them (same values "
+            "the main Lister app uses)."
+        )
+        return None, None, _config_error
+
+    try:
+        client = create_client(supabase_url, supabase_key)
+    except Exception as e:
+        _config_error = f"Failed to create the Supabase client -- check that SUPABASE_URL and SUPABASE_KEY are correct. Error: {e}"
+        return None, None, _config_error
+
+    owner_email = os.getenv("OWNER_EMAIL", "precisionindustrialmail@gmail.com")
+    try:
+        row = client.table("businesses").select("id").eq("email", owner_email).single().execute()
+        business_id = row.data["id"]
+    except Exception as e:
+        _config_error = (
+            f"Connected to Supabase, but could not find a business with email '{owner_email}'. "
+            f"Check the OWNER_EMAIL environment variable (or the default in main.py) matches a "
+            f"real row in the businesses table, and that SUPABASE_URL points at the right "
+            f"Supabase project. Error: {e}"
+        )
+        return None, None, _config_error
+
+    _supabase_client = client
+    _business_id = business_id
+    print(f"Auction Catalog Feed serving business_id={business_id} ({owner_email})")
+    return _supabase_client, _business_id, None
+
+
+def _require_config():
+    """Call at the top of every route. Raises a clean HTTP 500 with the exact
+    plain-English reason if Supabase/business_id isn't resolved -- readable
+    directly in the browser or via curl, nothing hidden in server logs."""
+    supabase_client, business_id, error = _get_supabase_and_business_id()
+    if error:
+        raise HTTPException(500, f"Configuration error: {error}")
+    return supabase_client, business_id
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +200,7 @@ Text:
         return {}
 
 
-def _ingest_one_catalog(catalog_url: str, raw_text: str, meta: dict) -> dict:
+def _ingest_one_catalog(supabase_client, business_id: str, catalog_url: str, raw_text: str, meta: dict) -> dict:
     """Writes into bidspotter_catalog_lots (the dedicated table for this feed --
     deliberately separate from auction_lots, which belongs to a different,
     unrelated feature in the main app) plus auction_catalogs for the
@@ -162,7 +212,7 @@ def _ingest_one_catalog(catalog_url: str, raw_text: str, meta: dict) -> dict:
     now_iso = datetime.now(timezone.utc).isoformat()
     for lot in lots:
         record = {
-            "business_id": BUSINESS_ID,
+            "business_id": business_id,
             "catalog_url": catalog_url,
             "lot_number": lot["lot_number"],
             "description": lot["description"],
@@ -171,27 +221,27 @@ def _ingest_one_catalog(catalog_url: str, raw_text: str, meta: dict) -> dict:
             "zip_code": meta.get("zip_code") or None,
             "date": meta.get("end_date") or None,
         }
-        existing = supabase.table("bidspotter_catalog_lots").select("id")\
-            .eq("business_id", BUSINESS_ID).eq("catalog_url", catalog_url).eq("lot_number", lot["lot_number"]).limit(1).execute()
+        existing = supabase_client.table("bidspotter_catalog_lots").select("id")\
+            .eq("business_id", business_id).eq("catalog_url", catalog_url).eq("lot_number", lot["lot_number"]).limit(1).execute()
         if existing.data:
-            supabase.table("bidspotter_catalog_lots").update(record).eq("id", existing.data[0]["id"]).execute()
+            supabase_client.table("bidspotter_catalog_lots").update(record).eq("id", existing.data[0]["id"]).execute()
         else:
-            supabase.table("bidspotter_catalog_lots").insert(record).execute()
+            supabase_client.table("bidspotter_catalog_lots").insert(record).execute()
 
     catalog_fields = {k: meta[k] for k in ("title", "auctioneer", "end_date", "state") if meta.get(k)}
-    catalog_existing = supabase.table("auction_catalogs").select("id")\
-        .eq("business_id", BUSINESS_ID).eq("catalog_url", catalog_url).limit(1).execute()
+    catalog_existing = supabase_client.table("auction_catalogs").select("id")\
+        .eq("business_id", business_id).eq("catalog_url", catalog_url).limit(1).execute()
     catalog_fields.update({"lot_count": len(lots), "lot_count_is_estimate": False, "last_checked_at": now_iso})
     if catalog_existing.data:
-        supabase.table("auction_catalogs").update(catalog_fields).eq("id", catalog_existing.data[0]["id"]).execute()
+        supabase_client.table("auction_catalogs").update(catalog_fields).eq("id", catalog_existing.data[0]["id"]).execute()
     else:
-        catalog_fields.update({"business_id": BUSINESS_ID, "source": "upload", "catalog_url": catalog_url, "first_seen_at": now_iso})
-        supabase.table("auction_catalogs").insert(catalog_fields).execute()
+        catalog_fields.update({"business_id": business_id, "source": "upload", "catalog_url": catalog_url, "first_seen_at": now_iso})
+        supabase_client.table("auction_catalogs").insert(catalog_fields).execute()
 
     return {"catalog_url": catalog_url, "parsed": len(lots)}
 
 
-def _backfill_catalog_metadata(catalog_url: str, raw_text: str, filename: str,
+def _backfill_catalog_metadata(supabase_client, business_id: str, catalog_url: str, raw_text: str, filename: str,
                                  state: str, zip_code: str, end_date: str) -> None:
     """Runs AFTER the upload response has already gone out, as a background
     task -- keeps uploads fast. Fills in whichever of state/zip/date the
@@ -206,28 +256,49 @@ def _backfill_catalog_metadata(catalog_url: str, raw_text: str, filename: str,
         if not end_date and auto_meta.get("end_date"):
             patch["date"] = auto_meta["end_date"]
         if patch:
-            supabase.table("bidspotter_catalog_lots").update(patch)\
-                .eq("business_id", BUSINESS_ID).eq("catalog_url", catalog_url).execute()
+            supabase_client.table("bidspotter_catalog_lots").update(patch)\
+                .eq("business_id", business_id).eq("catalog_url", catalog_url).execute()
     except Exception as e:
         print(f"Background metadata backfill failed for {filename} (lots themselves are unaffected): {e}")
 
 
 # ---------------------------------------------------------------------------
 # Routes -- everything here is intentionally public, no auth of any kind.
+# Every route calls _require_config() first -- if Supabase/business_id isn't
+# resolved, this raises a clean HTTP 500 with the exact plain-English reason,
+# readable directly in a browser. The app process itself never crashes.
 # ---------------------------------------------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
+    _, _, error = _get_supabase_and_business_id()
+    if error:
+        return HTMLResponse(
+            f"<html><body style='font-family:monospace;background:#1a0611;color:#f1f5f9;padding:40px;'>"
+            f"<h2>⚠️ Configuration error</h2><p>{error}</p></body></html>",
+            status_code=500,
+        )
     return templates.TemplateResponse("feed.html", {"request": request})
+
+
+@app.get("/health")
+async def health():
+    """Plain-text health/config check -- open this URL directly any time
+    something seems wrong, before digging through Railway logs at all."""
+    _, business_id, error = _get_supabase_and_business_id()
+    if error:
+        return JSONResponse({"ok": False, "error": error}, status_code=500)
+    return {"ok": True, "business_id": business_id}
 
 
 @app.get("/api/catalogs")
 async def api_catalogs():
+    supabase_client, business_id = _require_config()
     rows = []
     start = 0
     while True:
-        page = supabase.table("auction_catalogs").select("*")\
-            .eq("business_id", BUSINESS_ID).range(start, start + 999).execute().data or []
+        page = supabase_client.table("auction_catalogs").select("*")\
+            .eq("business_id", business_id).range(start, start + 999).execute().data or []
         rows.extend(page)
         if len(page) < 1000:
             break
@@ -237,7 +308,8 @@ async def api_catalogs():
 
 @app.get("/api/lots")
 async def api_lots(catalog_url: str = None):
-    q = supabase.table("bidspotter_catalog_lots").select("*").eq("business_id", BUSINESS_ID)
+    supabase_client, business_id = _require_config()
+    q = supabase_client.table("bidspotter_catalog_lots").select("*").eq("business_id", business_id)
     if catalog_url:
         q = q.eq("catalog_url", catalog_url)
     rows = []
@@ -253,6 +325,8 @@ async def api_lots(catalog_url: str = None):
 
 @app.post("/api/upload-pdf")
 async def upload_pdf(request: Request, background_tasks: BackgroundTasks):
+    supabase_client, business_id = _require_config()
+
     form = await request.form()
     file = form.get("file")
     if not file or not hasattr(file, "read"):
@@ -269,16 +343,16 @@ async def upload_pdf(request: Request, background_tasks: BackgroundTasks):
     catalog_url = catalog_key
 
     log_row = {
-        "business_id": BUSINESS_ID, "filename": file.filename, "status": "processing",
+        "business_id": business_id, "filename": file.filename, "status": "processing",
         "catalog_url": catalog_url, "catalog_title": title,
     }
-    log_res = supabase.table("auction_pdf_uploads").insert(log_row).execute()
+    log_res = supabase_client.table("auction_pdf_uploads").insert(log_row).execute()
     log_id = log_res.data[0]["id"] if log_res.data else None
 
     storage_path = None
     try:
         storage_path = f"{catalog_key}.pdf"
-        supabase.storage.from_("auction-pdfs").upload(
+        supabase_client.storage.from_("auction-pdfs").upload(
             path=storage_path, file=contents,
             file_options={"content-type": "application/pdf", "upsert": "true"}
         )
@@ -306,27 +380,29 @@ async def upload_pdf(request: Request, background_tasks: BackgroundTasks):
             # Not a parse failure -- the auction exists but has no lots posted
             # yet. Its own distinct status, not lumped in with real errors.
             if log_id:
-                supabase.table("auction_pdf_uploads").update({
+                supabase_client.table("auction_pdf_uploads").update({
                     "status": "empty", "storage_path": storage_path, "parsed_lot_count": 0,
                 }).eq("id", log_id).execute()
             return {"ok": True, "lots_parsed": 0, "empty": True, "catalog_url": catalog_url}
 
         meta = {"title": title, "auctioneer": auctioneer, "end_date": end_date, "state": state, "zip_code": zip_code}
-        result = _ingest_one_catalog(catalog_url, "\n".join(f"{l['lot_number']} {l['description']}" for l in lots), meta)
+        result = _ingest_one_catalog(supabase_client, business_id, catalog_url,
+                                      "\n".join(f"{l['lot_number']} {l['description']}" for l in lots), meta)
 
         if log_id:
-            supabase.table("auction_pdf_uploads").update({
+            supabase_client.table("auction_pdf_uploads").update({
                 "status": "success", "storage_path": storage_path, "parsed_lot_count": result.get("parsed", 0),
             }).eq("id", log_id).execute()
 
         if not (state and zip_code and end_date):
-            background_tasks.add_task(_backfill_catalog_metadata, catalog_url, raw_text, file.filename, state, zip_code, end_date)
+            background_tasks.add_task(_backfill_catalog_metadata, supabase_client, business_id, catalog_url,
+                                       raw_text, file.filename, state, zip_code, end_date)
 
         return {"ok": True, "lots_parsed": result.get("parsed", 0), "catalog_url": catalog_url}
 
     except Exception as e:
         if log_id:
-            supabase.table("auction_pdf_uploads").update({
+            supabase_client.table("auction_pdf_uploads").update({
                 "status": "error", "storage_path": storage_path, "error_message": str(e),
             }).eq("id", log_id).execute()
         raise HTTPException(500, str(e))
@@ -334,14 +410,16 @@ async def upload_pdf(request: Request, background_tasks: BackgroundTasks):
 
 @app.get("/api/pdf-uploads")
 async def api_pdf_uploads():
-    res = supabase.table("auction_pdf_uploads").select("*").eq("business_id", BUSINESS_ID)\
+    supabase_client, business_id = _require_config()
+    res = supabase_client.table("auction_pdf_uploads").select("*").eq("business_id", business_id)\
         .order("uploaded_at", desc=True).limit(500).execute()
     return {"uploads": res.data or []}
 
 
 @app.get("/api/needs-update")
 async def api_needs_update():
-    all_uploads = supabase.table("auction_pdf_uploads").select("*").eq("business_id", BUSINESS_ID)\
+    supabase_client, business_id = _require_config()
+    all_uploads = supabase_client.table("auction_pdf_uploads").select("*").eq("business_id", business_id)\
         .order("uploaded_at", desc=True).limit(500).execute().data or []
     latest_by_catalog = {}
     for u in all_uploads:
