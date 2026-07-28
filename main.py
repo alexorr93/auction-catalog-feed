@@ -167,7 +167,15 @@ Return ONLY a JSON array, no other text, in this exact shape:
 Text:
 {chunk}"""
         try:
-            resp = model.generate_content(prompt)
+            # Real bug fixed here: this had no timeout at all -- if the
+            # Gemini call hangs for any reason (network issue, throttling,
+            # anything), there was nothing to make it give up, so the whole
+            # background task (and the catalog it was processing) could sit
+            # stuck indefinitely with zero visible error. 120s is generous
+            # for a single ~80k-char chunk but still finite -- a timeout
+            # here is caught below like any other per-chunk failure and
+            # just skips to the next chunk instead of hanging the catalog.
+            resp = model.generate_content(prompt, request_options={"timeout": 120})
             text = resp.text.strip()
             if text.startswith("```"):
                 text = text.split("```")[1]
@@ -223,7 +231,7 @@ not found -- do not guess):
 Text:
 {raw_text[:20000]}"""
     try:
-        resp = model.generate_content(prompt)
+        resp = model.generate_content(prompt, request_options={"timeout": 60})
         text = resp.text.strip()
         if text.startswith("```"):
             text = text.split("```")[1]
