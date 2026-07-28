@@ -102,12 +102,16 @@ function escapeHtml(s) {
 }
 
 function titleAsLink(title) {
-  // The stored title is usually the original catalog URL with "https://" and
-  // every "/" stripped out (that's how these files get named). Reconstructs
-  // the real, clickable URL from that pattern when it matches; falls back to
-  // plain escaped text otherwise, so this never produces a broken link.
+  // The stored title/filename is usually the original catalog URL with
+  // "https://" and every "/" stripped out (that's how these files get
+  // named), sometimes still carrying a trailing ".pdf" (raw filenames do,
+  // catalog titles usually don't). Strips that extension before matching so
+  // both cases reconstruct correctly, then rebuilds the real, clickable URL.
+  // Falls back to plain escaped text if the pattern doesn't match, so this
+  // never produces a broken link.
   const t = title || '';
-  const m = t.match(/^https(www\.bidspotter\.com)en-usauction-catalogues(.+?)(catalogue-id-.+)$/);
+  const withoutExt = t.replace(/\.pdf$/i, '');
+  const m = withoutExt.match(/^https(www\.bidspotter\.com)en-usauction-catalogues(.+?)(catalogue-id-.+)$/);
   if (m) {
     const url = `https://${m[1]}/en-us/auction-catalogues/${m[2]}/${m[3]}`;
     return `<a href="${url}" target="_blank" rel="noopener noreferrer">${escapeHtml(t)}</a>`;
@@ -269,7 +273,7 @@ async function loadNeedsUpdateQueue() {
     if (!items.length) { el.innerHTML = '<div class="empty">Nothing waiting — every uploaded auction has lots.</div>'; return; }
     let html = `<table><thead><tr><th>File</th><th>First Uploaded Empty</th></tr></thead><tbody>`;
     for (const u of items) {
-      html += `<tr><td>${escapeHtml(u.filename)}</td><td class="muted">${u.uploaded_at ? new Date(u.uploaded_at).toLocaleString() : ''}</td></tr>`;
+      html += `<tr><td>${titleAsLink(u.filename)}</td><td class="muted">${u.uploaded_at ? new Date(u.uploaded_at).toLocaleString() : ''}</td></tr>`;
     }
     html += '</tbody></table>';
     el.innerHTML = html;
