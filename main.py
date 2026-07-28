@@ -112,10 +112,34 @@ def _parse_print_catalog_lots(raw_text: str) -> list:
     """Parses a BidSpotter 'Print Catalog' export's Lot/Description lines into
     structured rows. The regex only needs the lot number to be the first
     token on a line, so cleanly-ordered catalog text (one lot per line)
-    parses reliably."""
+    parses reliably.
+
+    Real bug this fixes: the auctioneer's own address in the header (e.g.
+    "11751 CR 12") matches the exact same "starts with digits, then text"
+    pattern as a real lot line, so an empty catalog with no lots at all was
+    getting a false positive lot_count of 1 from its own street address.
+    Fixed by skipping everything before the "Lot" / "Description" table
+    header that every catalog PDF puts right before the real data -- only
+    text after that boundary is ever considered for lot parsing. Falls back
+    to parsing the whole text if that header marker isn't found, so this
+    doesn't regress any layout that worked before."""
+    lines = [l.strip() for l in raw_text.split("\n")]
+
+    header_end = None
+    for i, line in enumerate(lines):
+        if line.lower() == "lot":
+            # look a few lines ahead for the matching "Description" marker
+            for j in range(i + 1, min(i + 5, len(lines))):
+                if lines[j].lower() == "description":
+                    header_end = j + 1
+                    break
+            if header_end:
+                break
+
+    body_lines = lines[header_end:] if header_end is not None else lines
+
     rows = []
-    for line in raw_text.split("\n"):
-        line = line.strip()
+    for line in body_lines:
         if not line:
             continue
         m = re.match(r'^(\d+[A-Za-z]?)\s+(.+)$', line)
