@@ -142,7 +142,11 @@ def _parse_print_catalog_lots(raw_text: str) -> list:
     for line in body_lines:
         if not line:
             continue
-        m = re.match(r'^(\d+[A-Za-z]?)\s+(.+)$', line)
+        # Broadened from a single-trailing-letter pattern -- real catalogs use
+        # sub-lot numbering like "123.1", "123-A", "123AB" too, none of which
+        # matched before, silently dropping those lots from very large or
+        # detailed catalogs.
+        m = re.match(r'^(\d+(?:[.\-]\d+)*(?:-?[A-Za-z]{1,3})?)\s+(.+)$', line)
         if m:
             rows.append({"lot_number": m.group(1), "description": m.group(2)[:2000]})
     return rows
@@ -153,37 +157,64 @@ def _extract_lots_via_gemini(raw_text: str, filename: str) -> list:
     (built for BidSpotter's own Print Catalog text format) -- asks Gemini to
     pull lot number + description pairs out of arbitrary catalog text
     instead. Only called when the fast, free regex pass finds too few lots
-    to trust."""
+    to trust, or looks like it's severely under-parsing a much larger
+    catalog than that.
+
+    Real bug fixed here: this used to hard-truncate at raw_text[:100000] and
+    call it done in one pass -- fine for a typical catalog, but for a
+    genuinely huge one (e.g. 2000 real lots) that cutoff lands well before
+    the end of the text, silently dropping everything after it. Now chunks
+    the text into ~80k-character pieces (a little under Gemini's practical
+    single-call comfort zone, leaving room for the prompt itself) and runs
+    every chunk, combining and deduping the results by lot_number, instead
+    of only ever seeing the first slice of a large catalog."""
     import google.generativeai as genai
     gemini_key = os.getenv("GEMINI_API_KEY", "")
     if not gemini_key:
         return []
     genai.configure(api_key=gemini_key)
     model = genai.GenerativeModel("gemini-2.5-flash")
-    prompt = f"""This is raw text extracted from an auction catalog PDF named "{filename}".
+
+    chunk_size = 80000
+    chunks = [raw_text[i:i + chunk_size] for i in range(0, len(raw_text), chunk_size)] or [raw_text]
+
+    seen_lot_numbers = set()
+    combined = []
+    for chunk_i, chunk in enumerate(chunks):
+        prompt = f"""This is raw text extracted from an auction catalog PDF named "{filename}"
+(part {chunk_i + 1} of {len(chunks)} -- the catalog is large enough it had to be split).
 Pull out every individual lot as a lot number and its description. Auction catalogs
 list lots sequentially, usually as "LOT ###" or "Lot ###:" or similar, followed by a
 description of the item(s) in that lot. Skip page headers, footers, terms & conditions,
-and anything that isn't an actual lot listing.
+and anything that isn't an actual lot listing. This chunk may start or end mid-lot --
+only include a lot if you can see its full lot number and description within this text.
 
 Return ONLY a JSON array, no other text, in this exact shape:
 [{{"lot_number": "123", "description": "..."}}, ...]
 
 Text:
-{raw_text[:100000]}"""
-    try:
-        resp = model.generate_content(prompt)
-        text = resp.text.strip()
-        if text.startswith("```"):
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-        parsed = json.loads(text.strip())
-        return [{"lot_number": str(r.get("lot_number", "")).strip(), "description": (r.get("description") or "")[:2000]}
-                for r in parsed if r.get("lot_number") and r.get("description")]
-    except Exception as e:
-        print(f"Gemini lot extraction failed for {filename}: {e}")
-        return []
+{chunk}"""
+        try:
+            resp = model.generate_content(prompt)
+            text = resp.text.strip()
+            if text.startswith("```"):
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+            parsed = json.loads(text.strip())
+            for r in parsed:
+                lot_number = str(r.get("lot_number", "")).strip()
+                description = (r.get("description") or "")[:2000]
+                if lot_number and description and lot_number not in seen_lot_numbers:
+                    seen_lot_numbers.add(lot_number)
+                    combined.append({"lot_number": lot_number, "description": description})
+        except Exception as e:
+            print(f"Gemini lot extraction failed for {filename} (chunk {chunk_i + 1}/{len(chunks)}): {e}")
+            # Keep going with whatever other chunks succeed, rather than
+            # losing the whole catalog over one bad chunk
+            continue
+
+    return combined
 
 
 def _extract_catalog_metadata_via_gemini(raw_text: str, filename: str) -> dict:
@@ -431,7 +462,18 @@ def _process_one_pdf(supabase_client, business_id: str, filename: str, contents:
             raise ValueError("No text found in this PDF (may be scanned images with no text layer -- not supported yet)")
 
         lots = _parse_print_catalog_lots(raw_text)
-        if len(lots) < 3:
+        # Real bug fixed here: this used to only fall back to Gemini when
+        # under 3 lots were found -- catches total failures, but not a
+        # catalog that's severely under-parsed while still clearing that low
+        # bar (e.g. 75 real matches out of a catalog with far more lots than
+        # that, judging by how much text there actually is). Added a rough
+        # density check: a catalog with a lot of text should produce
+        # proportionally more matches than this if the regex is actually
+        # catching most of it -- if it's not, treat it the same as finding
+        # too few outright, and let Gemini take a real crack at it too, then
+        # keep whichever result actually found more lots.
+        text_suggests_more_lots = len(raw_text) > 15000 and len(lots) < len(raw_text) / 800
+        if len(lots) < 3 or text_suggests_more_lots:
             gemini_lots = _extract_lots_via_gemini(raw_text, filename)
             if len(gemini_lots) > len(lots):
                 lots = gemini_lots
