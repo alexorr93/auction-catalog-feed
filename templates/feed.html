@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Auction Catalog Feed</title>
+<style>
+:root { --bg: #1a0611; --card: #1e2535; --border: #2d3348; --text: #f1f5f9; --muted: #64748b; --accent: #2563eb; --green: #16a34a; --red: #dc2626; --amber: #eab308; }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { overflow-x: hidden; max-width: 100%; }
+body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+.main { max-width: 1200px; margin: 0 auto; padding: 24px 20px 60px; }
+h1 { font-size: 22px; margin-bottom: 4px; }
+.sub { color: var(--muted); font-size: 13px; margin-bottom: 18px; max-width: 900px; }
+.btn { padding: 9px 16px; border-radius: 8px; border: 1px solid var(--border); background: #1e2535; color: var(--text); font-size: 13px; font-weight: 600; cursor: pointer; }
+.btn-primary { background: var(--accent); border-color: var(--accent); }
+.field-input { background: #fff; color: #111; border: none; border-radius: 8px; padding: 8px 10px; font-size: 13px; }
+table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); font-size: 13px; }
+th { background: #161b29; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .03em; }
+tr:last-child td { border-bottom: none; }
+.muted { color: var(--muted); }
+.status-msg { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+.empty { padding: 30px; text-align: center; color: var(--muted); }
+.tabs { display: flex; gap: 6px; margin-bottom: 16px; }
+.tab-btn { padding: 8px 14px; border-radius: 8px; border: 1px solid var(--border); background: #1e2535; color: var(--muted); font-size: 13px; font-weight: 600; cursor: pointer; }
+.tab-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+</style>
+</head>
+<body>
+<div class="main">
+  <h1>📋 Auction Catalog Feed</h1>
+  <div class="sub">Public view of tracked auction catalogs and lots. Anyone with this link can see and add catalogs — no login required.</div>
+
+  <div style="background:var(--card);border:2px solid var(--accent);border-radius:12px;padding:18px;margin-bottom:22px;">
+    <div style="font-size:16px;font-weight:700;margin-bottom:4px;">📄 Upload a Catalog PDF</div>
+    <div class="sub" style="margin-bottom:14px;">Drop in a catalog PDF and it gets read automatically. Title/auctioneer/date/state are optional — filled in from the PDF itself if left blank.</div>
+    <div id="pdf-drop-zone" style="border:2px dashed var(--border);border-radius:10px;padding:30px;text-align:center;cursor:pointer;margin-bottom:12px;"
+         onclick="document.getElementById('pdf-file-input').click()"
+         ondragover="event.preventDefault();this.style.borderColor='var(--accent)';"
+         ondragleave="this.style.borderColor='var(--border)';"
+         ondrop="handlePdfDrop(event)">
+      <div style="font-size:32px;margin-bottom:6px;">📎</div>
+      <div style="font-weight:600;">Click to choose a PDF, or drag one here</div>
+      <div class="sub" style="margin-top:4px;margin-bottom:0;">One at a time or several at once</div>
+      <input type="file" id="pdf-file-input" accept="application/pdf" multiple style="display:none;" onchange="handlePdfPick(this.files)"/>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px;">
+      <input type="text" class="field-input" id="pdf-title-input" placeholder="Title (optional)" style="flex:1;min-width:160px;" autocomplete="off"/>
+      <input type="text" class="field-input" id="pdf-auctioneer-input" placeholder="Auctioneer (optional)" style="flex:1;min-width:160px;" autocomplete="off"/>
+      <input type="text" class="field-input" id="pdf-enddate-input" placeholder="End date (optional)" style="width:150px;" autocomplete="off"/>
+      <input type="text" class="field-input" id="pdf-state-input" placeholder="State (optional)" style="width:110px;" autocomplete="off"/>
+      <input type="text" class="field-input" id="pdf-zip-input" placeholder="ZIP (optional)" style="width:100px;" autocomplete="off"/>
+    </div>
+    <div id="pdf-upload-status"></div>
+  </div>
+
+  <div style="margin-bottom:22px;">
+    <div style="font-size:15px;font-weight:700;margin-bottom:8px;">⏳ Needs Update — No Lots Yet</div>
+    <div class="sub" style="margin-bottom:8px;">These auctions exist but had zero lots posted when uploaded. Uploading a newer PDF for the same auction with lots in it clears it from this list automatically.</div>
+    <div id="pdf-needs-update"><div class="empty">Loading...</div></div>
+  </div>
+
+  <div class="tabs">
+    <button class="tab-btn active" id="tab-catalogs" onclick="setView('catalogs')">Catalogs</button>
+    <button class="tab-btn" id="tab-lots" onclick="setView('lots')">All Lots</button>
+    <button class="tab-btn" id="tab-log" onclick="setView('log')">Upload Log</button>
+  </div>
+
+  <input type="text" class="field-input" id="search-input" placeholder="Search..." oninput="renderCurrentView()" style="width:280px;margin-bottom:14px;" autocomplete="off"/>
+
+  <div id="catalogs-panel"><div class="empty">Loading...</div></div>
+  <div id="lots-panel" style="display:none;"><div class="empty">Loading...</div></div>
+  <div id="log-panel" style="display:none;"><div class="empty">Loading...</div></div>
+</div>
+
+<script>
+let catalogs = [], lots = [], uploads = [];
+let currentView = 'catalogs';
+
+function setView(view) {
+  currentView = view;
+  document.getElementById('tab-catalogs').classList.toggle('active', view === 'catalogs');
+  document.getElementById('tab-lots').classList.toggle('active', view === 'lots');
+  document.getElementById('tab-log').classList.toggle('active', view === 'log');
+  document.getElementById('catalogs-panel').style.display = view === 'catalogs' ? '' : 'none';
+  document.getElementById('lots-panel').style.display = view === 'lots' ? '' : 'none';
+  document.getElementById('log-panel').style.display = view === 'log' ? '' : 'none';
+  renderCurrentView();
+}
+
+function renderCurrentView() {
+  if (currentView === 'catalogs') renderCatalogs();
+  else if (currentView === 'lots') renderLots();
+  else renderLog();
+}
+
+function escapeHtml(s) {
+  return (s || '').toString().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+async function loadAll() {
+  await Promise.all([loadCatalogs(), loadLots(), loadPdfUploadLog(), loadNeedsUpdateQueue()]);
+  renderCurrentView();
+}
+
+async function loadCatalogs() {
+  try {
+    const r = await fetch('/api/catalogs');
+    const data = await r.json();
+    catalogs = data.catalogs || [];
+  } catch(e) { console.error(e); }
+}
+
+async function loadLots() {
+  try {
+    const r = await fetch('/api/lots');
+    const data = await r.json();
+    lots = data.lots || [];
+  } catch(e) { console.error(e); }
+}
+
+function renderCatalogs() {
+  const el = document.getElementById('catalogs-panel');
+  const search = document.getElementById('search-input').value.toLowerCase();
+  let rows = catalogs;
+  if (search) rows = rows.filter(c => (c.title || '').toLowerCase().includes(search) || (c.auctioneer || '').toLowerCase().includes(search));
+  if (!rows.length) { el.innerHTML = '<div class="empty">No catalogs yet.</div>'; return; }
+  let html = `<table><thead><tr><th>Title</th><th>Auctioneer</th><th>State</th><th>End Date</th><th>Lot Count</th></tr></thead><tbody>`;
+  for (const c of rows) {
+    html += `<tr>
+      <td>${escapeHtml(c.title)}</td>
+      <td class="muted">${escapeHtml(c.auctioneer)}</td>
+      <td>${escapeHtml(c.state)}</td>
+      <td class="muted">${escapeHtml(c.end_date)}</td>
+      <td>${c.lot_count ?? '—'}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+function renderLots() {
+  const el = document.getElementById('lots-panel');
+  const search = document.getElementById('search-input').value.toLowerCase();
+  let rows = lots;
+  if (search) rows = rows.filter(l => (l.description || '').toLowerCase().includes(search) || (l.lot_number || '').toLowerCase().includes(search));
+  if (!rows.length) { el.innerHTML = '<div class="empty">No lots yet.</div>'; return; }
+  let html = `<table><thead><tr><th>Lot #</th><th>Description</th><th>State</th><th>ZIP</th><th>Date</th></tr></thead><tbody>`;
+  for (const l of rows.slice(0, 500)) {
+    html += `<tr>
+      <td>${escapeHtml(l.lot_number)}</td>
+      <td>${escapeHtml(l.description)}</td>
+      <td>${escapeHtml(l.state)}</td>
+      <td class="muted">${escapeHtml(l.zip_code)}</td>
+      <td class="muted">${escapeHtml(l.date)}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  if (rows.length > 500) html += `<div class="sub" style="margin-top:8px;">Showing first 500 of ${rows.length} — narrow with search to see more specific results.</div>`;
+  el.innerHTML = html;
+}
+
+function renderLog() {
+  const el = document.getElementById('log-panel');
+  if (!uploads.length) { el.innerHTML = '<div class="empty">No PDFs uploaded yet.</div>'; return; }
+  let html = `<table><thead><tr><th>File</th><th>Uploaded</th><th>Catalog</th><th>Lots Found</th><th>Status</th></tr></thead><tbody>`;
+  for (const u of uploads) {
+    const statusHtml = u.status === 'success'
+      ? `<span style="color:var(--green);">✓ Success</span>`
+      : u.status === 'empty'
+        ? `<span style="color:var(--amber);">⏳ No lots yet</span>`
+        : u.status === 'error'
+          ? `<span style="color:var(--red);" title="${escapeHtml(u.error_message)}">✗ Error — ${escapeHtml(u.error_message || 'unknown')}</span>`
+          : `<span class="muted">⏳ Processing</span>`;
+    html += `<tr>
+      <td>${escapeHtml(u.filename)}</td>
+      <td class="muted">${u.uploaded_at ? new Date(u.uploaded_at).toLocaleString() : ''}</td>
+      <td>${escapeHtml(u.catalog_title)}</td>
+      <td>${u.parsed_lot_count ?? 0}</td>
+      <td>${statusHtml}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+function handlePdfDrop(event) {
+  event.preventDefault();
+  event.currentTarget.style.borderColor = 'var(--border)';
+  const files = event.dataTransfer.files;
+  if (files && files.length) handlePdfPick(files);
+}
+
+function handlePdfPick(fileList) {
+  const files = Array.from(fileList).filter(f => f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf'));
+  if (!files.length) { alert('Please choose PDF file(s)'); return; }
+  for (const f of files) uploadPdfFile(f);
+  document.getElementById('pdf-file-input').value = '';
+}
+
+async function uploadPdfFile(file) {
+  const statusEl = document.getElementById('pdf-upload-status');
+  const line = document.createElement('div');
+  line.className = 'status-msg';
+  line.textContent = `⏳ Uploading and reading ${file.name}...`;
+  statusEl.prepend(line);
+
+  const fd = new FormData();
+  fd.append('file', file);
+  const title = document.getElementById('pdf-title-input').value.trim();
+  const auctioneer = document.getElementById('pdf-auctioneer-input').value.trim();
+  const endDate = document.getElementById('pdf-enddate-input').value.trim();
+  const state = document.getElementById('pdf-state-input').value.trim();
+  const zip = document.getElementById('pdf-zip-input').value.trim();
+  if (title) fd.append('title', title);
+  if (auctioneer) fd.append('auctioneer', auctioneer);
+  if (endDate) fd.append('end_date', endDate);
+  if (state) fd.append('state', state);
+  if (zip) fd.append('zip_code', zip);
+
+  try {
+    const r = await fetch('/api/upload-pdf', {method: 'POST', body: fd});
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || 'Upload failed');
+    line.textContent = data.empty
+      ? `⏳ ${file.name} — auction exists but has no lots yet, added to the Needs Update queue`
+      : `✅ ${file.name} — found ${data.lots_parsed} lot(s)`;
+  } catch(e) {
+    line.textContent = `❌ ${file.name} — ${e.message}`;
+  } finally {
+    await loadAll();
+  }
+}
+
+async function loadPdfUploadLog() {
+  try {
+    const r = await fetch('/api/pdf-uploads');
+    const data = await r.json();
+    uploads = data.uploads || [];
+  } catch(e) { console.error(e); }
+}
+
+async function loadNeedsUpdateQueue() {
+  const el = document.getElementById('pdf-needs-update');
+  try {
+    const r = await fetch('/api/needs-update');
+    const data = await r.json();
+    const items = data.needs_update || [];
+    if (!items.length) { el.innerHTML = '<div class="empty">Nothing waiting — every uploaded auction has lots.</div>'; return; }
+    let html = `<table><thead><tr><th>File</th><th>First Uploaded Empty</th></tr></thead><tbody>`;
+    for (const u of items) {
+      html += `<tr><td>${escapeHtml(u.filename)}</td><td class="muted">${u.uploaded_at ? new Date(u.uploaded_at).toLocaleString() : ''}</td></tr>`;
+    }
+    html += '</tbody></table>';
+    el.innerHTML = html;
+  } catch(e) {
+    el.innerHTML = `<div class="empty">Failed to load: ${e.message}</div>`;
+  }
+}
+
+loadAll();
+</script>
+</body>
+</html>
