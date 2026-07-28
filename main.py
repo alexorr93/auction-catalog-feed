@@ -281,18 +281,38 @@ def _backfill_catalog_metadata(supabase_client, business_id: str, catalog_url: s
                                  state: str, zip_code: str, end_date: str) -> None:
     """Runs AFTER the upload response has already gone out, as a background
     task -- keeps uploads fast. Fills in whichever of state/zip/date the
-    form left blank, a few seconds after the VA already sees 'success'."""
+    form left blank, a few seconds after the VA already sees 'success'.
+
+    Real bug fixed here: this only ever updated bidspotter_catalog_lots (the
+    per-lot rows) -- it never touched auction_catalogs, which is the actual
+    summary row the Catalogs list displays (title/auctioneer/state/end date
+    columns). So an auto-extracted catalog (no form fields typed in, the
+    common case for zip-batch uploads) would show real lots but a blank
+    State/End Date forever, while anything with the fields typed in by hand
+    looked fine -- making it look like typed-in uploads worked and
+    auto-extracted ones didn't, which is exactly what was happening."""
     try:
         auto_meta = _extract_catalog_metadata_via_gemini(raw_text, filename)
-        patch = {}
+        lot_patch = {}
         if not state and auto_meta.get("state"):
-            patch["state"] = auto_meta["state"]
+            lot_patch["state"] = auto_meta["state"]
         if not zip_code and auto_meta.get("zip_code"):
-            patch["zip_code"] = auto_meta["zip_code"]
+            lot_patch["zip_code"] = auto_meta["zip_code"]
         if not end_date and auto_meta.get("end_date"):
-            patch["date"] = auto_meta["end_date"]
-        if patch:
-            supabase_client.table("bidspotter_catalog_lots").update(patch)\
+            lot_patch["date"] = auto_meta["end_date"]
+        if lot_patch:
+            supabase_client.table("bidspotter_catalog_lots").update(lot_patch)\
+                .eq("business_id", business_id).eq("catalog_url", catalog_url).execute()
+
+        catalog_patch = {}
+        if not state and auto_meta.get("state"):
+            catalog_patch["state"] = auto_meta["state"]
+        if not end_date and auto_meta.get("end_date"):
+            catalog_patch["end_date"] = auto_meta["end_date"]
+        if auto_meta.get("auctioneer"):  # no form field for this one, always fill if found
+            catalog_patch["auctioneer"] = auto_meta["auctioneer"]
+        if catalog_patch:
+            supabase_client.table("auction_catalogs").update(catalog_patch)\
                 .eq("business_id", business_id).eq("catalog_url", catalog_url).execute()
     except Exception as e:
         print(f"Background metadata backfill failed for {filename} (lots themselves are unaffected): {e}")
