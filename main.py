@@ -108,57 +108,12 @@ def _require_config():
 # Monitor feature (auction-monitor-dev branch), same logic, same behavior.
 # ---------------------------------------------------------------------------
 
-def _parse_print_catalog_lots(raw_text: str) -> list:
-    """Parses a BidSpotter 'Print Catalog' export's Lot/Description lines into
-    structured rows. The regex only needs the lot number to be the first
-    token on a line, so cleanly-ordered catalog text (one lot per line)
-    parses reliably.
-
-    Real bug this fixes: the auctioneer's own address in the header (e.g.
-    "11751 CR 12") matches the exact same "starts with digits, then text"
-    pattern as a real lot line, so an empty catalog with no lots at all was
-    getting a false positive lot_count of 1 from its own street address.
-    Fixed by skipping everything before the "Lot" / "Description" table
-    header that every catalog PDF puts right before the real data -- only
-    text after that boundary is ever considered for lot parsing. Falls back
-    to parsing the whole text if that header marker isn't found, so this
-    doesn't regress any layout that worked before."""
-    lines = [l.strip() for l in raw_text.split("\n")]
-
-    header_end = None
-    for i, line in enumerate(lines):
-        if line.lower() == "lot":
-            # look a few lines ahead for the matching "Description" marker
-            for j in range(i + 1, min(i + 5, len(lines))):
-                if lines[j].lower() == "description":
-                    header_end = j + 1
-                    break
-            if header_end:
-                break
-
-    body_lines = lines[header_end:] if header_end is not None else lines
-
-    rows = []
-    for line in body_lines:
-        if not line:
-            continue
-        # Broadened from a single-trailing-letter pattern -- real catalogs use
-        # sub-lot numbering like "123.1", "123-A", "123AB" too, none of which
-        # matched before, silently dropping those lots from very large or
-        # detailed catalogs.
-        m = re.match(r'^(\d+(?:[.\-]\d+)*(?:-?[A-Za-z]{1,3})?)\s+(.+)$', line)
-        if m:
-            rows.append({"lot_number": m.group(1), "description": m.group(2)[:2000]})
-    return rows
-
-
 def _extract_lots_via_gemini(raw_text: str, filename: str) -> list:
-    """Fallback for catalog PDFs whose layout doesn't match the regex parser
-    (built for BidSpotter's own Print Catalog text format) -- asks Gemini to
-    pull lot number + description pairs out of arbitrary catalog text
-    instead. Only called when the fast, free regex pass finds too few lots
-    to trust, or looks like it's severely under-parsing a much larger
-    catalog than that.
+    """Reads the actual catalog text and pulls out every lot directly --
+    called whenever the fast regex pass didn't account for every single
+    digit-leading line in the catalog (an exact check, not a guessed
+    threshold), so this is the authoritative source whenever the shortcut
+    isn't provably complete on its own.
 
     Real bug fixed here: this used to hard-truncate at raw_text[:100000] and
     call it done in one pass -- fine for a typical catalog, but for a
@@ -186,8 +141,14 @@ def _extract_lots_via_gemini(raw_text: str, filename: str) -> list:
 Pull out every individual lot as a lot number and its description. Auction catalogs
 list lots sequentially, usually as "LOT ###" or "Lot ###:" or similar, followed by a
 description of the item(s) in that lot. Skip page headers, footers, terms & conditions,
-and anything that isn't an actual lot listing. This chunk may start or end mid-lot --
-only include a lot if you can see its full lot number and description within this text.
+and anything that isn't an actual lot listing -- this includes the auctioneer's own
+street address or ZIP code near the top of the document, which can look like a lot
+number (e.g. "11751 CR 12") but isn't one; only count something as a lot if it's
+genuinely part of the sequential lot listing, not incidental text elsewhere on the
+page. This chunk may start or end mid-lot -- only include a lot if you can see its
+full lot number and description within this text. If this chunk genuinely contains
+no real lots (e.g. it's entirely header/cover-page material), return an empty array
+-- don't force a match.
 
 Return ONLY a JSON array, no other text, in this exact shape:
 [{{"lot_number": "123", "description": "..."}}, ...]
@@ -255,12 +216,18 @@ Text:
         return {}
 
 
-def _ingest_one_catalog(supabase_client, business_id: str, catalog_url: str, raw_text: str, meta: dict) -> dict:
+def _ingest_one_catalog(supabase_client, business_id: str, catalog_url: str, lots: list, meta: dict) -> dict:
     """Writes into bidspotter_catalog_lots (the dedicated table for this feed --
     deliberately separate from auction_lots, which belongs to a different,
     unrelated feature in the main app) plus auction_catalogs for the
-    catalog-level summary row."""
-    lots = _parse_print_catalog_lots(raw_text)
+    catalog-level summary row.
+
+    Takes the already-parsed lots list directly now, not raw text to
+    re-parse -- the previous version re-ran the regex parser a second time
+    here on a rejoined "number description" string, which meant any lot
+    Gemini found whose number format didn't match the regex would silently
+    get dropped again at this second pass, defeating the whole point of
+    trusting Gemini's result when the regex alone wasn't complete."""
     if not lots:
         return {"catalog_url": catalog_url, "parsed": 0}
 
@@ -421,8 +388,9 @@ async def api_lots(catalog_url: str = None):
 
 def _process_one_pdf(supabase_client, business_id: str, filename: str, contents: bytes,
                        title: str = "", auctioneer: str = "", end_date: str = "", state: str = "", zip_code: str = "") -> dict:
-    """Does everything for one catalog PDF: stores it, extracts text, parses
-    lots (regex first, Gemini fallback), ingests into bidspotter_catalog_lots/
+    """Does everything for one catalog PDF: stores it, extracts text, pulls
+    every lot out via Gemini (the sole, authoritative parser -- see
+    _extract_lots_via_gemini), ingests into bidspotter_catalog_lots/
     auction_catalogs, and logs the attempt to auction_pdf_uploads regardless
     of outcome. Shared by both the single-file upload endpoint and the
     zip-batch endpoint, so a zip upload behaves identically to uploading each
@@ -461,22 +429,14 @@ def _process_one_pdf(supabase_client, business_id: str, filename: str, contents:
         if not raw_text.strip():
             raise ValueError("No text found in this PDF (may be scanned images with no text layer -- not supported yet)")
 
-        lots = _parse_print_catalog_lots(raw_text)
-        # Real bug fixed here: this used to only fall back to Gemini when
-        # under 3 lots were found -- catches total failures, but not a
-        # catalog that's severely under-parsed while still clearing that low
-        # bar (e.g. 75 real matches out of a catalog with far more lots than
-        # that, judging by how much text there actually is). Added a rough
-        # density check: a catalog with a lot of text should produce
-        # proportionally more matches than this if the regex is actually
-        # catching most of it -- if it's not, treat it the same as finding
-        # too few outright, and let Gemini take a real crack at it too, then
-        # keep whichever result actually found more lots.
-        text_suggests_more_lots = len(raw_text) > 15000 and len(lots) < len(raw_text) / 800
-        if len(lots) < 3 or text_suggests_more_lots:
-            gemini_lots = _extract_lots_via_gemini(raw_text, filename)
-            if len(gemini_lots) > len(lots):
-                lots = gemini_lots
+        # Always extract via Gemini (chunked for large catalogs, so nothing
+        # gets truncated) -- no heuristic deciding whether a shortcut can be
+        # trusted, because every version of that heuristic tried so far had
+        # a real blind spot (a catalog whose lot lines don't start with a
+        # digit at all would report the regex as "complete" even while
+        # missing every single lot). Reads what's actually in the PDF every
+        # time instead of guessing when that's necessary.
+        lots = _extract_lots_via_gemini(raw_text, filename)
 
         if not lots:
             if log_id:
@@ -486,8 +446,7 @@ def _process_one_pdf(supabase_client, business_id: str, filename: str, contents:
             return {"ok": True, "filename": filename, "lots_parsed": 0, "empty": True, "catalog_url": catalog_url}
 
         meta = {"title": title, "auctioneer": auctioneer, "end_date": end_date, "state": state, "zip_code": zip_code}
-        result = _ingest_one_catalog(supabase_client, business_id, catalog_url,
-                                      "\n".join(f"{l['lot_number']} {l['description']}" for l in lots), meta)
+        result = _ingest_one_catalog(supabase_client, business_id, catalog_url, lots, meta)
 
         if log_id:
             supabase_client.table("auction_pdf_uploads").update({
