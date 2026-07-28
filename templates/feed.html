@@ -57,6 +57,21 @@ a:hover { color: #93c5fd; }
     <div id="pdf-upload-status"></div>
   </div>
 
+  <div style="background:var(--card);border:2px solid #16a34a;border-radius:12px;padding:18px;margin-bottom:22px;">
+    <div style="font-size:16px;font-weight:700;margin-bottom:4px;">📦 Upload Many Catalogs at Once (.zip)</div>
+    <div class="sub" style="margin-bottom:14px;">Got a whole folder of catalog PDFs (e.g. 350 of them)? Zip them up and drop the zip here instead of uploading one at a time — it processes them all in the background. Watch the Upload Log and Needs Update sections below to see them come in as each one finishes; no need to wait on this page.</div>
+    <div id="zip-drop-zone" style="border:2px dashed #16a34a;border-radius:10px;padding:24px;text-align:center;cursor:pointer;"
+         onclick="document.getElementById('zip-file-input').click()"
+         ondragover="event.preventDefault();this.style.borderColor='#22c55e';"
+         ondragleave="this.style.borderColor='#16a34a';"
+         ondrop="handleZipDrop(event)">
+      <div style="font-size:28px;margin-bottom:4px;">📦</div>
+      <div style="font-weight:600;">Click to choose a .zip, or drag one here</div>
+      <input type="file" id="zip-file-input" accept=".zip,application/zip" style="display:none;" onchange="handleZipPick(this.files)"/>
+    </div>
+    <div id="zip-upload-status" style="margin-top:10px;"></div>
+  </div>
+
   <div style="margin-bottom:22px;">
     <div style="font-size:15px;font-weight:700;margin-bottom:8px;">⏳ Needs Update — No Lots Yet</div>
     <div class="sub" style="margin-bottom:8px;">These auctions exist but had zero lots posted when uploaded. Uploading a newer PDF for the same auction with lots in it clears it from this list automatically.</div>
@@ -220,6 +235,53 @@ function handlePdfPick(fileList) {
   if (!files.length) { alert('Please choose PDF file(s)'); return; }
   for (const f of files) uploadPdfFile(f);
   document.getElementById('pdf-file-input').value = '';
+}
+
+function handleZipDrop(event) {
+  event.preventDefault();
+  event.currentTarget.style.borderColor = '#16a34a';
+  const files = event.dataTransfer.files;
+  if (files && files.length) handleZipPick(files);
+}
+
+function handleZipPick(fileList) {
+  const file = fileList[0];
+  if (!file) return;
+  if (!file.name.toLowerCase().endsWith('.zip')) { alert('Please choose a .zip file'); return; }
+  uploadZipFile(file);
+  document.getElementById('zip-file-input').value = '';
+}
+
+async function uploadZipFile(file) {
+  const statusEl = document.getElementById('zip-upload-status');
+  statusEl.innerHTML = `<div class="status-msg">⏳ Uploading ${file.name} and finding PDFs inside it...</div>`;
+
+  const fd = new FormData();
+  fd.append('file', file);
+
+  try {
+    const r = await fetch('/api/upload-zip', {method: 'POST', body: fd});
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || 'Upload failed');
+    statusEl.innerHTML = `<div class="status-msg" style="color:var(--green);">✅ Found ${data.queued} catalog(s) — processing in the background now. Watch the Upload Log and Needs Update sections below; this page will keep refreshing automatically.</div>`;
+    startAutoRefresh();
+  } catch(e) {
+    statusEl.innerHTML = `<div class="status-msg" style="color:var(--red);">❌ ${e.message}</div>`;
+  }
+}
+
+let autoRefreshTimer = null;
+function startAutoRefresh() {
+  // Runs every 8s for 20 minutes so a large zip batch's progress shows up
+  // without needing a manual refresh -- stops itself automatically so this
+  // doesn't run forever in an idle open tab.
+  if (autoRefreshTimer) return;
+  let elapsed = 0;
+  autoRefreshTimer = setInterval(async () => {
+    await loadAll();
+    elapsed += 8000;
+    if (elapsed > 20 * 60 * 1000) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
+  }, 8000);
 }
 
 async function uploadPdfFile(file) {

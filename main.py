@@ -359,27 +359,22 @@ async def api_lots(catalog_url: str = None):
     return {"lots": rows}
 
 
-@app.post("/api/upload-pdf")
-async def upload_pdf(request: Request, background_tasks: BackgroundTasks):
-    supabase_client, business_id = _require_config()
-
-    form = await request.form()
-    file = form.get("file")
-    if not file or not hasattr(file, "read"):
-        raise HTTPException(400, "file is required")
-    title = (form.get("title") or "").strip() or file.filename
-    auctioneer = (form.get("auctioneer") or "").strip()
-    end_date = (form.get("end_date") or "").strip()
-    state = (form.get("state") or "").strip()
-    zip_code = (form.get("zip_code") or "").strip()
-
-    contents = await file.read()
-    raw_name = file.filename.rsplit(".", 1)[0] if file.filename else str(uuid.uuid4())
+def _process_one_pdf(supabase_client, business_id: str, filename: str, contents: bytes,
+                       title: str = "", auctioneer: str = "", end_date: str = "", state: str = "", zip_code: str = "") -> dict:
+    """Does everything for one catalog PDF: stores it, extracts text, parses
+    lots (regex first, Gemini fallback), ingests into bidspotter_catalog_lots/
+    auction_catalogs, and logs the attempt to auction_pdf_uploads regardless
+    of outcome. Shared by both the single-file upload endpoint and the
+    zip-batch endpoint, so a zip upload behaves identically to uploading each
+    file one at a time -- same parsing, same empty-catalog handling, same
+    was_ever_empty flag, same logging."""
+    title = title.strip() or filename
+    raw_name = filename.rsplit(".", 1)[0] if filename else str(uuid.uuid4())
     catalog_key = re.sub(r'[^A-Za-z0-9._-]', '_', raw_name)
     catalog_url = catalog_key
 
     log_row = {
-        "business_id": business_id, "filename": file.filename, "status": "processing",
+        "business_id": business_id, "filename": filename, "status": "processing",
         "catalog_url": catalog_url, "catalog_title": title,
     }
     log_res = supabase_client.table("auction_pdf_uploads").insert(log_row).execute()
@@ -408,18 +403,16 @@ async def upload_pdf(request: Request, background_tasks: BackgroundTasks):
 
         lots = _parse_print_catalog_lots(raw_text)
         if len(lots) < 3:
-            gemini_lots = _extract_lots_via_gemini(raw_text, file.filename)
+            gemini_lots = _extract_lots_via_gemini(raw_text, filename)
             if len(gemini_lots) > len(lots):
                 lots = gemini_lots
 
         if not lots:
-            # Not a parse failure -- the auction exists but has no lots posted
-            # yet. Its own distinct status, not lumped in with real errors.
             if log_id:
                 supabase_client.table("auction_pdf_uploads").update({
                     "status": "empty", "storage_path": storage_path, "parsed_lot_count": 0,
                 }).eq("id", log_id).execute()
-            return {"ok": True, "lots_parsed": 0, "empty": True, "catalog_url": catalog_url}
+            return {"ok": True, "filename": filename, "lots_parsed": 0, "empty": True, "catalog_url": catalog_url}
 
         meta = {"title": title, "auctioneer": auctioneer, "end_date": end_date, "state": state, "zip_code": zip_code}
         result = _ingest_one_catalog(supabase_client, business_id, catalog_url,
@@ -430,18 +423,102 @@ async def upload_pdf(request: Request, background_tasks: BackgroundTasks):
                 "status": "success", "storage_path": storage_path, "parsed_lot_count": result.get("parsed", 0),
             }).eq("id", log_id).execute()
 
-        if not (state and zip_code and end_date):
-            background_tasks.add_task(_backfill_catalog_metadata, supabase_client, business_id, catalog_url,
-                                       raw_text, file.filename, state, zip_code, end_date)
+        needs_backfill = not (state and zip_code and end_date)
 
-        return {"ok": True, "lots_parsed": result.get("parsed", 0), "catalog_url": catalog_url}
+        return {"ok": True, "filename": filename, "lots_parsed": result.get("parsed", 0), "catalog_url": catalog_url,
+                "needs_backfill": needs_backfill, "raw_text": raw_text if needs_backfill else None}
 
     except Exception as e:
         if log_id:
             supabase_client.table("auction_pdf_uploads").update({
                 "status": "error", "storage_path": storage_path, "error_message": str(e),
             }).eq("id", log_id).execute()
-        raise HTTPException(500, str(e))
+        return {"ok": False, "filename": filename, "error": str(e)}
+
+
+@app.post("/api/upload-pdf")
+async def upload_pdf(request: Request, background_tasks: BackgroundTasks):
+    supabase_client, business_id = _require_config()
+
+    form = await request.form()
+    file = form.get("file")
+    if not file or not hasattr(file, "read"):
+        raise HTTPException(400, "file is required")
+    title = (form.get("title") or "").strip()
+    auctioneer = (form.get("auctioneer") or "").strip()
+    end_date = (form.get("end_date") or "").strip()
+    state = (form.get("state") or "").strip()
+    zip_code = (form.get("zip_code") or "").strip()
+
+    contents = await file.read()
+    result = _process_one_pdf(supabase_client, business_id, file.filename, contents,
+                               title, auctioneer, end_date, state, zip_code)
+    if not result.get("ok"):
+        raise HTTPException(500, result.get("error", "Unknown error"))
+
+    if result.get("needs_backfill") and result.get("raw_text"):
+        background_tasks.add_task(_backfill_catalog_metadata, supabase_client, business_id, result["catalog_url"],
+                                   result["raw_text"], file.filename, state, zip_code, end_date)
+
+    result.pop("raw_text", None)
+    result.pop("needs_backfill", None)
+    return result
+
+
+def _process_zip_batch(supabase_client, business_id: str, pdf_entries: list) -> None:
+    """Runs in the background (in its own thread, via BackgroundTasks -- doesn't
+    block other requests while this runs). Processes every PDF found in the zip
+    one at a time, same logic as a single upload for each. Progress is visible
+    the whole time through the existing Upload Log / Needs Update / Catalogs
+    views -- no separate progress UI needed, since each file logs itself as it
+    completes, exactly like uploading them one by one would."""
+    print(f"Zip batch: starting {len(pdf_entries)} catalog(s)")
+    for i, (filename, contents) in enumerate(pdf_entries):
+        try:
+            result = _process_one_pdf(supabase_client, business_id, filename, contents)
+            if result.get("needs_backfill") and result.get("raw_text"):
+                # Zip batches already run entirely in the background, so no
+                # need to schedule this separately -- just do it inline, one
+                # file at a time, same order as everything else in this batch.
+                _backfill_catalog_metadata(supabase_client, business_id, result["catalog_url"],
+                                            result["raw_text"], filename, "", "", "")
+        except Exception as e:
+            print(f"Zip batch: unexpected failure on {filename}: {e}")
+        if (i + 1) % 25 == 0:
+            print(f"Zip batch: {i + 1}/{len(pdf_entries)} done")
+    print(f"Zip batch: finished all {len(pdf_entries)} catalog(s)")
+
+
+@app.post("/api/upload-zip")
+async def upload_zip(request: Request, background_tasks: BackgroundTasks):
+    """The real answer for uploading many catalogs at once (e.g. 350 PDFs
+    collected into one zip) -- drop the zip in once instead of selecting
+    hundreds of files by hand in a browser file picker, which isn't a
+    reliable way to handle that many at once anyway."""
+    import zipfile
+
+    supabase_client, business_id = _require_config()
+    form = await request.form()
+    file = form.get("file")
+    if not file or not hasattr(file, "read"):
+        raise HTTPException(400, "file is required")
+
+    contents = await file.read()
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(contents))
+    except Exception as e:
+        raise HTTPException(400, f"Not a valid zip file: {e}")
+
+    pdf_entries = []
+    for name in zf.namelist():
+        if name.lower().endswith(".pdf") and not name.startswith("__MACOSX/"):
+            pdf_entries.append((name.rsplit("/", 1)[-1], zf.read(name)))
+
+    if not pdf_entries:
+        raise HTTPException(400, "No PDF files found inside this zip")
+
+    background_tasks.add_task(_process_zip_batch, supabase_client, business_id, pdf_entries)
+    return {"ok": True, "queued": len(pdf_entries)}
 
 
 @app.get("/api/pdf-uploads")
