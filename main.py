@@ -108,7 +108,7 @@ def _require_config():
 # Monitor feature (auction-monitor-dev branch), same logic, same behavior.
 # ---------------------------------------------------------------------------
 
-def _extract_lots_via_gemini(raw_text: str, filename: str) -> list:
+def _extract_lots_via_gemini(raw_text: str, filename: str, on_chunk_lots=None) -> list:
     """Reads the actual catalog text and pulls out every lot directly --
     called whenever the fast regex pass didn't account for every single
     digit-leading line in the catalog (an exact check, not a guessed
@@ -122,7 +122,18 @@ def _extract_lots_via_gemini(raw_text: str, filename: str) -> list:
     the text into ~80k-character pieces (a little under Gemini's practical
     single-call comfort zone, leaving room for the prompt itself) and runs
     every chunk, combining and deduping the results by lot_number, instead
-    of only ever seeing the first slice of a large catalog."""
+    of only ever seeing the first slice of a large catalog.
+
+    on_chunk_lots: optional callback invoked with each chunk's own newly-
+    found lots as soon as that chunk comes back from Gemini -- lets the
+    caller persist them immediately instead of waiting for every chunk in
+    the catalog to finish first. Real bug this fixes: previously nothing
+    was written to the database until the entire catalog had been through
+    every chunk, so a process killed partway through (a redeploy, a crash)
+    lost 100% of that catalog's work, not just whatever chunk hadn't run
+    yet. If the callback itself raises (e.g. a transient DB error), that
+    chunk's lots are still kept in the final returned list as a fallback --
+    only the immediate persistence attempt failed, not the extraction."""
     import google.generativeai as genai
     gemini_key = os.getenv("GEMINI_API_KEY", "")
     if not gemini_key:
@@ -163,12 +174,21 @@ Text:
                 if text.startswith("json"):
                     text = text[4:]
             parsed = json.loads(text.strip())
+            chunk_lots = []
             for r in parsed:
                 lot_number = str(r.get("lot_number", "")).strip()
                 description = (r.get("description") or "")[:2000]
                 if lot_number and description and lot_number not in seen_lot_numbers:
                     seen_lot_numbers.add(lot_number)
-                    combined.append({"lot_number": lot_number, "description": description})
+                    row = {"lot_number": lot_number, "description": description}
+                    combined.append(row)
+                    chunk_lots.append(row)
+            if chunk_lots and on_chunk_lots:
+                try:
+                    on_chunk_lots(chunk_lots)
+                except Exception as write_err:
+                    print(f"Immediate persist failed for {filename} chunk {chunk_i + 1}/{len(chunks)} "
+                          f"(kept in final result, will still save if the catalog completes): {write_err}")
         except Exception as e:
             print(f"Gemini lot extraction failed for {filename} (chunk {chunk_i + 1}/{len(chunks)}): {e}")
             # Keep going with whatever other chunks succeed, rather than
@@ -216,22 +236,30 @@ Text:
         return {}
 
 
-def _ingest_one_catalog(supabase_client, business_id: str, catalog_url: str, lots: list, meta: dict) -> dict:
-    """Writes into bidspotter_catalog_lots (the dedicated table for this feed --
-    deliberately separate from auction_lots, which belongs to a different,
-    unrelated feature in the main app) plus auction_catalogs for the
-    catalog-level summary row.
+def _upsert_lots_batch(supabase_client, business_id: str, catalog_url: str, lots: list, meta: dict) -> None:
+    """Writes ONE batch of already-parsed lots (typically one Gemini chunk's
+    worth) into bidspotter_catalog_lots immediately. Real bug this fixes:
+    the previous design collected every lot from an entire catalog in
+    memory and only wrote any of them after Gemini had finished the whole
+    thing -- so a catalog killed mid-extraction (a redeploy, a crash, a
+    zip batch of 350 files that never gets to finish in one process
+    lifetime) lost 100% of its lots, not just whatever hadn't been
+    processed yet. Called once per chunk instead, so each chunk's lots are
+    durable the moment that chunk comes back from Gemini.
 
-    Takes the already-parsed lots list directly now, not raw text to
-    re-parse -- the previous version re-ran the regex parser a second time
-    here on a rejoined "number description" string, which meant any lot
-    Gemini found whose number format didn't match the regex would silently
-    get dropped again at this second pass, defeating the whole point of
-    trusting Gemini's result when the regex alone wasn't complete."""
+    Batches the existence check into one query per call (via .in_() on
+    lot_number) instead of one query per lot -- far fewer round trips than
+    the original row-at-a-time select+insert, on top of now also being
+    incremental."""
     if not lots:
-        return {"catalog_url": catalog_url, "parsed": 0}
-
+        return
     now_iso = datetime.now(timezone.utc).isoformat()
+    lot_numbers = [l["lot_number"] for l in lots]
+    existing = supabase_client.table("bidspotter_catalog_lots").select("id,lot_number")\
+        .eq("business_id", business_id).eq("catalog_url", catalog_url).in_("lot_number", lot_numbers).execute()
+    existing_by_number = {row["lot_number"]: row["id"] for row in (existing.data or [])}
+
+    new_rows = []
     for lot in lots:
         record = {
             "business_id": business_id,
@@ -243,27 +271,34 @@ def _ingest_one_catalog(supabase_client, business_id: str, catalog_url: str, lot
             "zip_code": meta.get("zip_code") or None,
             "date": meta.get("end_date") or None,
         }
-        existing = supabase_client.table("bidspotter_catalog_lots").select("id")\
-            .eq("business_id", business_id).eq("catalog_url", catalog_url).eq("lot_number", lot["lot_number"]).limit(1).execute()
-        if existing.data:
-            supabase_client.table("bidspotter_catalog_lots").update(record).eq("id", existing.data[0]["id"]).execute()
+        existing_id = existing_by_number.get(lot["lot_number"])
+        if existing_id:
+            supabase_client.table("bidspotter_catalog_lots").update(record).eq("id", existing_id).execute()
         else:
-            supabase_client.table("bidspotter_catalog_lots").insert(record).execute()
+            new_rows.append(record)
+    if new_rows:
+        supabase_client.table("bidspotter_catalog_lots").insert(new_rows).execute()
 
-    # Permanent flag, set once and never cleared: did this catalog ever have an
-    # 'empty' upload attempt before this one, at any point? If so, this catalog
-    # is presumed to potentially still be growing even now that it has real
-    # lots -- e.g. an auction house adds 2 lots today, more expected later.
-    # Checked from auction_pdf_uploads history, since an empty catalog never
-    # gets its own auction_catalogs row in the first place (nothing to flag
-    # until the first real ingest happens here).
+
+def _upsert_catalog_summary(supabase_client, business_id: str, catalog_url: str, meta: dict, lot_count: int) -> None:
+    """Creates or refreshes the auction_catalogs summary row (what the
+    Catalogs tab actually displays) with the CURRENT real lot_count.
+    Called once per chunk now (right after that chunk's lots are written),
+    not once at the very end of a whole catalog -- so a catalog killed
+    partway through still leaves a real, findable summary row showing
+    however many lots actually made it in, instead of nothing at all.
+    Deliberately only ever called once at least one real lot exists (never
+    for a genuinely empty catalog), matching the existing rule that an
+    empty catalog gets an 'empty' upload-log entry but no catalogs row at
+    all -- the Needs Update queue and the false-positive-lot-count fix
+    both depend on that."""
+    now_iso = datetime.now(timezone.utc).isoformat()
     had_prior_empty = supabase_client.table("auction_pdf_uploads").select("id")\
         .eq("business_id", business_id).eq("catalog_url", catalog_url).eq("status", "empty").limit(1).execute()
-
     catalog_fields = {k: meta[k] for k in ("title", "auctioneer", "end_date", "state") if meta.get(k)}
     catalog_existing = supabase_client.table("auction_catalogs").select("id,was_ever_empty")\
         .eq("business_id", business_id).eq("catalog_url", catalog_url).limit(1).execute()
-    catalog_fields.update({"lot_count": len(lots), "lot_count_is_estimate": False, "last_checked_at": now_iso})
+    catalog_fields.update({"lot_count": lot_count, "lot_count_is_estimate": False, "last_checked_at": now_iso})
     if had_prior_empty.data or (catalog_existing.data and catalog_existing.data[0].get("was_ever_empty")):
         catalog_fields["was_ever_empty"] = True  # never write False here -- one-way flag, permanent once set
     if catalog_existing.data:
@@ -271,8 +306,6 @@ def _ingest_one_catalog(supabase_client, business_id: str, catalog_url: str, lot
     else:
         catalog_fields.update({"business_id": business_id, "source": "upload", "catalog_url": catalog_url, "first_seen_at": now_iso})
         supabase_client.table("auction_catalogs").insert(catalog_fields).execute()
-
-    return {"catalog_url": catalog_url, "parsed": len(lots)}
 
 
 def _backfill_catalog_metadata(supabase_client, business_id: str, catalog_url: str, raw_text: str, filename: str,
@@ -446,16 +479,47 @@ def _process_one_pdf(supabase_client, business_id: str, filename: str, contents:
             return {"ok": True, "filename": filename, "lots_parsed": 0, "empty": True, "catalog_url": catalog_url}
 
         meta = {"title": title, "auctioneer": auctioneer, "end_date": end_date, "state": state, "zip_code": zip_code}
-        result = _ingest_one_catalog(supabase_client, business_id, catalog_url, lots, meta)
 
+        # Real bug fixed here: this used to call _extract_lots_via_gemini
+        # with no callback, collect the ENTIRE catalog's lots in memory, and
+        # only write any of it to the database after every chunk had
+        # finished -- so a catalog killed mid-extraction lost 100% of its
+        # work, not just whatever chunk hadn't run yet. Now each chunk's
+        # lots are written the moment that chunk comes back, and the
+        # catalog's summary row is created/refreshed with the running total
+        # right after -- so a partial catalog leaves a real, findable,
+        # partially-complete result instead of nothing at all.
+        written_count = 0
+
+        def _on_chunk(chunk_lots):
+            nonlocal written_count
+            _upsert_lots_batch(supabase_client, business_id, catalog_url, chunk_lots, meta)
+            written_count += len(chunk_lots)
+            _upsert_catalog_summary(supabase_client, business_id, catalog_url, meta, lot_count=written_count)
+
+        lots = _extract_lots_via_gemini(raw_text, filename, on_chunk_lots=_on_chunk)
+
+        if not lots:
+            if log_id:
+                supabase_client.table("auction_pdf_uploads").update({
+                    "status": "empty", "storage_path": storage_path, "parsed_lot_count": 0,
+                }).eq("id", log_id).execute()
+            return {"ok": True, "filename": filename, "lots_parsed": 0, "empty": True, "catalog_url": catalog_url}
+
+        # written_count tracks what actually landed via the per-chunk
+        # callback, which is the real durable number -- if any single
+        # chunk's immediate write failed (rare, logged, kept in the final
+        # `lots` list as a fallback rather than lost), written_count and
+        # len(lots) can differ slightly; written_count is what's actually
+        # in the database right now, so it's what gets reported and logged.
         if log_id:
             supabase_client.table("auction_pdf_uploads").update({
-                "status": "success", "storage_path": storage_path, "parsed_lot_count": result.get("parsed", 0),
+                "status": "success", "storage_path": storage_path, "parsed_lot_count": written_count,
             }).eq("id", log_id).execute()
 
         needs_backfill = not (state and zip_code and end_date)
 
-        return {"ok": True, "filename": filename, "lots_parsed": result.get("parsed", 0), "catalog_url": catalog_url,
+        return {"ok": True, "filename": filename, "lots_parsed": written_count, "catalog_url": catalog_url,
                 "needs_backfill": needs_backfill, "raw_text": raw_text if needs_backfill else None}
 
     except Exception as e:
