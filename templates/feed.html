@@ -22,6 +22,8 @@ tr:last-child td { border-bottom: none; }
 .muted { color: var(--muted); }
 .status-msg { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
 .empty { padding: 30px; text-align: center; color: var(--muted); }
+a { color: #60a5fa; }
+a:hover { color: #93c5fd; }
 .tabs { display: flex; gap: 6px; margin-bottom: 16px; }
 .tab-btn { padding: 8px 14px; border-radius: 8px; border: 1px solid var(--border); background: #1e2535; color: var(--muted); font-size: 13px; font-weight: 600; cursor: pointer; }
 .tab-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
@@ -99,6 +101,20 @@ function escapeHtml(s) {
   return (s || '').toString().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
+function titleAsLink(title) {
+  // The stored title is usually the original catalog URL with "https://" and
+  // every "/" stripped out (that's how these files get named). Reconstructs
+  // the real, clickable URL from that pattern when it matches; falls back to
+  // plain escaped text otherwise, so this never produces a broken link.
+  const t = title || '';
+  const m = t.match(/^https(www\.bidspotter\.com)en-usauction-catalogues(.+?)(catalogue-id-.+)$/);
+  if (m) {
+    const url = `https://${m[1]}/en-us/auction-catalogues/${m[2]}/${m[3]}`;
+    return `<a href="${url}" target="_blank" rel="noopener noreferrer">${escapeHtml(t)}</a>`;
+  }
+  return escapeHtml(t);
+}
+
 async function loadAll() {
   await Promise.all([loadCatalogs(), loadLots(), loadPdfUploadLog(), loadNeedsUpdateQueue()]);
   renderCurrentView();
@@ -132,7 +148,7 @@ function renderCatalogs() {
       ? `${c.lot_count ?? '—'} <span style="color:var(--amber);font-size:11px;" title="This catalog started with zero lots and later got some added — may still be growing, not necessarily final.">⚠️ may still be growing</span>`
       : (c.lot_count ?? '—');
     html += `<tr>
-      <td>${escapeHtml(c.title)}</td>
+      <td>${titleAsLink(c.title)}</td>
       <td class="muted">${escapeHtml(c.auctioneer)}</td>
       <td>${escapeHtml(c.state)}</td>
       <td class="muted">${escapeHtml(c.end_date)}</td>
@@ -179,7 +195,7 @@ function renderLog() {
     html += `<tr>
       <td>${escapeHtml(u.filename)}</td>
       <td class="muted">${u.uploaded_at ? new Date(u.uploaded_at).toLocaleString() : ''}</td>
-      <td>${escapeHtml(u.catalog_title)}</td>
+      <td>${titleAsLink(u.catalog_title)}</td>
       <td>${u.parsed_lot_count ?? 0}</td>
       <td>${statusHtml}</td>
     </tr>`;
