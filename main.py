@@ -327,35 +327,44 @@ async def health():
     return {"ok": True, "business_id": business_id}
 
 
-@app.get("/api/catalogs")
-async def api_catalogs():
-    supabase_client, business_id = _require_config()
+def _fetch_all_paginated(query_factory) -> list:
+    """query_factory is a callable that returns a fresh Supabase query object
+    (already filtered/ordered, but without .range() applied) each time it's
+    called -- needed because query objects aren't safely reusable across
+    multiple .range() calls. Pages through in chunks of 1000 (Supabase's
+    per-request cap) until exhausted. Use this for ANY query that could
+    plausibly return more than 1000 rows -- this exact silent-undercounting
+    bug class has bitten this project's main app many times before, so every
+    full-table-scan query in this app goes through this one place instead of
+    each one growing its own copy of the same pagination logic (or, worse,
+    skipping it)."""
     rows = []
     start = 0
     while True:
-        page = supabase_client.table("auction_catalogs").select("*")\
-            .eq("business_id", business_id).range(start, start + 999).execute().data or []
+        page = query_factory().range(start, start + 999).execute().data or []
         rows.extend(page)
         if len(page) < 1000:
             break
         start += 1000
+    return rows
+
+
+@app.get("/api/catalogs")
+async def api_catalogs():
+    supabase_client, business_id = _require_config()
+    rows = _fetch_all_paginated(lambda: supabase_client.table("auction_catalogs").select("*").eq("business_id", business_id))
     return {"catalogs": rows}
 
 
 @app.get("/api/lots")
 async def api_lots(catalog_url: str = None):
     supabase_client, business_id = _require_config()
-    q = supabase_client.table("bidspotter_catalog_lots").select("*").eq("business_id", business_id)
-    if catalog_url:
-        q = q.eq("catalog_url", catalog_url)
-    rows = []
-    start = 0
-    while True:
-        page = q.order("last_seen_at", desc=True).range(start, start + 999).execute().data or []
-        rows.extend(page)
-        if len(page) < 1000:
-            break
-        start += 1000
+    def build_query():
+        q = supabase_client.table("bidspotter_catalog_lots").select("*").eq("business_id", business_id)
+        if catalog_url:
+            q = q.eq("catalog_url", catalog_url)
+        return q.order("last_seen_at", desc=True)
+    rows = _fetch_all_paginated(build_query)
     return {"lots": rows}
 
 
@@ -524,16 +533,16 @@ async def upload_zip(request: Request, background_tasks: BackgroundTasks):
 @app.get("/api/pdf-uploads")
 async def api_pdf_uploads():
     supabase_client, business_id = _require_config()
-    res = supabase_client.table("auction_pdf_uploads").select("*").eq("business_id", business_id)\
-        .order("uploaded_at", desc=True).limit(500).execute()
-    return {"uploads": res.data or []}
+    uploads = _fetch_all_paginated(lambda: supabase_client.table("auction_pdf_uploads").select("*")
+                                     .eq("business_id", business_id).order("uploaded_at", desc=True))
+    return {"uploads": uploads}
 
 
 @app.get("/api/needs-update")
 async def api_needs_update():
     supabase_client, business_id = _require_config()
-    all_uploads = supabase_client.table("auction_pdf_uploads").select("*").eq("business_id", business_id)\
-        .order("uploaded_at", desc=True).limit(500).execute().data or []
+    all_uploads = _fetch_all_paginated(lambda: supabase_client.table("auction_pdf_uploads").select("*")
+                                         .eq("business_id", business_id).order("uploaded_at", desc=True))
     latest_by_catalog = {}
     for u in all_uploads:
         key = u.get("catalog_url")
@@ -550,8 +559,8 @@ async def api_needs_update():
     # Real bug this fixes: a catalog could show as both empty AND appear in
     # the regular Catalogs list at the same time, because the log and the
     # actual data could disagree with each other.
-    catalog_rows = supabase_client.table("auction_catalogs").select("catalog_url,lot_count")\
-        .eq("business_id", business_id).execute().data or []
+    catalog_rows = _fetch_all_paginated(lambda: supabase_client.table("auction_catalogs").select("catalog_url,lot_count")
+                                          .eq("business_id", business_id))
     has_real_lots = {c["catalog_url"] for c in catalog_rows if (c.get("lot_count") or 0) > 0}
 
     needs_update = [u for u in latest_by_catalog.values()
