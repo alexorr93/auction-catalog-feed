@@ -108,7 +108,7 @@ def _require_config():
 # Monitor feature (auction-monitor-dev branch), same logic, same behavior.
 # ---------------------------------------------------------------------------
 
-def _extract_lots_via_gemini(raw_text: str, filename: str, on_chunk_lots=None) -> list:
+def _extract_lots_via_gemini(raw_text: str, filename: str, on_chunk_lots=None) -> tuple:
     """Reads the actual catalog text and pulls out every lot directly --
     called whenever the fast regex pass didn't account for every single
     digit-leading line in the catalog (an exact check, not a guessed
@@ -133,11 +133,22 @@ def _extract_lots_via_gemini(raw_text: str, filename: str, on_chunk_lots=None) -
     lost 100% of that catalog's work, not just whatever chunk hadn't run
     yet. If the callback itself raises (e.g. a transient DB error), that
     chunk's lots are still kept in the final returned list as a fallback --
-    only the immediate persistence attempt failed, not the extraction."""
+    only the immediate persistence attempt failed, not the extraction.
+
+    Returns (lots, errors) now, not just lots. Real bug this fixes: every
+    chunk failure (timeout, rate limit, invalid API key, quota exhausted --
+    all real, all seen tonight) was caught and only ever printed to a
+    server console nobody but Railway can see, then silently treated the
+    exact same as "this chunk genuinely had no lots in it." A catalog where
+    EVERY chunk failed for a real infrastructure reason looked identical in
+    the UI to a catalog that's actually empty -- 'empty' status, no hint
+    anything went wrong. Now every failure's message is collected and
+    handed back so the caller can tell the two apart and show the real
+    reason instead of a misleading 'empty'."""
     import google.generativeai as genai
     gemini_key = os.getenv("GEMINI_API_KEY", "")
     if not gemini_key:
-        return []
+        return [], ["GEMINI_API_KEY is not set on this Railway service -- nothing can be extracted without it."]
     genai.configure(api_key=gemini_key)
     model = genai.GenerativeModel("gemini-2.5-flash")
 
@@ -146,6 +157,7 @@ def _extract_lots_via_gemini(raw_text: str, filename: str, on_chunk_lots=None) -
 
     seen_lot_numbers = set()
     combined = []
+    errors = []
     for chunk_i, chunk in enumerate(chunks):
         prompt = f"""This is raw text extracted from an auction catalog PDF named "{filename}"
 (part {chunk_i + 1} of {len(chunks)} -- the catalog is large enough it had to be split).
@@ -198,12 +210,14 @@ Text:
                     print(f"Immediate persist failed for {filename} chunk {chunk_i + 1}/{len(chunks)} "
                           f"(kept in final result, will still save if the catalog completes): {write_err}")
         except Exception as e:
-            print(f"Gemini lot extraction failed for {filename} (chunk {chunk_i + 1}/{len(chunks)}): {e}")
+            err_msg = f"Chunk {chunk_i + 1}/{len(chunks)}: {str(e)[:300]}"
+            print(f"Gemini lot extraction failed for {filename} ({err_msg})")
+            errors.append(err_msg)
             # Keep going with whatever other chunks succeed, rather than
             # losing the whole catalog over one bad chunk
             continue
 
-    return combined
+    return combined, errors
 
 
 def _extract_catalog_metadata_via_gemini(raw_text: str, filename: str) -> dict:
@@ -489,9 +503,25 @@ def _process_one_pdf(supabase_client, business_id: str, filename: str, contents:
             written_count += len(chunk_lots)
             _upsert_catalog_summary(supabase_client, business_id, catalog_url, meta, lot_count=written_count)
 
-        lots = _extract_lots_via_gemini(raw_text, filename, on_chunk_lots=_on_chunk)
+        lots, chunk_errors = _extract_lots_via_gemini(raw_text, filename, on_chunk_lots=_on_chunk)
 
         if not lots:
+            # Real bug fixed here: this used to mark EVERY zero-lot result
+            # as "empty" -- indistinguishable in the UI from a catalog that
+            # genuinely has no lots yet. If chunk_errors is non-empty, every
+            # chunk actually failed (timeout, rate limit, bad API key, quota
+            # exhausted -- all real, all possible) and there's a real reason
+            # nothing came back, not an empty auction. Surface that as an
+            # actual error with the real message instead of hiding it behind
+            # "empty," so a genuine infrastructure failure is never
+            # mistaken for "this auction just doesn't have lots yet."
+            if chunk_errors:
+                error_message = "; ".join(chunk_errors)[:1000]
+                if log_id:
+                    supabase_client.table("auction_pdf_uploads").update({
+                        "status": "error", "storage_path": storage_path, "error_message": error_message,
+                    }).eq("id", log_id).execute()
+                return {"ok": False, "filename": filename, "error": error_message}
             if log_id:
                 supabase_client.table("auction_pdf_uploads").update({
                     "status": "empty", "storage_path": storage_path, "parsed_lot_count": 0,
