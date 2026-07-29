@@ -470,22 +470,6 @@ def _process_one_pdf(supabase_client, business_id: str, filename: str, contents:
         if not raw_text.strip():
             raise ValueError("No text found in this PDF (may be scanned images with no text layer -- not supported yet)")
 
-        # Always extract via Gemini (chunked for large catalogs, so nothing
-        # gets truncated) -- no heuristic deciding whether a shortcut can be
-        # trusted, because every version of that heuristic tried so far had
-        # a real blind spot (a catalog whose lot lines don't start with a
-        # digit at all would report the regex as "complete" even while
-        # missing every single lot). Reads what's actually in the PDF every
-        # time instead of guessing when that's necessary.
-        lots = _extract_lots_via_gemini(raw_text, filename)
-
-        if not lots:
-            if log_id:
-                supabase_client.table("auction_pdf_uploads").update({
-                    "status": "empty", "storage_path": storage_path, "parsed_lot_count": 0,
-                }).eq("id", log_id).execute()
-            return {"ok": True, "filename": filename, "lots_parsed": 0, "empty": True, "catalog_url": catalog_url}
-
         meta = {"title": title, "auctioneer": auctioneer, "end_date": end_date, "state": state, "zip_code": zip_code}
 
         # Real bug fixed here: this used to call _extract_lots_via_gemini
