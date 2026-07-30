@@ -16,6 +16,7 @@ import io
 import json
 import time
 import uuid
+import concurrent.futures
 from datetime import datetime, timezone
 
 import fitz  # PyMuPDF
@@ -609,11 +610,56 @@ def _process_zip_batch(supabase_client, business_id: str, pdf_entries: list) -> 
     one at a time, same logic as a single upload for each. Progress is visible
     the whole time through the existing Upload Log / Needs Update / Catalogs
     views -- no separate progress UI needed, since each file logs itself as it
-    completes, exactly like uploading them one by one would."""
+    completes, exactly like uploading them one by one would.
+
+    Real bug fixed here: one single file got stuck processing for 1.5+ hours
+    and silently froze the ENTIRE remaining batch behind it (349 other files
+    never even started) -- because this loop called _process_one_pdf directly
+    and just waited, with nothing to give up on a file that hangs. The
+    per-Gemini-call 120s timeout added earlier turned out to NOT be reliably
+    honored by the underlying SDK in every failure mode (a real gap, not a
+    theory -- confirmed by exactly this happening in production). Rather than
+    chase which specific internal call can still hang, every file's ENTIRE
+    processing now runs under one hard, unconditional 10-minute ceiling --
+    if anything inside it hangs for any reason at all, this loop gives up on
+    that one file, logs it as a real timeout error, and moves on to the next
+    file immediately instead of stalling the other 349 behind it."""
     print(f"Zip batch: starting {len(pdf_entries)} catalog(s)")
     for i, (filename, contents) in enumerate(pdf_entries):
         try:
-            result = _process_one_pdf(supabase_client, business_id, filename, contents)
+            # Deliberately NOT a `with ThreadPoolExecutor() as ex:` block --
+            # caught via direct testing before this shipped: the context
+            # manager's __exit__ calls shutdown(wait=True), which blocks
+            # until the submitted task actually finishes -- meaning even
+            # after catching TimeoutError below, exiting the `with` block
+            # would silently wait for the stuck file anyway, completely
+            # defeating the point of the watchdog. shutdown(wait=False)
+            # lets this loop actually move on; the orphaned thread (if the
+            # file really is stuck forever) just keeps running harmlessly
+            # in the background instead of blocking anything else.
+            ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            future = ex.submit(_process_one_pdf, supabase_client, business_id, filename, contents)
+            try:
+                result = future.result(timeout=600)
+            except concurrent.futures.TimeoutError:
+                ex.shutdown(wait=False)
+                print(f"Zip batch: {filename} exceeded the 10-minute hard watchdog timeout -- "
+                      f"giving up on this file and moving on (the stuck attempt may still finish "
+                      f"on its own later and overwrite this with a real result)")
+                try:
+                    supabase_client.table("auction_pdf_uploads").insert({
+                        "business_id": business_id, "filename": filename,
+                        "catalog_url": re.sub(r'[^A-Za-z0-9._-]', '_', filename.rsplit(".", 1)[0]),
+                        "status": "error",
+                        "error_message": "Hard watchdog timeout: this file's processing did not "
+                                          "complete within 10 minutes, so it was skipped to let the "
+                                          "rest of the batch continue. Try uploading this one file "
+                                          "again on its own.",
+                    }).execute()
+                except Exception as log_err:
+                    print(f"Zip batch: also failed to log the watchdog timeout for {filename}: {log_err}")
+                continue
+            ex.shutdown(wait=False)
             if result.get("needs_backfill") and result.get("raw_text"):
                 # Zip batches already run entirely in the background, so no
                 # need to schedule this separately -- just do it inline, one
