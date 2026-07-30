@@ -14,6 +14,7 @@ import os
 import re
 import io
 import json
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -178,39 +179,52 @@ Return ONLY a JSON array, no other text, in this exact shape:
 
 Text:
 {chunk}"""
-        try:
-            # Real bug fixed here: this had no timeout at all -- if the
-            # Gemini call hangs for any reason (network issue, throttling,
-            # anything), there was nothing to make it give up, so the whole
-            # background task (and the catalog it was processing) could sit
-            # stuck indefinitely with zero visible error. 120s is generous
-            # for a single ~80k-char chunk but still finite -- a timeout
-            # here is caught below like any other per-chunk failure and
-            # just skips to the next chunk instead of hanging the catalog.
-            resp = model.generate_content(prompt, request_options={"timeout": 120})
-            text = resp.text.strip()
-            if text.startswith("```"):
-                text = text.split("```")[1]
-                if text.startswith("json"):
-                    text = text[4:]
-            parsed = json.loads(text.strip())
-            chunk_lots = []
-            for r in parsed:
-                lot_number = str(r.get("lot_number", "")).strip()
-                description = (r.get("description") or "")[:2000]
-                if lot_number and description and lot_number not in seen_lot_numbers:
-                    seen_lot_numbers.add(lot_number)
-                    row = {"lot_number": lot_number, "description": description}
-                    combined.append(row)
-                    chunk_lots.append(row)
-            if chunk_lots and on_chunk_lots:
-                try:
-                    on_chunk_lots(chunk_lots)
-                except Exception as write_err:
-                    print(f"Immediate persist failed for {filename} chunk {chunk_i + 1}/{len(chunks)} "
-                          f"(kept in final result, will still save if the catalog completes): {write_err}")
-        except Exception as e:
-            err_msg = f"Chunk {chunk_i + 1}/{len(chunks)}: {str(e)[:300]}"
+        # Real bug fixed here: a single failed attempt permanently marked
+        # this chunk (and often the whole catalog) as failed, forever, with
+        # no retry at all. Real data from a 190-catalog batch showed 85% of
+        # all errors were transient failures on Gemini's OWN backend --
+        # 504 timeouts, "stream cancelled," literal internal inference
+        # failures -- exactly the class of error that commonly succeeds a
+        # few seconds later once Google's backend recovers from being
+        # overloaded by a burst of requests. Retries up to 3 times total
+        # with increasing backoff (4s, 10s) before giving up on this chunk
+        # for real.
+        last_error = None
+        for attempt in range(3):
+            try:
+                resp = model.generate_content(prompt, request_options={"timeout": 120})
+                text = resp.text.strip()
+                if text.startswith("```"):
+                    text = text.split("```")[1]
+                    if text.startswith("json"):
+                        text = text[4:]
+                parsed = json.loads(text.strip())
+                chunk_lots = []
+                for r in parsed:
+                    lot_number = str(r.get("lot_number", "")).strip()
+                    description = (r.get("description") or "")[:2000]
+                    if lot_number and description and lot_number not in seen_lot_numbers:
+                        seen_lot_numbers.add(lot_number)
+                        row = {"lot_number": lot_number, "description": description}
+                        combined.append(row)
+                        chunk_lots.append(row)
+                if chunk_lots and on_chunk_lots:
+                    try:
+                        on_chunk_lots(chunk_lots)
+                    except Exception as write_err:
+                        print(f"Immediate persist failed for {filename} chunk {chunk_i + 1}/{len(chunks)} "
+                              f"(kept in final result, will still save if the catalog completes): {write_err}")
+                last_error = None
+                break
+            except Exception as e:
+                last_error = e
+                if attempt < 2:
+                    wait_s = 4 if attempt == 0 else 10
+                    print(f"Gemini call failed for {filename} chunk {chunk_i + 1}/{len(chunks)} "
+                          f"(attempt {attempt + 1}/3, retrying in {wait_s}s): {e}")
+                    time.sleep(wait_s)
+        if last_error is not None:
+            err_msg = f"Chunk {chunk_i + 1}/{len(chunks)} (after 3 attempts): {str(last_error)[:300]}"
             print(f"Gemini lot extraction failed for {filename} ({err_msg})")
             errors.append(err_msg)
             # Keep going with whatever other chunks succeed, rather than
