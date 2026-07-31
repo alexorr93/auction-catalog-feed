@@ -36,6 +36,12 @@ a:hover { color: #93c5fd; }
   <h1>📋 Auction Catalog Feed</h1>
   <div class="sub">Public view of tracked auction catalogs and lots. Anyone with this link can see and add catalogs — no login required.</div>
 
+  <div style="margin-bottom:22px;">
+    <div style="font-size:15px;font-weight:700;margin-bottom:8px;">🔄 Updates to Make</div>
+    <div class="sub" style="margin-bottom:8px;">Auto-detected daily from BidSpotter's own site: catalogs that are brand new (never pulled here) or that were blank before and now have real lots posted. Click "View on BidSpotter" to grab the PDF, then upload it below — this clears itself automatically the moment lots land for that catalog.</div>
+    <div id="updates-to-make"><div class="empty">Loading...</div></div>
+  </div>
+
   <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:22px;align-items:flex-start;">
     <div>
       <label class="upload-btn" for="pdf-file-input">📄 Upload PDF</label>
@@ -122,6 +128,7 @@ function titleAsLink(title, displayText) {
 
 async function loadAll() {
   loadNeedsUpdateQueue(); // starts immediately and renders itself the moment it resolves -- not gated behind the heavier fetches below
+  loadUpdatesToMake();
   await Promise.all([loadCatalogs(), loadLots(), loadPdfUploadLog()]);
   renderCurrentView();
 }
@@ -363,6 +370,39 @@ function renderNeedsUpdateTable() {
   }
   html += '</tbody></table>';
   el.innerHTML = html;
+}
+
+async function loadUpdatesToMake() {
+  const el = document.getElementById('updates-to-make');
+  try {
+    const r = await fetch('/api/updates-to-make');
+    const data = await r.json();
+    const items = data.updates || [];
+    if (!items.length) { el.innerHTML = '<div class="empty">Nothing pending — all caught up.</div>'; return; }
+    let html = `<table><thead><tr><th>Title</th><th>Type</th><th>Flagged</th><th></th></tr></thead><tbody>`;
+    for (const it of items) {
+      const badge = it.kind === 'new'
+        ? `<span style="color:var(--accent);font-weight:700;">🆕 New</span>`
+        : `<span style="color:var(--amber);font-weight:700;">🔁 Reactivated</span>`;
+      const bidspotterUrl = reconstructBidspotterUrl(it.catalog_url);
+      html += `<tr>
+        <td>${escapeHtml(it.title || it.catalog_url)}</td>
+        <td>${badge}</td>
+        <td class="muted">${it.first_flagged_at ? new Date(it.first_flagged_at).toLocaleDateString() : ''}</td>
+        <td>${bidspotterUrl ? `<a href="${bidspotterUrl}" target="_blank" rel="noopener noreferrer">View on BidSpotter</a>` : ''}</td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    el.innerHTML = html;
+  } catch(e) {
+    el.innerHTML = `<div class="empty">Failed to load: ${e.message}</div>`;
+  }
+}
+
+function reconstructBidspotterUrl(catalogUrl) {
+  const m = (catalogUrl || '').match(/^https(www\.bidspotter\.com)en-usauction-catalogues(.+?)(catalogue-id-.+)$/);
+  if (!m) return null;
+  return `https://${m[1]}/en-us/auction-catalogues/${m[2]}/${m[3]}`;
 }
 
 async function loadNeedsUpdateQueue() {
