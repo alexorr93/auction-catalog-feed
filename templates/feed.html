@@ -203,9 +203,11 @@ function renderLog() {
       ? `<span style="color:var(--green);">✓ Success</span>`
       : u.status === 'empty'
         ? `<span style="color:var(--amber);">⏳ No lots yet</span>`
-        : u.status === 'error'
-          ? `<span style="color:var(--red);" title="${escapeHtml(u.error_message)}">✗ Error — ${escapeHtml(u.error_message || 'unknown')}</span>`
-          : `<span class="muted">⏳ Processing</span>`;
+        : u.status === 'partial'
+          ? `<span style="color:var(--red);font-weight:700;" title="${escapeHtml(u.error_message)}">⚠️ PARTIAL — likely incomplete, re-upload</span>`
+          : u.status === 'error'
+            ? `<span style="color:var(--red);" title="${escapeHtml(u.error_message)}">✗ Error — ${escapeHtml(u.error_message || 'unknown')}</span>`
+            : `<span class="muted">⏳ Processing</span>`;
     html += `<tr>
       <td>${escapeHtml(u.filename)}</td>
       <td class="muted">${u.uploaded_at ? new Date(u.uploaded_at).toLocaleString() : ''}</td>
