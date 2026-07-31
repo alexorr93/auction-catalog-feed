@@ -372,6 +372,10 @@ def _backfill_catalog_metadata(supabase_client, business_id: str, catalog_url: s
             supabase_client.table("bidspotter_catalog_lots").update(lot_patch)\
                 .eq("business_id", business_id).eq("catalog_url", catalog_url).execute()
 
+        if not end_date and auto_meta.get("end_date"):
+            supabase_client.table("auction_pdf_uploads").update({"end_date": auto_meta["end_date"]})\
+                .eq("business_id", business_id).eq("catalog_url", catalog_url).execute()
+
         catalog_patch = {}
         if not state and auto_meta.get("state"):
             catalog_patch["state"] = auto_meta["state"]
@@ -744,7 +748,7 @@ async def api_needs_update():
     needs_update = [u for u in latest_by_catalog.values()
                      if u.get("status") == "empty" and u.get("catalog_url") not in has_real_lots]
     for u in needs_update:
-        u["end_date"] = end_date_by_catalog.get(u.get("catalog_url"))
+        u["end_date"] = u.get("end_date") or end_date_by_catalog.get(u.get("catalog_url"))
     needs_update.sort(key=lambda u: u.get("uploaded_at") or "", reverse=True)
     return {"needs_update": needs_update}
 
