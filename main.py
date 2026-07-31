@@ -542,10 +542,18 @@ class _BrightDataResponse:
                 request=None, response=None,
             )
 
-async def _brightdata_get(client: httpx.AsyncClient, target_url: str) -> _BrightDataResponse:
+async def _brightdata_get(client: httpx.AsyncClient, target_url: str, expect_selector: str = None) -> _BrightDataResponse:
     """Fetch target_url through Bright Data's Web Unlocker API instead of
     fetching it directly. HARD-LOCKED to bidspotter.com -- refuses (raises,
-    sends nothing) for any other domain."""
+    sends nothing) for any other domain.
+
+    expect_selector: a CSS selector to wait for before Bright Data returns
+    the response (their x-unblock-expect feature). BidSpotter's listing page
+    is an AngularJS SPA -- the initial HTML is an empty shell (ng-cloak) with
+    the real catalog links injected client-side by JS, so without this the
+    WAF-unlocked page comes back real but still empty. Only pass this where
+    the selector is guaranteed to eventually appear -- if it never does,
+    Bright Data waits out its own render timeout before giving up."""
     host = urlparse(target_url).netloc.lower()
     if not (host == _BIDSPOTTER_ALLOWED_HOST or host.endswith("." + _BIDSPOTTER_ALLOWED_HOST)):
         raise BrightDataMisuseError(f"Refusing to fetch non-BidSpotter domain via Bright Data: {host!r}")
@@ -555,10 +563,17 @@ async def _brightdata_get(client: httpx.AsyncClient, target_url: str) -> _Bright
     if not api_key:
         raise RuntimeError("BRIGHT_DATA_API_KEY is not set -- cannot fetch BidSpotter pages")
 
+    payload = {"zone": zone, "url": target_url, "format": "json"}
+    if expect_selector:
+        # NOTE: enabling this custom header switches Bright Data's billing for
+        # this request from pay-only-on-success to pay-on-every-attempt. Still
+        # trivial money at our volume (a handful of requests/day), so left on.
+        payload["headers"] = {"x-unblock-expect": json.dumps({"element": expect_selector})}
+
     resp = await client.post(
         "https://api.brightdata.com/request",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={"zone": zone, "url": target_url, "format": "json"},
+        json=payload,
         timeout=150.0,  # BidSpotter's WAF challenge can take well over 60s to solve
     )
     if resp.status_code != 200:
@@ -622,7 +637,7 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
         while page <= 60 and empty_pages_in_a_row < 2:  # hard ceiling -- never loop forever on an unexpected layout change
             url = f"https://www.bidspotter.com/en-us/auction-catalogues?page={page}"
             try:
-                resp = await _brightdata_get(client, url)
+                resp = await _brightdata_get(client, url, expect_selector='a[href*="catalogue-id-"]')
                 resp.raise_for_status()
             except Exception as e:
                 err = f"page {page} fetch failed: {type(e).__name__}: {e}"
