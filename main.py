@@ -548,6 +548,7 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
     all_listings = {}
     pages_fetched = 0
     first_page_error = None
+    first_page_diagnostic = None  # captured on page 1 only, used purely for debugging a 0-listings outcome
     async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
         page = 1
         empty_pages_in_a_row = 0
@@ -564,6 +565,15 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
                 break
             pages_fetched += 1
             listings = _parse_bidspotter_listing_page(resp.text)
+            if page == 1:
+                # Capture real evidence of what came back -- status, length, final
+                # URL (redirects reveal a challenge/interstitial), and a snippet --
+                # so a 0-listings outcome is diagnosable, not guessed at.
+                snippet = re.sub(r'\s+', ' ', resp.text[:400]).strip()
+                first_page_diagnostic = (
+                    f"page1 status={resp.status_code} bytes={len(resp.text)} "
+                    f"final_url={str(resp.url)} snippet=\"{snippet}\""
+                )
             if not listings:
                 empty_pages_in_a_row += 1
             else:
@@ -576,7 +586,7 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
         return {"ok": False, "error": first_page_error, "pages": pages_fetched, "listings": 0, "new_flagged": 0}
 
     if not all_listings:
-        msg = "found nothing at all -- likely a page layout change, not a real empty result"
+        msg = f"found nothing at all -- likely a page layout change or a bot-block, not a real empty result | {first_page_diagnostic}"
         print(f"BidSpotter scan: {msg}")
         return {"ok": False, "error": msg, "pages": pages_fetched, "listings": 0, "new_flagged": 0}
 
