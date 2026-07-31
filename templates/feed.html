@@ -27,6 +27,8 @@ a:hover { color: #93c5fd; }
 .tabs { display: flex; gap: 6px; margin-bottom: 16px; }
 .tab-btn { padding: 8px 14px; border-radius: 8px; border: 1px solid var(--border); background: #1e2535; color: var(--muted); font-size: 13px; font-weight: 600; cursor: pointer; }
 .tab-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.upload-btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--border); background: var(--card); color: var(--text); font-size: 13px; font-weight: 600; cursor: pointer; transition: border-color 0.15s; }
+.upload-btn:hover { border-color: var(--accent); }
 </style>
 </head>
 <body>
@@ -34,48 +36,30 @@ a:hover { color: #93c5fd; }
   <h1>📋 Auction Catalog Feed</h1>
   <div class="sub">Public view of tracked auction catalogs and lots. Anyone with this link can see and add catalogs — no login required.</div>
 
-  <div style="background:var(--card);border:2px solid var(--accent);border-radius:12px;padding:18px;margin-bottom:22px;">
-    <div style="font-size:16px;font-weight:700;margin-bottom:4px;">📄 Upload a Catalog PDF</div>
-    <div class="sub" style="margin-bottom:14px;">Drop in a catalog PDF and it gets read automatically. Title/auctioneer/date/state are optional — filled in from the PDF itself if left blank.</div>
-    <div id="pdf-drop-zone" style="border:2px dashed var(--border);border-radius:10px;padding:30px;text-align:center;cursor:pointer;margin-bottom:12px;"
-         onclick="document.getElementById('pdf-file-input').click()"
-         ondragover="event.preventDefault();this.style.borderColor='var(--accent)';"
-         ondragleave="this.style.borderColor='var(--border)';"
-         ondrop="handlePdfDrop(event)">
-      <div style="font-size:32px;margin-bottom:6px;">📎</div>
-      <div style="font-weight:600;">Click to choose a PDF, or drag one here</div>
-      <div class="sub" style="margin-top:4px;margin-bottom:0;">One at a time or several at once</div>
-      <input type="file" id="pdf-file-input" accept="application/pdf" multiple style="display:none;" onchange="handlePdfPick(this.files)"/>
-    </div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px;">
-      <input type="text" class="field-input" id="pdf-title-input" placeholder="Title (optional)" style="flex:1;min-width:160px;" autocomplete="off"/>
-      <input type="text" class="field-input" id="pdf-auctioneer-input" placeholder="Auctioneer (optional)" style="flex:1;min-width:160px;" autocomplete="off"/>
-      <input type="text" class="field-input" id="pdf-enddate-input" placeholder="End date (optional)" style="width:150px;" autocomplete="off"/>
-      <input type="text" class="field-input" id="pdf-state-input" placeholder="State (optional)" style="width:110px;" autocomplete="off"/>
-      <input type="text" class="field-input" id="pdf-zip-input" placeholder="ZIP (optional)" style="width:100px;" autocomplete="off"/>
-    </div>
-    <div id="pdf-upload-status"></div>
-  </div>
-
-  <div style="background:var(--card);border:2px solid #16a34a;border-radius:12px;padding:18px;margin-bottom:22px;">
-    <div style="font-size:16px;font-weight:700;margin-bottom:4px;">📦 Upload Many Catalogs at Once (.zip)</div>
-    <div class="sub" style="margin-bottom:14px;">Got a whole folder of catalog PDFs (e.g. 350 of them)? Zip them up and drop the zip here instead of uploading one at a time — it processes them all in the background. Watch the Upload Log and Needs Update sections below to see them come in as each one finishes; no need to wait on this page.</div>
-    <div id="zip-drop-zone" style="border:2px dashed #16a34a;border-radius:10px;padding:24px;text-align:center;cursor:pointer;"
-         onclick="document.getElementById('zip-file-input').click()"
-         ondragover="event.preventDefault();this.style.borderColor='#22c55e';"
-         ondragleave="this.style.borderColor='#16a34a';"
-         ondrop="handleZipDrop(event)">
-      <div style="font-size:28px;margin-bottom:4px;">📦</div>
-      <div style="font-weight:600;">Click to choose a .zip, or drag one here</div>
-      <input type="file" id="zip-file-input" accept=".zip,application/zip" style="display:none;" onchange="handleZipPick(this.files)"/>
-    </div>
-    <div id="zip-upload-status" style="margin-top:10px;"></div>
-  </div>
-
   <div style="margin-bottom:22px;">
     <div style="font-size:15px;font-weight:700;margin-bottom:8px;">⏳ Needs Update — No Lots Yet</div>
     <div class="sub" style="margin-bottom:8px;">These auctions exist but had zero lots posted when uploaded. Uploading a newer PDF for the same auction with lots in it clears it from this list automatically.</div>
     <div id="pdf-needs-update"><div class="empty">Loading...</div></div>
+  </div>
+
+  <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:22px;align-items:flex-start;">
+    <div>
+      <label class="upload-btn" for="pdf-file-input">📄 Upload PDF</label>
+      <input type="file" id="pdf-file-input" accept="application/pdf" multiple style="display:none;" onchange="handlePdfPick(this.files)"/>
+      <div id="pdf-upload-status" style="margin-top:6px;"></div>
+    </div>
+    <div>
+      <label class="upload-btn" for="zip-file-input" style="border-color:#16a34a;">📦 Upload .zip</label>
+      <input type="file" id="zip-file-input" accept=".zip,application/zip" style="display:none;" onchange="handleZipPick(this.files)"/>
+      <div id="zip-upload-status" style="margin-top:6px;"></div>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;flex:1;min-width:280px;">
+      <input type="text" class="field-input" id="pdf-title-input" placeholder="Title (optional)" style="flex:1;min-width:120px;" autocomplete="off"/>
+      <input type="text" class="field-input" id="pdf-auctioneer-input" placeholder="Auctioneer (optional)" style="flex:1;min-width:120px;" autocomplete="off"/>
+      <input type="text" class="field-input" id="pdf-enddate-input" placeholder="End date" style="width:110px;" autocomplete="off"/>
+      <input type="text" class="field-input" id="pdf-state-input" placeholder="State" style="width:80px;" autocomplete="off"/>
+      <input type="text" class="field-input" id="pdf-zip-input" placeholder="ZIP" style="width:80px;" autocomplete="off"/>
+    </div>
   </div>
 
   <div class="tabs">
@@ -135,7 +119,8 @@ function titleAsLink(title) {
 }
 
 async function loadAll() {
-  await Promise.all([loadCatalogs(), loadLots(), loadPdfUploadLog(), loadNeedsUpdateQueue()]);
+  loadNeedsUpdateQueue(); // starts immediately and renders itself the moment it resolves -- not gated behind the heavier fetches below
+  await Promise.all([loadCatalogs(), loadLots(), loadPdfUploadLog()]);
   renderCurrentView();
 }
 
