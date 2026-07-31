@@ -606,9 +606,42 @@ def _full_url_to_catalog_url(full_url: str) -> str:
     return re.sub(r'[:/]', '', full_url)
 
 def _parse_bidspotter_listing_page(html: str) -> list:
-    """Plain HTML parsing, no AI. Each listing card has its title/link
-    repeated a few times (image, title, 'View auction') -- dedupes on
-    catalog_url. Returns [{catalog_url, title, full_url}, ...]."""
+    """BidSpotter's listing page is an AngularJS SPA -- clickable <a href>
+    catalog links only exist in the DOM after client-side JS runs, which a
+    plain fetch never sees. BUT the same catalog data is ALSO embedded
+    directly in the raw HTML as schema.org structured data (for SEO) --
+    confirmed via a live diagnostic showing real catalog urls/dates present
+    in the un-rendered response body at a fixed JSON shape:
+      "name": "...", ..., "url": "https://www.bidspotter.com/en-us/auction-
+      catalogues/<slug>/catalogue-id-<id>", "location": {"url": "<same>", ...}
+    We parse THAT instead of DOM anchors -- no JS rendering required, so this
+    also works on a plain WAF-unlocked fetch (no x-unblock-expect needed).
+    Each catalog's url appears twice (top-level + nested "location.url",
+    identical) -- deduped on catalog_url same as the old anchor-based code."""
+    seen = set()
+    listings = []
+    url_pattern = re.compile(
+        r'"url"\s*:\s*"(https://www\.bidspotter\.com/en-us/auction-catalogues/[^"]*catalogue-id-[^"]+)"'
+    )
+    name_pattern = re.compile(r'"name"\s*:\s*"([^"]*)"')
+    for m in url_pattern.finditer(html):
+        full_url = m.group(1)
+        catalog_url = _full_url_to_catalog_url(full_url)
+        if catalog_url in seen:
+            continue
+        seen.add(catalog_url)
+        # The catalog's display name is the nearest preceding "name" field in
+        # the same JSON object (schema.org Event puts name before url/location).
+        window = html[max(0, m.start() - 800):m.start()]
+        name_matches = name_pattern.findall(window)
+        title = name_matches[-1] if name_matches else full_url
+        listings.append({"catalog_url": catalog_url, "title": title, "full_url": full_url})
+    return listings
+
+def _parse_bidspotter_listing_page_OLD_UNUSED(html: str) -> list:
+    """Kept for reference only -- not called. Original anchor-tag based
+    parser, replaced because BidSpotter's <a href> catalog links only exist
+    post-JS-render, which a plain fetch never produces."""
     soup = BeautifulSoup(html, "html.parser")
     seen = set()
     listings = []
@@ -648,7 +681,7 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
         while page <= 60 and empty_pages_in_a_row < 2:  # hard ceiling -- never loop forever on an unexpected layout change
             url = f"https://www.bidspotter.com/en-us/auction-catalogues?page={page}"
             try:
-                resp = await _brightdata_get(client, url, expect_selector='a[href*="catalogue-id-"]')
+                resp = await _brightdata_get(client, url)
                 resp.raise_for_status()
             except Exception as e:
                 err = f"page {page} fetch failed: {type(e).__name__}: {e}"
