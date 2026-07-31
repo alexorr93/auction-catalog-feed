@@ -535,14 +535,19 @@ def _parse_bidspotter_listing_page(html: str) -> list:
             listings.append({"catalog_url": catalog_url, "title": title, "full_url": full_url})
     return listings
 
-async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> int:
+async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> dict:
     """Job 1. Pages through the full public listing, stores every catalog
     seen into bidspotter_scan_snapshot (a durable record -- if BidSpotter
     ever changes their page layout and parsing silently breaks, this table
     going stale/empty is how that gets noticed instead of just quietly
     missing catalogs forever), then flags anything not already in
-    auction_pdf_uploads as a new item in the updates queue."""
+    auction_pdf_uploads as a new item in the updates queue. Returns a dict
+    describing what actually happened -- including the real error if the
+    first fetch fails, since that failure was previously completely
+    invisible (a background task, no request, nothing in reach to check)."""
     all_listings = {}
+    pages_fetched = 0
+    first_page_error = None
     async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
         page = 1
         empty_pages_in_a_row = 0
@@ -552,8 +557,12 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> in
                 resp = await client.get(url)
                 resp.raise_for_status()
             except Exception as e:
-                print(f"BidSpotter scan: page {page} fetch failed: {e}")
+                err = f"page {page} fetch failed: {type(e).__name__}: {e}"
+                print(f"BidSpotter scan: {err}")
+                if page == 1:
+                    first_page_error = err
                 break
+            pages_fetched += 1
             listings = _parse_bidspotter_listing_page(resp.text)
             if not listings:
                 empty_pages_in_a_row += 1
@@ -563,9 +572,13 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> in
                     all_listings[item["catalog_url"]] = item
             page += 1
 
+    if first_page_error:
+        return {"ok": False, "error": first_page_error, "pages": pages_fetched, "listings": 0, "new_flagged": 0}
+
     if not all_listings:
-        print("BidSpotter scan: found nothing at all -- likely a page layout change, not a real empty result. Skipping this run rather than risk a false 'everything is new' flood.")
-        return 0
+        msg = "found nothing at all -- likely a page layout change, not a real empty result"
+        print(f"BidSpotter scan: {msg}")
+        return {"ok": False, "error": msg, "pages": pages_fetched, "listings": 0, "new_flagged": 0}
 
     now_iso = datetime.now(timezone.utc).isoformat()
     snapshot_rows = [
@@ -594,9 +607,9 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> in
             new_count += 1
         except Exception as e:
             print(f"BidSpotter scan: failed to queue new catalog {catalog_url}: {e}")
-    return new_count
+    return {"ok": True, "error": None, "pages": pages_fetched, "listings": len(all_listings), "new_flagged": new_count}
 
-async def _recheck_blank_catalogs(supabase_client, business_id: str) -> int:
+async def _recheck_blank_catalogs(supabase_client, business_id: str) -> dict:
     """Job 2. For every catalog we already know about that's currently
     sitting at zero lots, re-fetches its own individual page directly and
     checks for real content. A catalog card shows a 'Cannot load data'
@@ -611,6 +624,8 @@ async def _recheck_blank_catalogs(supabase_client, business_id: str) -> int:
 
     blank_catalogs = [r for r in latest_status.values() if r["status"] == "empty"]
     reactivated_count = 0
+    checked = 0
+    first_error = None
 
     async with httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
         for row in blank_catalogs:
@@ -621,9 +636,14 @@ async def _recheck_blank_catalogs(supabase_client, business_id: str) -> int:
             try:
                 resp = await client.get(real_url)
                 if resp.status_code != 200:
+                    if first_error is None:
+                        first_error = f"{catalog_url}: HTTP {resp.status_code}"
                     continue
                 text = resp.text
-            except Exception:
+                checked += 1
+            except Exception as e:
+                if first_error is None:
+                    first_error = f"{catalog_url}: {type(e).__name__}: {e}"
                 continue
 
             has_real_content = bool(re.search(r'search-filter\?CategoryCode=', text))
@@ -636,7 +656,7 @@ async def _recheck_blank_catalogs(supabase_client, business_id: str) -> int:
                     reactivated_count += 1
                 except Exception as e:
                     print(f"BidSpotter recheck: failed to queue reactivated catalog {catalog_url}: {e}")
-    return reactivated_count
+    return {"total_blank": len(blank_catalogs), "checked": checked, "reactivated": reactivated_count, "first_error": first_error}
 
 def _reconstruct_full_url(catalog_url: str) -> Optional[str]:
     """Inverse of _full_url_to_catalog_url -- rebuilds a real, fetchable
@@ -646,11 +666,37 @@ def _reconstruct_full_url(catalog_url: str) -> Optional[str]:
         return None
     return f"https://{m.group(1)}/en-us/auction-catalogues/{m.group(2)}/{m.group(3)}"
 
+async def _run_bidspotter_scan_for_business(supabase_client, business_id: str):
+    """Runs both jobs once for one business and writes the outcome (success
+    or the real error) into bidspotter_scan_status -- so what actually
+    happened is checkable via a normal query, not lost in server logs
+    nobody can reach."""
+    scan_result = await _scan_bidspotter_new_catalogs(supabase_client, business_id)
+    recheck_result = await _recheck_blank_catalogs(supabase_client, business_id)
+    error_parts = []
+    if not scan_result["ok"]:
+        error_parts.append(f"New-catalog scan: {scan_result['error']}")
+    if recheck_result["first_error"]:
+        error_parts.append(f"Blank-catalog recheck: {recheck_result['first_error']}")
+    status_row = {
+        "business_id": business_id,
+        "last_run_at": datetime.now(timezone.utc).isoformat(),
+        "last_success": scan_result["ok"],
+        "last_error": " | ".join(error_parts) if error_parts else None,
+        "pages_scanned": scan_result["pages"],
+        "listings_found": scan_result["listings"],
+        "new_flagged": scan_result["new_flagged"],
+        "reactivated_flagged": recheck_result["reactivated"],
+    }
+    supabase_client.table("bidspotter_scan_status").upsert(status_row, on_conflict="business_id").execute()
+    print(f"BidSpotter scan for {business_id}: {status_row}")
+    return status_row
+
 async def _daily_bidspotter_scan_loop():
     """Runs once at startup (after a short delay so the app is fully up
     first), then once every 12 hours after that, for every business_id that
-    has ever used this app. No manual trigger needed -- this is the whole
-    point, it just runs."""
+    has ever used this app. No manual trigger needed for normal operation --
+    /api/updates/trigger-scan exists purely for on-demand debugging."""
     await asyncio.sleep(30)
     while True:
         try:
@@ -658,9 +704,7 @@ async def _daily_bidspotter_scan_loop():
             biz_rows = supabase_client.table("auction_pdf_uploads").select("business_id").limit(1000).execute().data or []
             business_ids = {r["business_id"] for r in biz_rows}
             for business_id in business_ids:
-                new_n = await _scan_bidspotter_new_catalogs(supabase_client, business_id)
-                react_n = await _recheck_blank_catalogs(supabase_client, business_id)
-                print(f"BidSpotter daily scan for {business_id}: {new_n} new, {react_n} reactivated")
+                await _run_bidspotter_scan_for_business(supabase_client, business_id)
         except Exception as e:
             print(f"BidSpotter daily scan loop failed: {e}")
         await asyncio.sleep(12 * 60 * 60)
@@ -668,6 +712,15 @@ async def _daily_bidspotter_scan_loop():
 @app.on_event("startup")
 async def _start_bidspotter_scan_loop():
     asyncio.create_task(_daily_bidspotter_scan_loop())
+
+@app.post("/api/updates/trigger-scan")
+async def api_trigger_scan():
+    """Manual, on-demand trigger for debugging -- runs the exact same scan
+    the background loop runs, immediately, and returns exactly what
+    happened (including the real error, if any) directly in the response."""
+    supabase_client, business_id = _require_config()
+    status_row = await _run_bidspotter_scan_for_business(supabase_client, business_id)
+    return status_row
 
 @app.get("/api/updates-to-make")
 async def api_updates_to_make():
