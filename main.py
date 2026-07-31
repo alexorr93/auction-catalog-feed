@@ -713,7 +713,7 @@ async def _daily_bidspotter_scan_loop():
 async def _start_bidspotter_scan_loop():
     asyncio.create_task(_daily_bidspotter_scan_loop())
 
-@app.post("/api/updates/trigger-scan")
+@app.api_route("/api/updates/trigger-scan", methods=["GET", "POST"])
 async def api_trigger_scan():
     """Manual, on-demand trigger for debugging -- runs the exact same scan
     the background loop runs, immediately, and returns exactly what
