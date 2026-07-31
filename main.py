@@ -541,7 +541,9 @@ def _process_one_pdf(supabase_client, business_id: str, filename: str, contents:
                 supabase_client.table("auction_pdf_uploads").update({
                     "status": "empty", "storage_path": storage_path, "parsed_lot_count": 0,
                 }).eq("id", log_id).execute()
-            return {"ok": True, "filename": filename, "lots_parsed": 0, "empty": True, "catalog_url": catalog_url}
+            needs_backfill = not (state and zip_code and end_date)
+            return {"ok": True, "filename": filename, "lots_parsed": 0, "empty": True, "catalog_url": catalog_url,
+                    "needs_backfill": needs_backfill, "raw_text": raw_text if needs_backfill else None}
 
         # written_count tracks what actually landed via the per-chunk
         # callback, which is the real durable number -- if any single
