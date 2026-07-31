@@ -559,7 +559,7 @@ async def _brightdata_get(client: httpx.AsyncClient, target_url: str) -> _Bright
         "https://api.brightdata.com/request",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json={"zone": zone, "url": target_url, "format": "json"},
-        timeout=60.0,
+        timeout=150.0,  # BidSpotter's WAF challenge can take well over 60s to solve
     )
     if resp.status_code != 200:
         # Bright Data's own request-level failure (bad zone/auth/rate-limit) --
