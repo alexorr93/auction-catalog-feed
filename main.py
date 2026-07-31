@@ -16,11 +16,12 @@ import io
 import json
 import time
 import uuid
+import asyncio
 import concurrent.futures
 from datetime import datetime, timezone
 
 import fitz  # PyMuPDF
-from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
@@ -30,6 +31,39 @@ app = FastAPI()
 templates = Jinja2Templates(directory="templates")
 if os.path.isdir("static"):
     app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Real bug fixed here: every single-PDF upload used to spawn its own
+# completely independent background job with no concurrency limit at all --
+# so uploading, say, 5 catalogs in quick succession ran all 5 simultaneously,
+# each doing several sequential Gemini calls plus PDF parsing plus multiple
+# Supabase writes at once. On a small box that saturates the CPU/GIL and
+# makes every other request (even just loading a page) feel frozen while
+# it's happening -- exactly the "unusably slow while ingesting" symptom.
+# The zip-batch path already avoided this internally (processes its own
+# files one at a time), but nothing coordinated it against a single-PDF
+# upload happening at the same time, or against other single-PDF uploads.
+# One shared queue + one persistent worker fixes both: single-PDF uploads
+# AND zip batches all go through the exact same queue now, so real
+# processing is capped at one job app-wide, no matter how many uploads
+# arrive back to back. Uploads still queue up instantly and the Upload Log
+# fills in live as each one actually finishes -- nothing about the UX
+# changes, only the uncontrolled concurrency underneath it.
+_pdf_processing_queue: "asyncio.Queue" = asyncio.Queue()
+
+async def _pdf_worker_loop():
+    while True:
+        job = await _pdf_processing_queue.get()
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, job)
+        except Exception as e:
+            print(f"[pdf-worker] job failed: {e}")
+        finally:
+            _pdf_processing_queue.task_done()
+
+@app.on_event("startup")
+async def _start_pdf_worker():
+    asyncio.create_task(_pdf_worker_loop())
 
 # --- Startup no longer crashes the whole process, on purpose ---------------
 # The previous version connected to Supabase and looked up the business_id
@@ -574,17 +608,11 @@ def _process_one_pdf(supabase_client, business_id: str, filename: str, contents:
 
 
 @app.post("/api/upload-pdf")
-async def upload_pdf(request: Request, background_tasks: BackgroundTasks):
-    """Real bug fixed here: this used to await _process_one_pdf directly,
-    holding the HTTP request open for the entire duration -- fine for a
-    small catalog, but now that Gemini is the sole lot extractor (chunked,
-    possibly several sequential API calls for a large catalog), a real
-    700+ lot PDF can take long enough that Railway's proxy or the browser
-    itself kills the connection mid-request ("Failed to fetch", even though
-    the upload was actually still working server-side). The zip-upload
-    endpoint already solved this by running in the background and letting
-    the Upload Log fill in live -- this now does the exact same thing for
-    a single file, instead of blocking the request on it."""
+async def upload_pdf(request: Request):
+    """Queues this file for processing -- see _pdf_processing_queue above for
+    why this is a queue now instead of an independent background task per
+    upload. Returns immediately either way; the Upload Log fills in once this
+    file's actual turn comes up, same as before."""
     supabase_client, business_id = _require_config()
 
     form = await request.form()
@@ -606,13 +634,14 @@ async def upload_pdf(request: Request, background_tasks: BackgroundTasks):
             _backfill_catalog_metadata(supabase_client, business_id, result["catalog_url"],
                                         result["raw_text"], file.filename, state, zip_code, end_date)
 
-    background_tasks.add_task(_run_and_backfill)
+    _pdf_processing_queue.put_nowait(_run_and_backfill)
     return {"ok": True, "queued": True, "filename": file.filename}
 
 
 def _process_zip_batch(supabase_client, business_id: str, pdf_entries: list) -> None:
-    """Runs in the background (in its own thread, via BackgroundTasks -- doesn't
-    block other requests while this runs). Processes every PDF found in the zip
+    """Runs via the shared processing queue (see _pdf_processing_queue) -- doesn't
+    block other requests while this runs, and never overlaps with a single-PDF
+    upload or another zip batch either. Processes every PDF found in the zip
     one at a time, same logic as a single upload for each. Progress is visible
     the whole time through the existing Upload Log / Needs Update / Catalogs
     views -- no separate progress UI needed, since each file logs itself as it
@@ -680,7 +709,7 @@ def _process_zip_batch(supabase_client, business_id: str, pdf_entries: list) -> 
 
 
 @app.post("/api/upload-zip")
-async def upload_zip(request: Request, background_tasks: BackgroundTasks):
+async def upload_zip(request: Request):
     """The real answer for uploading many catalogs at once (e.g. 350 PDFs
     collected into one zip) -- drop the zip in once instead of selecting
     hundreds of files by hand in a browser file picker, which isn't a
@@ -707,7 +736,7 @@ async def upload_zip(request: Request, background_tasks: BackgroundTasks):
     if not pdf_entries:
         raise HTTPException(400, "No PDF files found inside this zip")
 
-    background_tasks.add_task(_process_zip_batch, supabase_client, business_id, pdf_entries)
+    _pdf_processing_queue.put_nowait(lambda: _process_zip_batch(supabase_client, business_id, pdf_entries))
     return {"ok": True, "queued": len(pdf_entries)}
 
 
