@@ -188,7 +188,14 @@ def _extract_lots_via_gemini(raw_text: str, filename: str, on_chunk_lots=None) -
     genai.configure(api_key=gemini_key)
     model = genai.GenerativeModel("gemini-2.5-flash")
 
-    chunk_size = 25000
+    # Real bug fixed here: 25,000 chars still packed 500+ lots into a single
+    # chunk for a dense catalog (short descriptions, e.g. "1501\nTool box with
+    # misc hand tools"), and confirmed directly against real data: Gemini
+    # silently returned only ~200 of 710 actual lots for one such chunk --
+    # no error, valid JSON, just genuinely incomplete enumeration. Smaller
+    # chunks keep the per-call lot count low enough for reliable, exhaustive
+    # extraction regardless of how dense a given catalog's descriptions are.
+    chunk_size = 8000
     chunks = [raw_text[i:i + chunk_size] for i in range(0, len(raw_text), chunk_size)] or [raw_text]
 
     seen_lot_numbers = set()
