@@ -576,6 +576,12 @@ async def _brightdata_get(client: httpx.AsyncClient, target_url: str, expect_sel
         json=payload,
         timeout=150.0,  # BidSpotter's WAF challenge can take well over 60s to solve
     )
+    # TEMP DEBUG: log the raw outer Bright Data response before any parsing --
+    # a prior attempt came back status=200 bytes=0, which the post-parse
+    # diagnostic couldn't explain (it only sees the *parsed* body). This shows
+    # exactly what Bright Data's own HTTP response contained.
+    print(f"BrightData raw response: outer_status={resp.status_code} outer_bytes={len(resp.text)} "
+          f"outer_snippet={resp.text[:500]!r}")
     if resp.status_code != 200:
         # Bright Data's own request-level failure (bad zone/auth/rate-limit) --
         # not BidSpotter's status, that's the point of checking this first.
@@ -584,7 +590,8 @@ async def _brightdata_get(client: httpx.AsyncClient, target_url: str, expect_sel
         parsed = resp.json()
         target_status = int(parsed.get("status", 200))
         body = parsed.get("body", "")
-    except Exception:
+    except Exception as e:
+        print(f"BrightData response was not the expected JSON shape: {type(e).__name__}: {e}")
         target_status = resp.status_code
         body = resp.text
     return _BrightDataResponse(status_code=target_status, text=body, url=target_url)
