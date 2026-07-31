@@ -648,7 +648,7 @@ def _reconstruct_full_url(catalog_url: str) -> Optional[str]:
 
 async def _daily_bidspotter_scan_loop():
     """Runs once at startup (after a short delay so the app is fully up
-    first), then once every 24 hours after that, for every business_id that
+    first), then once every 12 hours after that, for every business_id that
     has ever used this app. No manual trigger needed -- this is the whole
     point, it just runs."""
     await asyncio.sleep(30)
@@ -663,7 +663,7 @@ async def _daily_bidspotter_scan_loop():
                 print(f"BidSpotter daily scan for {business_id}: {new_n} new, {react_n} reactivated")
         except Exception as e:
             print(f"BidSpotter daily scan loop failed: {e}")
-        await asyncio.sleep(24 * 60 * 60)
+        await asyncio.sleep(12 * 60 * 60)
 
 @app.on_event("startup")
 async def _start_bidspotter_scan_loop():
