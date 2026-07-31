@@ -836,6 +836,47 @@ async def _run_bidspotter_scan_for_business(supabase_client, business_id: str):
     print(f"BidSpotter scan for {business_id}: {status_row}")
     return status_row
 
+async def _debug_fast_lot_search_test() -> None:
+    """TEMP, runs immediately at startup (no delay). Uses ONLY the already-
+    working Bright Data pipe -- no new credentials, no new product. Fetches
+    one known real catalog page, pulls a real search-filter?CategoryCode=
+    link off it (these are real lot-search-results pages, not the auction
+    overview), fetches THAT, and checks whether lot data is embedded in it
+    the same way catalog data was embedded in the main listing page."""
+    try:
+        async with httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+            catalog_url = "https://www.bidspotter.com/en-us/auction-catalogues/a2cauc/catalogue-id-a2c-au10012"
+            print(f"=== FAST LOT TEST: fetching catalog page {catalog_url} ===")
+            resp = await _brightdata_get(client, catalog_url)
+            print(f"catalog page: status={resp.status_code} bytes={len(resp.text)}")
+
+            m = re.search(r'href=["\']([^"\']*search-filter\?CategoryCode=[^"\']*)["\']', resp.text)
+            if not m:
+                print("=== FAST LOT TEST: no search-filter link found on this page, aborting ===")
+                return
+            filter_path = m.group(1)
+            filter_url = filter_path if filter_path.startswith("http") else f"https://www.bidspotter.com{filter_path}"
+            print(f"=== FAST LOT TEST: found search-filter URL: {filter_url} ===")
+
+            resp2 = await _brightdata_get(client, filter_url)
+            print(f"search-filter page: status={resp2.status_code} bytes={len(resp2.text)}")
+            text2 = resp2.text
+
+            for marker in ("lotNumber", "lot_number", "LotNumber", "itemListElement", "\"lots\"", "\"Lots\"", "\"description\""):
+                idx = text2.find(marker)
+                if idx >= 0:
+                    around = re.sub(r'\s+', ' ', text2[max(0, idx-200):idx+1000]).strip()
+                    print(f"Marker {marker!r} found at offset {idx}: {around}")
+                else:
+                    print(f"Marker {marker!r}: not found")
+            ldjson_blocks = re.findall(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', text2, re.I | re.S)
+            print(f"Found {len(ldjson_blocks)} ld+json block(s) on search-filter page")
+            for i, block in enumerate(ldjson_blocks[:2]):
+                print(f"--- ld+json block {i} (first 4000 chars) ---\n{block[:4000]}")
+    except Exception as e:
+        print(f"=== FAST LOT TEST FAILED: {type(e).__name__}: {e} ===")
+    print(f"=== END FAST LOT TEST ===")
+
 async def _daily_bidspotter_scan_loop():
     """Runs once at startup (after a short delay so the app is fully up
     first), then once every 12 hours after that, for every business_id that
@@ -855,6 +896,7 @@ async def _daily_bidspotter_scan_loop():
 
 @app.on_event("startup")
 async def _start_bidspotter_scan_loop():
+    asyncio.create_task(_debug_fast_lot_search_test())
     asyncio.create_task(_daily_bidspotter_scan_loop())
 
 @app.api_route("/api/updates/trigger-scan", methods=["GET", "POST"])
