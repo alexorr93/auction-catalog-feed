@@ -312,10 +312,10 @@ async function loadPdfUploadLog() {
 
 let needsUpdateItems = [];
 let nuSortKey = 'end_date';
-let nuSortDir = -1;
+let nuSortDir = 1;
 
 function nuSetSort(key) {
-  if (nuSortKey === key) { nuSortDir *= -1; } else { nuSortKey = key; nuSortDir = -1; }
+  if (nuSortKey === key) { nuSortDir *= -1; } else { nuSortKey = key; nuSortDir = 1; }
   renderNeedsUpdateTable();
 }
 
