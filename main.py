@@ -660,12 +660,20 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
             listings = _parse_bidspotter_listing_page(resp.text)
             if page == 1:
                 # Capture real evidence of what came back -- status, length, final
-                # URL (redirects reveal a challenge/interstitial), and a snippet --
-                # so a 0-listings outcome is diagnosable, not guessed at.
+                # URL, a snippet, AND whether the target content exists ANYWHERE
+                # in the full body (not just the visible start) -- distinguishes
+                # "never rendered at all" from "rendered but our parser/selector
+                # is looking in the wrong place".
                 snippet = re.sub(r'\s+', ' ', resp.text[:400]).strip()
+                marker_idx = resp.text.find("catalogue-id-")
+                if marker_idx >= 0:
+                    around = re.sub(r'\s+', ' ', resp.text[max(0, marker_idx-150):marker_idx+150]).strip()
+                    marker_info = f"catalogue-id- FOUND at offset {marker_idx}, context=\"{around}\""
+                else:
+                    marker_info = "catalogue-id- NOT found anywhere in the full response body"
                 first_page_diagnostic = (
                     f"page1 status={resp.status_code} bytes={len(resp.text)} "
-                    f"final_url={str(resp.url)} snippet=\"{snippet}\""
+                    f"final_url={str(resp.url)} | {marker_info} | snippet=\"{snippet}\""
                 )
             if not listings:
                 empty_pages_in_a_row += 1
