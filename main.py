@@ -620,7 +620,7 @@ def _process_zip_batch(supabase_client, business_id: str, pdf_entries: list) -> 
     honored by the underlying SDK in every failure mode (a real gap, not a
     theory -- confirmed by exactly this happening in production). Rather than
     chase which specific internal call can still hang, every file's ENTIRE
-    processing now runs under one hard, unconditional 10-minute ceiling --
+    processing now runs under one hard, unconditional 25-minute ceiling --
     if anything inside it hangs for any reason at all, this loop gives up on
     that one file, logs it as a real timeout error, and moves on to the next
     file immediately instead of stalling the other 349 behind it."""
@@ -640,10 +640,10 @@ def _process_zip_batch(supabase_client, business_id: str, pdf_entries: list) -> 
             ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             future = ex.submit(_process_one_pdf, supabase_client, business_id, filename, contents)
             try:
-                result = future.result(timeout=600)
+                result = future.result(timeout=1500)
             except concurrent.futures.TimeoutError:
                 ex.shutdown(wait=False)
-                print(f"Zip batch: {filename} exceeded the 10-minute hard watchdog timeout -- "
+                print(f"Zip batch: {filename} exceeded the 25-minute hard watchdog timeout -- "
                       f"giving up on this file and moving on (the stuck attempt may still finish "
                       f"on its own later and overwrite this with a real result)")
                 try:
@@ -652,7 +652,7 @@ def _process_zip_batch(supabase_client, business_id: str, pdf_entries: list) -> 
                         "catalog_url": re.sub(r'[^A-Za-z0-9._-]', '_', filename.rsplit(".", 1)[0]),
                         "status": "error",
                         "error_message": "Hard watchdog timeout: this file's processing did not "
-                                          "complete within 10 minutes, so it was skipped to let the "
+                                          "complete within 25 minutes, so it was skipped to let the "
                                           "rest of the batch continue. Try uploading this one file "
                                           "again on its own.",
                     }).execute()
