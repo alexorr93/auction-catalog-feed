@@ -734,12 +734,15 @@ async def api_needs_update():
     # Real bug this fixes: a catalog could show as both empty AND appear in
     # the regular Catalogs list at the same time, because the log and the
     # actual data could disagree with each other.
-    catalog_rows = _fetch_all_paginated(lambda: supabase_client.table("auction_catalogs").select("catalog_url,lot_count")
+    catalog_rows = _fetch_all_paginated(lambda: supabase_client.table("auction_catalogs").select("catalog_url,lot_count,end_date")
                                           .eq("business_id", business_id))
     has_real_lots = {c["catalog_url"] for c in catalog_rows if (c.get("lot_count") or 0) > 0}
+    end_date_by_catalog = {c["catalog_url"]: c.get("end_date") for c in catalog_rows}
 
     needs_update = [u for u in latest_by_catalog.values()
                      if u.get("status") == "empty" and u.get("catalog_url") not in has_real_lots]
+    for u in needs_update:
+        u["end_date"] = end_date_by_catalog.get(u.get("catalog_url"))
     needs_update.sort(key=lambda u: u.get("uploaded_at") or "", reverse=True)
     return {"needs_update": needs_update}
 
