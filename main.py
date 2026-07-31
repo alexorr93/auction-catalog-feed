@@ -506,6 +506,73 @@ def _fetch_all_paginated(query_factory) -> list:
 
 import httpx
 from bs4 import BeautifulSoup
+from urllib.parse import urlparse
+
+# ── Bright Data Web Unlocker: routes around BidSpotter's AWS WAF ───────────
+# The page1 diagnostic above proved plain httpx gets served an AWS WAF
+# challenge page (edge.sdk.awswaf.com/.../challenge.js), not real content.
+# Bright Data's Web Unlocker API solves that challenge server-side and
+# returns the real page. format=json is used (not raw) specifically because
+# it echoes the *target's own* HTTP status in the response body -- needed so
+# _recheck_blank_catalogs' `resp.status_code != 200` check still means what
+# it always meant (the individual catalog page's real status), not just
+# "Bright Data's own request succeeded".
+
+_BIDSPOTTER_ALLOWED_HOST = "www.bidspotter.com"
+
+class BrightDataMisuseError(Exception):
+    """Raised if any code path ever tries to route a non-BidSpotter URL
+    through Bright Data. This must NEVER be pointed at any other site --
+    most importantly, NEVER at ebay.com, under any circumstances. This is
+    enforced here, inside the fetch function itself, so no caller can bypass
+    it by mistake."""
+    pass
+
+class _BrightDataResponse:
+    """Stand-in for an httpx.Response exposing only what this file's existing
+    BidSpotter code already uses: status_code, text, url, raise_for_status()."""
+    def __init__(self, status_code: int, text: str, url: str):
+        self.status_code = status_code
+        self.text = text
+        self.url = url
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                f"BidSpotter (via Bright Data) returned {self.status_code} for {self.url}",
+                request=None, response=None,
+            )
+
+async def _brightdata_get(client: httpx.AsyncClient, target_url: str) -> _BrightDataResponse:
+    """Fetch target_url through Bright Data's Web Unlocker API instead of
+    fetching it directly. HARD-LOCKED to bidspotter.com -- refuses (raises,
+    sends nothing) for any other domain."""
+    host = urlparse(target_url).netloc.lower()
+    if not (host == _BIDSPOTTER_ALLOWED_HOST or host.endswith("." + _BIDSPOTTER_ALLOWED_HOST)):
+        raise BrightDataMisuseError(f"Refusing to fetch non-BidSpotter domain via Bright Data: {host!r}")
+
+    api_key = os.environ.get("BRIGHT_DATA_API_KEY")
+    zone = os.environ.get("BRIGHT_DATA_ZONE", "bidspotter_unlock")
+    if not api_key:
+        raise RuntimeError("BRIGHT_DATA_API_KEY is not set -- cannot fetch BidSpotter pages")
+
+    resp = await client.post(
+        "https://api.brightdata.com/request",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={"zone": zone, "url": target_url, "format": "json"},
+        timeout=60.0,
+    )
+    if resp.status_code != 200:
+        # Bright Data's own request-level failure (bad zone/auth/rate-limit) --
+        # not BidSpotter's status, that's the point of checking this first.
+        return _BrightDataResponse(status_code=resp.status_code, text=resp.text, url=target_url)
+    try:
+        parsed = resp.json()
+        target_status = int(parsed.get("status", 200))
+        body = parsed.get("body", "")
+    except Exception:
+        target_status = resp.status_code
+        body = resp.text
+    return _BrightDataResponse(status_code=target_status, text=body, url=target_url)
 
 def _full_url_to_catalog_url(full_url: str) -> str:
     """Matches the exact sanitization this app already uses everywhere else:
@@ -555,7 +622,7 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
         while page <= 60 and empty_pages_in_a_row < 2:  # hard ceiling -- never loop forever on an unexpected layout change
             url = f"https://www.bidspotter.com/en-us/auction-catalogues?page={page}"
             try:
-                resp = await client.get(url)
+                resp = await _brightdata_get(client, url)
                 resp.raise_for_status()
             except Exception as e:
                 err = f"page {page} fetch failed: {type(e).__name__}: {e}"
@@ -644,7 +711,7 @@ async def _recheck_blank_catalogs(supabase_client, business_id: str) -> dict:
             if not real_url:
                 continue
             try:
-                resp = await client.get(real_url)
+                resp = await _brightdata_get(client, real_url)
                 if resp.status_code != 200:
                     if first_error is None:
                         first_error = f"{catalog_url}: HTTP {resp.status_code}"
