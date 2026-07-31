@@ -836,38 +836,6 @@ async def _run_bidspotter_scan_for_business(supabase_client, business_id: str):
     print(f"BidSpotter scan for {business_id}: {status_row}")
     return status_row
 
-async def _debug_rendered_catalog_test() -> None:
-    """TEMP, runs immediately at startup. Two prior tests fetched a catalog
-    page's RAW (unrendered) HTML and found no search-filter/lot links --
-    but the listing page had this exact same problem (Angular renders
-    content client-side) and x-unblock-expect fixed it there. Never tried
-    x-unblock-expect on an individual catalog page specifically. Testing
-    that now -- same already-proven mechanism, new target."""
-    try:
-        async with httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
-            catalog_url = "https://www.bidspotter.com/en-us/auction-catalogues/bsckee/catalogue-id-bsckee10060"
-            print(f"=== RENDERED CATALOG TEST: fetching {catalog_url} WITH expect ===")
-            resp = await _brightdata_get(client, catalog_url, expect_selector='a[href*="search-filter"]')
-            print(f"status={resp.status_code} bytes={len(resp.text)}")
-            text = resp.text
-
-            m = re.search(r'href=["\']([^"\']*search-filter[^"\']*)["\']', text)
-            if m:
-                print(f"FOUND search-filter link: {m.group(1)}")
-            else:
-                print("Still no search-filter link found, even with expect wait.")
-
-            for marker in ("lotNumber", "lot_number", "\"lots\"", "\"Lots\"", "CategoryCode", "class=\"lot"):
-                idx = text.find(marker)
-                if idx >= 0:
-                    around = re.sub(r'\s+', ' ', text[max(0, idx-150):idx+600]).strip()
-                    print(f"Marker {marker!r} found at {idx}: {around}")
-                else:
-                    print(f"Marker {marker!r}: not found")
-    except Exception as e:
-        print(f"=== RENDERED CATALOG TEST FAILED: {type(e).__name__}: {e} ===")
-    print("=== END RENDERED CATALOG TEST ===")
-
 async def _daily_bidspotter_scan_loop():
     """Runs once at startup (after a short delay so the app is fully up
     first), then once every 12 hours after that, for every business_id that
@@ -887,7 +855,6 @@ async def _daily_bidspotter_scan_loop():
 
 @app.on_event("startup")
 async def _start_bidspotter_scan_loop():
-    asyncio.create_task(_debug_rendered_catalog_test())
     asyncio.create_task(_daily_bidspotter_scan_loop())
 
 @app.api_route("/api/updates/trigger-scan", methods=["GET", "POST"])
