@@ -845,7 +845,7 @@ async def _debug_fast_lot_search_test() -> None:
     the same way catalog data was embedded in the main listing page."""
     try:
         async with httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
-            catalog_url = "https://www.bidspotter.com/en-us/auction-catalogues/a2cauc/catalogue-id-a2c-au10012"
+            catalog_url = "https://www.bidspotter.com/en-us/auction-catalogues/bsckee/catalogue-id-bsckee10060"
             print(f"=== FAST LOT TEST: fetching catalog page {catalog_url} ===")
             resp = await _brightdata_get(client, catalog_url)
             print(f"catalog page: status={resp.status_code} bytes={len(resp.text)}")
