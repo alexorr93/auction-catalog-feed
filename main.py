@@ -570,31 +570,35 @@ async def _brightdata_get(client: httpx.AsyncClient, target_url: str, expect_sel
         # trivial money at our volume (a handful of requests/day), so left on.
         payload["headers"] = {"x-unblock-expect": json.dumps({"element": expect_selector})}
 
-    resp = await client.post(
-        "https://api.brightdata.com/request",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=150.0,  # BidSpotter's WAF challenge can take well over 60s to solve
-    )
-    # TEMP DEBUG: log the raw outer Bright Data response before any parsing --
-    # a prior attempt came back status=200 bytes=0, which the post-parse
-    # diagnostic couldn't explain (it only sees the *parsed* body). This shows
-    # exactly what Bright Data's own HTTP response contained.
-    print(f"BrightData raw response: outer_status={resp.status_code} outer_bytes={len(resp.text)} "
-          f"outer_snippet={resp.text[:500]!r}")
-    if resp.status_code != 200:
-        # Bright Data's own request-level failure (bad zone/auth/rate-limit) --
-        # not BidSpotter's status, that's the point of checking this first.
-        return _BrightDataResponse(status_code=resp.status_code, text=resp.text, url=target_url)
-    try:
-        parsed = resp.json()
-        target_status = int(parsed.get("status", 200))
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        resp = await client.post(
+            "https://api.brightdata.com/request",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=150.0,  # BidSpotter's WAF challenge can take well over 60s to solve
+        )
+        if resp.status_code != 200:
+            # Bright Data's own request-level failure (bad zone/auth/rate-limit) --
+            # not BidSpotter's status, that's the point of checking this first.
+            return _BrightDataResponse(status_code=resp.status_code, text=resp.text, url=target_url)
+        try:
+            parsed = resp.json()
+        except Exception as e:
+            print(f"BrightData response for {target_url} wasn't the expected JSON shape: {type(e).__name__}: {e}")
+            return _BrightDataResponse(status_code=resp.status_code, text=resp.text, url=target_url)
+
+        target_status = int(parsed.get("status_code", 200))  # NOTE: field is "status_code", not "status"
         body = parsed.get("body", "")
-    except Exception as e:
-        print(f"BrightData response was not the expected JSON shape: {type(e).__name__}: {e}")
-        target_status = resp.status_code
-        body = resp.text
-    return _BrightDataResponse(status_code=target_status, text=body, url=target_url)
+        resp_headers = parsed.get("headers") or {}
+        brd_error = resp_headers.get("x-brd-error") if isinstance(resp_headers, dict) else None
+
+        if brd_error and attempt < max_attempts:
+            print(f"BrightData attempt {attempt}/{max_attempts} for {target_url}: blocked ({brd_error!r}), retrying...")
+            continue
+        if brd_error:
+            print(f"BrightData still blocked after {max_attempts} attempts for {target_url}: {brd_error!r} (status_code={target_status})")
+        return _BrightDataResponse(status_code=target_status, text=body, url=target_url)
 
 def _full_url_to_catalog_url(full_url: str) -> str:
     """Matches the exact sanitization this app already uses everywhere else:
