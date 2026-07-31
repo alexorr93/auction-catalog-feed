@@ -154,7 +154,7 @@ def _extract_lots_via_gemini(raw_text: str, filename: str, on_chunk_lots=None) -
     genai.configure(api_key=gemini_key)
     model = genai.GenerativeModel("gemini-2.5-flash")
 
-    chunk_size = 80000
+    chunk_size = 25000
     chunks = [raw_text[i:i + chunk_size] for i in range(0, len(raw_text), chunk_size)] or [raw_text]
 
     seen_lot_numbers = set()
