@@ -325,19 +325,56 @@ async function loadPdfUploadLog() {
   } catch(e) { console.error(e); }
 }
 
+let needsUpdateItems = [];
+let nuSortKey = 'end_date';
+let nuSortDir = -1;
+
+function nuSetSort(key) {
+  if (nuSortKey === key) { nuSortDir *= -1; } else { nuSortKey = key; nuSortDir = -1; }
+  renderNeedsUpdateTable();
+}
+
+function isUrgent(end_date) {
+  if (!end_date) return false;
+  const days = (new Date(end_date) - new Date()) / 86400000;
+  return days <= 7;
+}
+
+function renderNeedsUpdateTable() {
+  const el = document.getElementById('pdf-needs-update');
+  if (!needsUpdateItems.length) { el.innerHTML = '<div class="empty">Nothing waiting — every uploaded auction has lots.</div>'; return; }
+
+  const sorted = [...needsUpdateItems].sort((a, b) => {
+    let av = a[nuSortKey], bv = b[nuSortKey];
+    const aNull = (av === null || av === undefined || av === '');
+    const bNull = (bv === null || bv === undefined || bv === '');
+    if (aNull && bNull) return 0;
+    if (aNull) return 1;   // blanks always sort last, regardless of direction
+    if (bNull) return -1;
+    const cmp = av > bv ? 1 : (av < bv ? -1 : 0);
+    return cmp * nuSortDir;
+  });
+
+  const th = (key, label) => `<th onclick="nuSetSort('${key}')" style="cursor:pointer;">${label}${nuSortKey===key ? (nuSortDir===1?' ▲':' ▼') : ''}</th>`;
+  let html = `<table><thead><tr>${th('filename','File')}${th('end_date','Auction Date')}${th('uploaded_at','First Uploaded Empty')}</tr></thead><tbody>`;
+  for (const u of sorted) {
+    const urgent = isUrgent(u.end_date);
+    const dateCell = u.end_date
+      ? `<span style="${urgent ? 'color:var(--red);font-weight:700;' : ''}">${u.end_date}${urgent ? ' ⚠️' : ''}</span>`
+      : '<span class="muted">—</span>';
+    html += `<tr><td>${titleAsLink(u.filename)}</td><td>${dateCell}</td><td class="muted">${u.uploaded_at ? new Date(u.uploaded_at).toLocaleString() : ''}</td></tr>`;
+  }
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
 async function loadNeedsUpdateQueue() {
   const el = document.getElementById('pdf-needs-update');
   try {
     const r = await fetch('/api/needs-update');
     const data = await r.json();
-    const items = data.needs_update || [];
-    if (!items.length) { el.innerHTML = '<div class="empty">Nothing waiting — every uploaded auction has lots.</div>'; return; }
-    let html = `<table><thead><tr><th>File</th><th>First Uploaded Empty</th></tr></thead><tbody>`;
-    for (const u of items) {
-      html += `<tr><td>${titleAsLink(u.filename)}</td><td class="muted">${u.uploaded_at ? new Date(u.uploaded_at).toLocaleString() : ''}</td></tr>`;
-    }
-    html += '</tbody></table>';
-    el.innerHTML = html;
+    needsUpdateItems = data.needs_update || [];
+    renderNeedsUpdateTable();
   } catch(e) {
     el.innerHTML = `<div class="empty">Failed to load: ${e.message}</div>`;
   }
