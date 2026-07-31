@@ -18,6 +18,7 @@ import time
 import uuid
 import asyncio
 import concurrent.futures
+from typing import Optional
 from datetime import datetime, timezone
 
 import fitz  # PyMuPDF
@@ -482,6 +483,203 @@ def _fetch_all_paginated(query_factory) -> list:
     return rows
 
 
+# ── Updates to Make: automated BidSpotter scanning ──────────────────────
+# Two separate jobs, deliberately not combined into one:
+#
+# 1. New-catalog detection: pulls every page of BidSpotter's own public
+#    "/en-us/auction-catalogues" listing (confirmed directly, live, to work
+#    with a plain httpx GET -- no API, no login, no AI), and diffs every
+#    catalog_url found against everything already in auction_pdf_uploads.
+#    Anything on BidSpotter that we've never even attempted is a real,
+#    solid signal -- this is proven, low-risk.
+#
+# 2. Blank-catalog re-check: for catalogs already in our own system sitting
+#    at zero lots (status='empty'), re-fetches each ONE'S OWN individual
+#    catalogue page (also confirmed directly to work) and checks whether it
+#    now shows real category/lot data. Deliberately NOT extracted from the
+#    big listing scan -- a truly-empty card's exact appearance on that page
+#    was never actually confirmed, so this uses the one mechanism that IS
+#    confirmed reliable (the individual page fetch already proven for
+#    Recast-equivalent work) instead of guessing at an unverified signal.
+#    The blank-catalog list is small (dozens, not hundreds), so a fetch per
+#    catalog is completely reasonable here.
+
+import httpx
+from bs4 import BeautifulSoup
+
+def _full_url_to_catalog_url(full_url: str) -> str:
+    """Matches the exact sanitization this app already uses everywhere else:
+    strip only ':' and '/' out of the real URL, keep everything else."""
+    return re.sub(r'[:/]', '', full_url)
+
+def _parse_bidspotter_listing_page(html: str) -> list:
+    """Plain HTML parsing, no AI. Each listing card has its title/link
+    repeated a few times (image, title, 'View auction') -- dedupes on
+    catalog_url. Returns [{catalog_url, title, full_url}, ...]."""
+    soup = BeautifulSoup(html, "html.parser")
+    seen = set()
+    listings = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "/auction-catalogues/" not in href or "catalogue-id-" not in href:
+            continue
+        if "search-filter" in href:
+            continue  # these are the per-category refine links inside each card, not the catalog itself
+        full_url = href if href.startswith("http") else f"https://www.bidspotter.com{href}"
+        catalog_url = _full_url_to_catalog_url(full_url)
+        if catalog_url in seen:
+            continue
+        seen.add(catalog_url)
+        title = a.get_text(strip=True)
+        if title:  # the image-wrapper <a> has no text -- skip it, the title <a> duplicate will be caught
+            listings.append({"catalog_url": catalog_url, "title": title, "full_url": full_url})
+    return listings
+
+async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> int:
+    """Job 1. Pages through the full public listing, stores every catalog
+    seen into bidspotter_scan_snapshot (a durable record -- if BidSpotter
+    ever changes their page layout and parsing silently breaks, this table
+    going stale/empty is how that gets noticed instead of just quietly
+    missing catalogs forever), then flags anything not already in
+    auction_pdf_uploads as a new item in the updates queue."""
+    all_listings = {}
+    async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+        page = 1
+        empty_pages_in_a_row = 0
+        while page <= 60 and empty_pages_in_a_row < 2:  # hard ceiling -- never loop forever on an unexpected layout change
+            url = f"https://www.bidspotter.com/en-us/auction-catalogues?page={page}"
+            try:
+                resp = await client.get(url)
+                resp.raise_for_status()
+            except Exception as e:
+                print(f"BidSpotter scan: page {page} fetch failed: {e}")
+                break
+            listings = _parse_bidspotter_listing_page(resp.text)
+            if not listings:
+                empty_pages_in_a_row += 1
+            else:
+                empty_pages_in_a_row = 0
+                for item in listings:
+                    all_listings[item["catalog_url"]] = item
+            page += 1
+
+    if not all_listings:
+        print("BidSpotter scan: found nothing at all -- likely a page layout change, not a real empty result. Skipping this run rather than risk a false 'everything is new' flood.")
+        return 0
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    snapshot_rows = [
+        {"business_id": business_id, "catalog_url": v["catalog_url"], "title": v["title"], "scanned_at": now_iso}
+        for v in all_listings.values()
+    ]
+    for i in range(0, len(snapshot_rows), 500):
+        supabase_client.table("bidspotter_scan_snapshot").upsert(
+            snapshot_rows[i:i+500], on_conflict="business_id,catalog_url"
+        ).execute()
+
+    known_urls = set()
+    known_rows = _fetch_all_paginated(lambda: supabase_client.table("auction_pdf_uploads").select("catalog_url").eq("business_id", business_id))
+    for r in known_rows:
+        known_urls.add(r["catalog_url"])
+
+    new_count = 0
+    for catalog_url, item in all_listings.items():
+        if catalog_url in known_urls:
+            continue
+        try:
+            supabase_client.table("catalog_updates_queue").upsert({
+                "business_id": business_id, "catalog_url": catalog_url, "title": item["title"],
+                "kind": "new", "resolved": False,
+            }, on_conflict="business_id,catalog_url").execute()
+            new_count += 1
+        except Exception as e:
+            print(f"BidSpotter scan: failed to queue new catalog {catalog_url}: {e}")
+    return new_count
+
+async def _recheck_blank_catalogs(supabase_client, business_id: str) -> int:
+    """Job 2. For every catalog we already know about that's currently
+    sitting at zero lots, re-fetches its own individual page directly and
+    checks for real content. A catalog card shows a 'Cannot load data'
+    placeholder for its lot-count widget regardless of whether it actually
+    has lots (that's just an unrendered JS component in a static fetch, not
+    a real signal) -- but the category tag list underneath it IS real, and
+    is genuinely absent when a catalog has nothing in it yet."""
+    latest_status = {}
+    rows = _fetch_all_paginated(lambda: supabase_client.table("auction_pdf_uploads").select("catalog_url,status,uploaded_at,filename").eq("business_id", business_id).order("uploaded_at"))
+    for r in rows:
+        latest_status[r["catalog_url"]] = r  # later rows overwrite earlier -- ends up holding the latest per catalog_url
+
+    blank_catalogs = [r for r in latest_status.values() if r["status"] == "empty"]
+    reactivated_count = 0
+
+    async with httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
+        for row in blank_catalogs:
+            catalog_url = row["catalog_url"]
+            real_url = _reconstruct_full_url(catalog_url)
+            if not real_url:
+                continue
+            try:
+                resp = await client.get(real_url)
+                if resp.status_code != 200:
+                    continue
+                text = resp.text
+            except Exception:
+                continue
+
+            has_real_content = bool(re.search(r'search-filter\?CategoryCode=', text))
+            if has_real_content:
+                try:
+                    supabase_client.table("catalog_updates_queue").upsert({
+                        "business_id": business_id, "catalog_url": catalog_url,
+                        "title": row.get("filename", catalog_url), "kind": "reactivated", "resolved": False,
+                    }, on_conflict="business_id,catalog_url").execute()
+                    reactivated_count += 1
+                except Exception as e:
+                    print(f"BidSpotter recheck: failed to queue reactivated catalog {catalog_url}: {e}")
+    return reactivated_count
+
+def _reconstruct_full_url(catalog_url: str) -> Optional[str]:
+    """Inverse of _full_url_to_catalog_url -- rebuilds a real, fetchable
+    BidSpotter URL from our sanitized catalog_url format."""
+    m = re.match(r'^https(www\.bidspotter\.com)en-usauction-catalogues(.+?)(catalogue-id-.+)$', catalog_url)
+    if not m:
+        return None
+    return f"https://{m.group(1)}/en-us/auction-catalogues/{m.group(2)}/{m.group(3)}"
+
+async def _daily_bidspotter_scan_loop():
+    """Runs once at startup (after a short delay so the app is fully up
+    first), then once every 24 hours after that, for every business_id that
+    has ever used this app. No manual trigger needed -- this is the whole
+    point, it just runs."""
+    await asyncio.sleep(30)
+    while True:
+        try:
+            supabase_client, _ = _require_config()
+            biz_rows = supabase_client.table("auction_pdf_uploads").select("business_id").limit(1000).execute().data or []
+            business_ids = {r["business_id"] for r in biz_rows}
+            for business_id in business_ids:
+                new_n = await _scan_bidspotter_new_catalogs(supabase_client, business_id)
+                react_n = await _recheck_blank_catalogs(supabase_client, business_id)
+                print(f"BidSpotter daily scan for {business_id}: {new_n} new, {react_n} reactivated")
+        except Exception as e:
+            print(f"BidSpotter daily scan loop failed: {e}")
+        await asyncio.sleep(24 * 60 * 60)
+
+@app.on_event("startup")
+async def _start_bidspotter_scan_loop():
+    asyncio.create_task(_daily_bidspotter_scan_loop())
+
+@app.get("/api/updates-to-make")
+async def api_updates_to_make():
+    """Powers the 'Updates to Make' box -- unresolved new catalogs and
+    reactivated (was-blank, now-has-content) catalogs, newest flagged first."""
+    supabase_client, business_id = _require_config()
+    rows = (supabase_client.table("catalog_updates_queue").select("*")
+            .eq("business_id", business_id).eq("resolved", False)
+            .order("first_flagged_at", desc=True).execute().data or [])
+    return {"updates": rows}
+
+
 @app.get("/api/catalogs")
 async def api_catalogs():
     supabase_client, business_id = _require_config()
@@ -633,6 +831,13 @@ def _process_one_pdf(supabase_client, business_id: str, filename: str, contents:
                 }).eq("id", log_id).execute()
 
         needs_backfill = not (state and zip_code and end_date)
+
+        if written_count > 0:
+            try:
+                supabase_client.table("catalog_updates_queue").update({"resolved": True})\
+                    .eq("business_id", business_id).eq("catalog_url", catalog_url).execute()
+            except Exception:
+                pass  # never let queue bookkeeping break the actual upload
 
         return {"ok": True, "filename": filename, "lots_parsed": written_count, "catalog_url": catalog_url,
                 "partial": bool(chunk_errors), "needs_backfill": needs_backfill, "raw_text": raw_text if needs_backfill else None}
