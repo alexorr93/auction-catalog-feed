@@ -531,8 +531,22 @@ def _process_one_pdf(supabase_client, business_id: str, filename: str, contents:
             file_options={"content-type": "application/pdf", "upsert": "true"}
         )
     except Exception as e:
+        # Real bug this caught before: the "auction-pdfs" bucket never
+        # actually existed, so every single upload silently failed here for
+        # this app's entire lifetime -- nothing ever got archived, and the
+        # only trace was a print() statement nobody was watching. Now also
+        # written into the upload log itself so a storage failure is
+        # actually visible somewhere a human will see it, instead of only
+        # existing in Railway's console output.
         print(f"PDF storage warning (upload still proceeds): {e}")
         storage_path = None
+        if log_id:
+            try:
+                supabase_client.table("auction_pdf_uploads").update({
+                    "storage_warning": f"PDF was not archived to storage: {e}"[:500],
+                }).eq("id", log_id).execute()
+            except Exception:
+                pass  # never let a logging failure break the actual upload
 
     try:
         doc = fitz.open(stream=contents, filetype="pdf")
