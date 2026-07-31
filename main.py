@@ -792,6 +792,32 @@ def _debug_dump_catalog_page(url: str, text: str) -> None:
         print(f"  {s}")
     print(f"=== END SCRIPT SRCS ===")
 
+async def _debug_grep_js_bundles(client: httpx.AsyncClient) -> None:
+    """TEMP. Fetch the most promising-named JS bundle files (found via the
+    script-src listing) and grep them for AJAX/API call patterns -- looking
+    for whatever URL actually populates the full lot list, the same way
+    featuredlots/getfeaturedlotsforauction was found inline for the featured
+    carousel. This should be a real, non-guessed route straight from the
+    site's own code instead of another blind URL guess."""
+    candidates = [
+        "https://www.bidspotter.com/js/lot/auctioncataloguedetails",
+        "https://www.bidspotter.com/js/module/lot-searchresult",
+        "https://www.bidspotter.com/scripts/gap.portal.ui.infinitelist.js",
+        "https://www.bidspotter.com/js/lot/autoupdatelotsearchresult",
+        "https://www.bidspotter.com/js/module/lot",
+    ]
+    api_pattern = re.compile(r'["\']((?:/en-us/|/api/)[a-zA-Z0-9_/\-]*(?:lot|search|catalogue)[a-zA-Z0-9_/\-]*)["\']', re.I)
+    for url in candidates:
+        try:
+            resp = await _brightdata_get(client, url)
+            print(f"  [{resp.status_code}] {url} bytes={len(resp.text)}")
+            if resp.status_code == 200:
+                matches = sorted(set(api_pattern.findall(resp.text)))
+                print(f"    possible API-looking paths: {matches[:20]}")
+        except Exception as e:
+            print(f"  [ERROR] {url}: {type(e).__name__}: {e}")
+    print(f"=== END JS BUNDLE GREP ===")
+
 async def _debug_test_lot_api_candidates(client: httpx.AsyncClient, text: str) -> None:
     """TEMP. The catalog page's own JS reveals an internal JSON API:
     /en-us/featuredlots/getfeaturedlotsforauction?auctionid=<guid> -- only
@@ -861,6 +887,7 @@ async def _recheck_blank_catalogs(supabase_client, business_id: str) -> dict:
             if not dumped_diagnostic:
                 dumped_diagnostic = True
                 _debug_dump_catalog_page(real_url, text)
+                await _debug_grep_js_bundles(client)
 
             has_real_content = bool(re.search(r'search-filter\?CategoryCode=', text))
             if has_real_content:
