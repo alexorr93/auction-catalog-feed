@@ -100,22 +100,24 @@ function escapeHtml(s) {
   return (s || '').toString().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
-function titleAsLink(title) {
+function titleAsLink(title, displayText) {
   // The stored title/filename is usually the original catalog URL with
   // "https://" and every "/" stripped out (that's how these files get
   // named), sometimes still carrying a trailing ".pdf" (raw filenames do,
   // catalog titles usually don't). Strips that extension before matching so
   // both cases reconstruct correctly, then rebuilds the real, clickable URL.
   // Falls back to plain escaped text if the pattern doesn't match, so this
-  // never produces a broken link.
+  // never produces a broken link. displayText (e.g. the real auction title)
+  // is shown instead of the raw URL string when provided.
   const t = title || '';
+  const shown = displayText || t;
   const withoutExt = t.replace(/\.pdf$/i, '');
   const m = withoutExt.match(/^https(www\.bidspotter\.com)en-usauction-catalogues(.+?)(catalogue-id-.+)$/);
   if (m) {
     const url = `https://${m[1]}/en-us/auction-catalogues/${m[2]}/${m[3]}`;
-    return `<a href="${url}" target="_blank" rel="noopener noreferrer">${escapeHtml(t)}</a>`;
+    return `<a href="${url}" target="_blank" rel="noopener noreferrer">${escapeHtml(shown)}</a>`;
   }
-  return escapeHtml(t);
+  return escapeHtml(shown);
 }
 
 async function loadAll() {
@@ -144,15 +146,23 @@ function renderCatalogs() {
   const el = document.getElementById('catalogs-panel');
   const search = document.getElementById('search-input').value.toLowerCase();
   let rows = catalogs;
-  if (search) rows = rows.filter(c => (c.title || '').toLowerCase().includes(search) || (c.auctioneer || '').toLowerCase().includes(search));
+  if (search) rows = rows.filter(c => (c.title || '').toLowerCase().includes(search) || (c.display_title || '').toLowerCase().includes(search) || (c.auctioneer || '').toLowerCase().includes(search));
   if (!rows.length) { el.innerHTML = '<div class="empty">No catalogs yet.</div>'; return; }
-  let html = `<table><thead><tr><th>Title</th><th>Auctioneer</th><th>State</th><th>End Date</th><th>Lot Count</th></tr></thead><tbody>`;
+  rows = [...rows].sort((a, b) => {
+    const av = a.first_seen_at || '', bv = b.first_seen_at || '';
+    return av < bv ? 1 : (av > bv ? -1 : 0); // always newest upload first
+  });
+  let html = `<table><thead><tr><th>Uploaded</th><th>Auction Title</th><th>Auctioneer</th><th>State</th><th>End Date</th><th>Lot Count</th></tr></thead><tbody>`;
   for (const c of rows) {
     const lotCountCell = c.was_ever_empty
       ? `${c.lot_count ?? '—'} <span style="color:var(--amber);font-size:11px;" title="This catalog started with zero lots and later got some added — may still be growing, not necessarily final.">⚠️ may still be growing</span>`
       : (c.lot_count ?? '—');
+    const uploadedCell = c.first_seen_at
+      ? new Date(c.first_seen_at).toLocaleString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+      : '—';
     html += `<tr>
-      <td>${titleAsLink(c.title)}</td>
+      <td class="muted" style="white-space:nowrap;">${uploadedCell}</td>
+      <td>${titleAsLink(c.title, c.display_title)}</td>
       <td class="muted">${escapeHtml(c.auctioneer)}</td>
       <td>${escapeHtml(c.state)}</td>
       <td class="muted">${escapeHtml(c.end_date)}</td>
