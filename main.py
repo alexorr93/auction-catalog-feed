@@ -786,6 +786,34 @@ def _debug_dump_catalog_page(url: str, text: str) -> None:
             print(f"Marker {marker!r}: not found")
     print(f"=== END DIAGNOSTIC ===")
 
+async def _debug_test_lot_api_candidates(client: httpx.AsyncClient, text: str) -> None:
+    """TEMP. The catalog page's own JS reveals an internal JSON API:
+    /en-us/featuredlots/getfeaturedlotsforauction?auctionid=<guid> -- only
+    returns FEATURED lots. Testing plausible sibling endpoints for the FULL
+    lot list, using the same real auctionid pulled from the page."""
+    m = re.search(r'auctionid=([0-9a-fA-F-]{36})', text)
+    if not m:
+        print("=== LOT API TEST: no auctionid found on this page, skipping ===")
+        return
+    auction_id = m.group(1)
+    candidates = [
+        f"https://www.bidspotter.com/en-us/lots/getlotsforauction?auctionid={auction_id}",
+        f"https://www.bidspotter.com/en-us/lots/getallotsforauction?auctionid={auction_id}",
+        f"https://www.bidspotter.com/en-us/auctionlots/getlotsforauction?auctionid={auction_id}",
+        f"https://www.bidspotter.com/en-us/featuredlots/getlotsforauction?auctionid={auction_id}",
+        f"https://www.bidspotter.com/en-us/featuredlots/getfeaturedlotsforauction?auctionid={auction_id}&all=true",
+        f"https://www.bidspotter.com/en-us/featuredlots/getfeaturedlotsforauction?auctionid={auction_id}&pagesize=1000",
+    ]
+    print(f"=== LOT API TEST: trying {len(candidates)} candidate URLs for auction {auction_id} ===")
+    for url in candidates:
+        try:
+            resp = await _brightdata_get(client, url)
+            snippet = re.sub(r'\s+', ' ', resp.text[:400]).strip()
+            print(f"  [{resp.status_code}] {url}\n    bytes={len(resp.text)} snippet={snippet!r}")
+        except Exception as e:
+            print(f"  [ERROR] {url}: {type(e).__name__}: {e}")
+    print(f"=== END LOT API TEST ===")
+
 async def _recheck_blank_catalogs(supabase_client, business_id: str) -> dict:
     """Job 2. For every catalog we already know about that's currently
     sitting at zero lots, re-fetches its own individual page directly and
@@ -827,6 +855,7 @@ async def _recheck_blank_catalogs(supabase_client, business_id: str) -> dict:
             if not dumped_diagnostic:
                 dumped_diagnostic = True
                 _debug_dump_catalog_page(real_url, text)
+                await _debug_test_lot_api_candidates(client, text)
 
             has_real_content = bool(re.search(r'search-filter\?CategoryCode=', text))
             if has_real_content:
