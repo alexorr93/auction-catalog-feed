@@ -753,6 +753,39 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
             print(f"BidSpotter scan: failed to queue new catalog {catalog_url}: {e}")
     return {"ok": True, "error": None, "pages": pages_fetched, "listings": len(all_listings), "new_flagged": new_count}
 
+def _debug_dump_catalog_page(url: str, text: str) -> None:
+    """TEMP diagnostic, called once on the first individual catalog page we
+    successfully fetch. Looks for two things we don't yet know the shape of:
+    (1) lot-level data embedded in the page the same way the listing page's
+    catalog data was (needed to plan the future full-lot-pull feature), and
+    (2) whatever the 'Print Catalog PDF' button actually links to (needed to
+    plan automated PDF fetching)."""
+    print(f"=== CATALOG PAGE DIAGNOSTIC for {url} (bytes={len(text)}) ===")
+
+    pdf_links = re.findall(r'href=["\']([^"\']*\.pdf[^"\']*)["\']', text, re.I)
+    print(f"Direct .pdf hrefs found: {pdf_links[:10]}")
+
+    print_links = re.findall(r'href=["\']([^"\']*print[^"\']*)["\']', text, re.I)
+    print(f"hrefs containing 'print': {print_links[:10]}")
+
+    # Anything that looks like a JS-driven download trigger instead of a plain link
+    onclick_pdf = re.findall(r'(?:onclick|ng-click)=["\']([^"\']*(?:pdf|print|download)[^"\']*)["\']', text, re.I)
+    print(f"onclick/ng-click handlers mentioning pdf/print/download: {onclick_pdf[:10]}")
+
+    ldjson_blocks = re.findall(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', text, re.I | re.S)
+    print(f"Found {len(ldjson_blocks)} ld+json script block(s)")
+    for i, block in enumerate(ldjson_blocks[:2]):
+        print(f"--- ld+json block {i} (first 3000 chars) ---\n{block[:3000]}")
+
+    for marker in ("lotNumber", "lot_number", "LotNumber", "itemListElement", "\"lots\"", "\"items\""):
+        idx = text.find(marker)
+        if idx >= 0:
+            around = re.sub(r'\s+', ' ', text[max(0, idx-200):idx+800]).strip()
+            print(f"Marker {marker!r} found at offset {idx}: {around}")
+        else:
+            print(f"Marker {marker!r}: not found")
+    print(f"=== END DIAGNOSTIC ===")
+
 async def _recheck_blank_catalogs(supabase_client, business_id: str) -> dict:
     """Job 2. For every catalog we already know about that's currently
     sitting at zero lots, re-fetches its own individual page directly and
@@ -771,6 +804,7 @@ async def _recheck_blank_catalogs(supabase_client, business_id: str) -> dict:
     checked = 0
     first_error = None
 
+    dumped_diagnostic = False
     async with httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
         for row in blank_catalogs:
             catalog_url = row["catalog_url"]
@@ -789,6 +823,10 @@ async def _recheck_blank_catalogs(supabase_client, business_id: str) -> dict:
                 if first_error is None:
                     first_error = f"{catalog_url}: {type(e).__name__}: {e}"
                 continue
+
+            if not dumped_diagnostic:
+                dumped_diagnostic = True
+                _debug_dump_catalog_page(real_url, text)
 
             has_real_content = bool(re.search(r'search-filter\?CategoryCode=', text))
             if has_real_content:
