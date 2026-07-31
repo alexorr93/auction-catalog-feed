@@ -786,6 +786,12 @@ def _debug_dump_catalog_page(url: str, text: str) -> None:
             print(f"Marker {marker!r}: not found")
     print(f"=== END DIAGNOSTIC ===")
 
+    script_srcs = re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', text, re.I)
+    print(f"=== SCRIPT SRCS ({len(script_srcs)}) ===")
+    for s in script_srcs:
+        print(f"  {s}")
+    print(f"=== END SCRIPT SRCS ===")
+
 async def _debug_test_lot_api_candidates(client: httpx.AsyncClient, text: str) -> None:
     """TEMP. The catalog page's own JS reveals an internal JSON API:
     /en-us/featuredlots/getfeaturedlotsforauction?auctionid=<guid> -- only
@@ -855,7 +861,6 @@ async def _recheck_blank_catalogs(supabase_client, business_id: str) -> dict:
             if not dumped_diagnostic:
                 dumped_diagnostic = True
                 _debug_dump_catalog_page(real_url, text)
-                await _debug_test_lot_api_candidates(client, text)
 
             has_real_content = bool(re.search(r'search-filter\?CategoryCode=', text))
             if has_real_content:
