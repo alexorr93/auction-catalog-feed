@@ -596,15 +596,32 @@ def _process_one_pdf(supabase_client, business_id: str, filename: str, contents:
         # `lots` list as a fallback rather than lost), written_count and
         # len(lots) can differ slightly; written_count is what's actually
         # in the database right now, so it's what gets reported and logged.
+        # Real bug fixed here: chunk_errors was captured above but never
+        # checked again once ANY chunk succeeded -- so a catalog chunked into,
+        # say, 5 pieces where 3 succeed and 2 time out silently reported as a
+        # complete "success" with only the partial lot count, no indication
+        # anywhere that ~40% of the catalog never made it in. Now flagged as
+        # its own "partial" status with the real error message attached, so
+        # this is actually visible instead of looking identical to a genuine
+        # complete success.
         if log_id:
-            supabase_client.table("auction_pdf_uploads").update({
-                "status": "success", "storage_path": storage_path, "parsed_lot_count": written_count,
-            }).eq("id", log_id).execute()
+            if chunk_errors:
+                error_message = "; ".join(chunk_errors)[:1000]
+                supabase_client.table("auction_pdf_uploads").update({
+                    "status": "partial", "storage_path": storage_path, "parsed_lot_count": written_count,
+                    "error_message": f"Partial: {len(chunk_errors)} chunk(s) failed after retries -- "
+                                      f"{written_count} lots landed but this catalog is very likely "
+                                      f"incomplete. Try re-uploading. Errors: {error_message}",
+                }).eq("id", log_id).execute()
+            else:
+                supabase_client.table("auction_pdf_uploads").update({
+                    "status": "success", "storage_path": storage_path, "parsed_lot_count": written_count,
+                }).eq("id", log_id).execute()
 
         needs_backfill = not (state and zip_code and end_date)
 
         return {"ok": True, "filename": filename, "lots_parsed": written_count, "catalog_url": catalog_url,
-                "needs_backfill": needs_backfill, "raw_text": raw_text if needs_backfill else None}
+                "partial": bool(chunk_errors), "needs_backfill": needs_backfill, "raw_text": raw_text if needs_backfill else None}
 
     except Exception as e:
         if log_id:
