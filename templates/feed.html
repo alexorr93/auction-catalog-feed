@@ -36,12 +36,6 @@ a:hover { color: #93c5fd; }
   <h1>📋 Auction Catalog Feed</h1>
   <div class="sub">Public view of tracked auction catalogs and lots. Anyone with this link can see and add catalogs — no login required.</div>
 
-  <div style="margin-bottom:22px;">
-    <div style="font-size:15px;font-weight:700;margin-bottom:8px;">⏳ Needs Update — No Lots Yet</div>
-    <div class="sub" style="margin-bottom:8px;">These auctions exist but had zero lots posted when uploaded. Uploading a newer PDF for the same auction with lots in it clears it from this list automatically.</div>
-    <div id="pdf-needs-update"><div class="empty">Loading...</div></div>
-  </div>
-
   <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:22px;align-items:flex-start;">
     <div>
       <label class="upload-btn" for="pdf-file-input">📄 Upload PDF</label>
@@ -60,6 +54,12 @@ a:hover { color: #93c5fd; }
       <input type="text" class="field-input" id="pdf-state-input" placeholder="State" style="width:80px;" autocomplete="off"/>
       <input type="text" class="field-input" id="pdf-zip-input" placeholder="ZIP" style="width:80px;" autocomplete="off"/>
     </div>
+  </div>
+
+  <div style="margin-bottom:22px;">
+    <div style="font-size:15px;font-weight:700;margin-bottom:8px;">⏳ Needs Update — No Lots Yet</div>
+    <div class="sub" style="margin-bottom:8px;">These auctions exist but had zero lots posted when uploaded. Uploading a newer PDF for the same auction with lots in it clears it from this list automatically.</div>
+    <div id="pdf-needs-update"><div class="empty">Loading...</div></div>
   </div>
 
   <div class="tabs">
