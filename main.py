@@ -717,7 +717,7 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
         empty_pages_in_a_row = 0
         while page <= 60 and empty_pages_in_a_row < 2:  # hard ceiling -- never loop forever on an unexpected layout change
             _update_live_activity(supabase_client, business_id, f"Job 1: fetching listing page {page}")
-            url = f"https://www.bidspotter.com/en-us/auction-catalogues?page={page}"
+            url = f"https://www.bidspotter.com/en-us/auction-catalogues/search-filter?countryName=United%20States&page={page}"
             try:
                 resp = await _brightdata_get(client, url)
                 resp.raise_for_status()
