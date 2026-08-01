@@ -1007,7 +1007,28 @@ async def _pull_lots_for_queued_catalogs(supabase_client, business_id: str) -> d
             }).eq("business_id", business_id).execute()
         except Exception:
             pass
-        lots = await _fetch_catalog_lots_via_browser(real_url, catalog_slug)
+        lots = []
+        max_attempts = 3
+        for retry_num in range(1, max_attempts + 1):
+            try:
+                # Hard outer ceiling -- 120s gives real comfortable margin over
+                # the ~50s a genuine successful run takes (page load +
+                # click-retry + submit + 5x scroll), but guarantees this
+                # single attempt can't hang forever no matter WHAT breaks
+                # internally, even if a Playwright/CDP call's own timeout
+                # param mysteriously doesn't fire (which is what happened
+                # tonight -- the run sat well past its 60-90s internal
+                # timeouts with zero log output).
+                lots = await asyncio.wait_for(
+                    _fetch_catalog_lots_via_browser(real_url, catalog_slug), timeout=120.0
+                )
+                if lots:
+                    break
+                print(f"Lot pull attempt {retry_num}/{max_attempts} for {catalog_url}: got 0 lots, retrying from scratch")
+            except asyncio.TimeoutError:
+                print(f"Lot pull attempt {retry_num}/{max_attempts} for {catalog_url}: HARD TIMEOUT (120s), redoing from scratch")
+            except Exception as e:
+                print(f"Lot pull attempt {retry_num}/{max_attempts} for {catalog_url} failed: {type(e).__name__}: {e}")
         if lots:
             succeeded += 1
             rows_to_upsert = [
