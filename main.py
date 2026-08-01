@@ -573,19 +573,25 @@ async def _brightdata_get(client: httpx.AsyncClient, target_url: str, expect_sel
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
         try:
-            # Hard outer ceiling on top of the 150s httpx timeout= below --
-            # tonight's real hangs sat well past that 150s with zero
-            # exception ever raised, meaning the connection died in a way
-            # httpx's own timeout didn't catch. This forces a kill regardless.
-            resp = await asyncio.wait_for(
-                client.post(
-                    "https://api.brightdata.com/request",
-                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                    json=payload,
-                    timeout=150.0,  # BidSpotter's WAF challenge can take well over 60s to solve
-                ),
-                timeout=180.0,
-            )
+            # A fresh client (and thus a fresh TCP connection, no keep-alive
+            # reuse) on EVERY attempt -- tonight's real hang was a REUSED
+            # connection going silently dead on a later request after an
+            # earlier one on the same connection succeeded fine. Neither
+            # httpx's own timeout= nor an outer asyncio.wait_for caught it,
+            # consistent with a truly stuck low-level socket read that
+            # doesn't yield control back cleanly. A brand new connection per
+            # attempt sidesteps the whole class of problem instead of trying
+            # to detect/interrupt it after the fact.
+            async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": "Mozilla/5.0"}) as fresh_client:
+                resp = await asyncio.wait_for(
+                    fresh_client.post(
+                        "https://api.brightdata.com/request",
+                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                        json=payload,
+                        timeout=150.0,  # BidSpotter's WAF challenge can take well over 60s to solve
+                    ),
+                    timeout=180.0,
+                )
         except Exception as e:
             if attempt < max_attempts:
                 print(f"BrightData attempt {attempt}/{max_attempts} for {target_url}: HARD TIMEOUT/error ({type(e).__name__}: {e}), retrying with a fresh connection...")
