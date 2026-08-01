@@ -681,6 +681,19 @@ def _parse_bidspotter_listing_page_OLD_UNUSED(html: str) -> list:
             listings.append({"catalog_url": catalog_url, "title": title, "full_url": full_url})
     return listings
 
+def _update_live_activity(supabase_client, business_id: str, text: str) -> None:
+    """Writes a real, human-readable 'what's happening right now' status --
+    called continuously throughout Job 1/2/lot-pull (every page, every
+    catalog), not just once at the end. This is what makes progress
+    actually checkable in real time instead of silence for hours."""
+    try:
+        supabase_client.table("bidspotter_scan_status").upsert({
+            "business_id": business_id, "current_activity": text,
+            "activity_updated_at": datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="business_id").execute()
+    except Exception as e:
+        print(f"Failed to update live activity: {e}")
+
 async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> dict:
     """Job 1. Pages through the full public listing, stores every catalog
     seen into bidspotter_scan_snapshot (a durable record -- if BidSpotter
@@ -699,6 +712,7 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
         page = 1
         empty_pages_in_a_row = 0
         while page <= 60 and empty_pages_in_a_row < 2:  # hard ceiling -- never loop forever on an unexpected layout change
+            _update_live_activity(supabase_client, business_id, f"Job 1: fetching listing page {page}")
             url = f"https://www.bidspotter.com/en-us/auction-catalogues?page={page}"
             try:
                 resp = await _brightdata_get(client, url)
@@ -815,8 +829,9 @@ async def _recheck_blank_catalogs(supabase_client, business_id: str) -> dict:
             print(f"BidSpotter recheck: failed to fetch prior category counts: {e}")
 
     async with httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
-        for row in blank_catalogs:
+        for i, row in enumerate(blank_catalogs, 1):
             catalog_url = row["catalog_url"]
+            _update_live_activity(supabase_client, business_id, f"Job 2: rechecking blank catalog {i}/{len(blank_catalogs)}")
             real_url = _reconstruct_full_url(catalog_url)
             if not real_url:
                 continue
@@ -847,7 +862,8 @@ async def _recheck_blank_catalogs(supabase_client, business_id: str) -> dict:
                 except Exception as e:
                     print(f"BidSpotter recheck: failed to queue reactivated catalog {catalog_url}: {e}")
 
-        for catalog_url in small_catalog_urls:
+        for i, catalog_url in enumerate(small_catalog_urls, 1):
+            _update_live_activity(supabase_client, business_id, f"Job 2: checking growth on small catalog {i}/{len(small_catalog_urls)}")
             real_url = _reconstruct_full_url(catalog_url)
             if not real_url:
                 continue
@@ -1021,6 +1037,7 @@ async def _pull_lots_for_queued_catalogs(supabase_client, business_id: str) -> d
             continue
         catalog_slug = m.group(1)
         attempted += 1
+        _update_live_activity(supabase_client, business_id, f"Job 3 (lot pull): catalog {attempted}/{len(queue_rows)} -- {catalog_url}")
         try:
             supabase_client.table("bidspotter_lot_pull_progress").update({
                 "current_catalog_url": catalog_url, "updated_at": datetime.now(timezone.utc).isoformat(),
