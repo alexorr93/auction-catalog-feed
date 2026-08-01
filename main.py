@@ -1179,8 +1179,40 @@ async def _daily_bidspotter_scan_loop():
             print(f"BidSpotter daily scan loop failed: {e}")
         await asyncio.sleep(12 * 60 * 60)
 
+async def _debug_state_extraction() -> None:
+    """TEMP, runs immediately at startup. Only 1 of 13 real catalogs pulled
+    so far has state/zip populated -- checking a genuinely US catalog's raw
+    initial page to see if location data exists under a different field
+    name/location than addressRegion/postalCode, or is genuinely absent."""
+    from playwright.async_api import async_playwright
+    wss_url = os.environ.get("BRIGHT_DATA_BROWSER_WSS")
+    if not wss_url:
+        print("=== STATE EXTRACTION DEBUG: BRIGHT_DATA_BROWSER_WSS not set, skipping ===")
+        return
+    catalog_url = "https://www.bidspotter.com/en-us/auction-catalogues/ncm/catalogue-id-ncm-au11448"
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.connect_over_cdp(wss_url, timeout=60000)
+            page = await browser.new_page()
+            await page.goto(catalog_url, timeout=60000, wait_until="load")
+            await page.wait_for_timeout(3000)
+            html = await page.content()
+            await browser.close()
+        print(f"=== STATE EXTRACTION DEBUG: page is {len(html)} bytes ===")
+        for marker in ("addressRegion", "postalCode", "addressLocality", "\"state\"", "\"zip\"", "location", "PostalAddress", "streetAddress"):
+            idx = html.find(marker)
+            if idx >= 0:
+                around = re.sub(r'\s+', ' ', html[max(0, idx-150):idx+400]).strip()
+                print(f"Marker {marker!r} found at {idx}: {around}")
+            else:
+                print(f"Marker {marker!r}: not found")
+    except Exception as e:
+        print(f"=== STATE EXTRACTION DEBUG FAILED: {type(e).__name__}: {e} ===")
+    print("=== END STATE EXTRACTION DEBUG ===")
+
 @app.on_event("startup")
 async def _start_bidspotter_scan_loop():
+    asyncio.create_task(_debug_state_extraction())
     asyncio.create_task(_daily_bidspotter_scan_loop())
 
 @app.api_route("/api/updates/trigger-scan", methods=["GET", "POST"])
