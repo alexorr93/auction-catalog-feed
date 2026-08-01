@@ -976,13 +976,21 @@ async def _pull_lots_for_queued_catalogs(supabase_client, business_id: str) -> d
     exactly the ones a VA would otherwise have to open and read by hand.
     Writes into bidspotter_auto_catalog_lots (the staging table, kept
     separate from the trusted bidspotter_catalog_lots table the real
-    listing pipeline depends on)."""
+    listing pipeline depends on). Updates bidspotter_lot_pull_progress
+    after every single catalog so real progress is queryable at any
+    moment, not just guessed from logs."""
     if not os.environ.get("BRIGHT_DATA_BROWSER_WSS"):
         return {"attempted": 0, "succeeded": 0, "total_lots_written": 0}
     queue_rows = _fetch_all_paginated(lambda: supabase_client.table("catalog_updates_queue").select("catalog_url,title").eq("business_id", business_id).eq("resolved", False))
     attempted = 0
     succeeded = 0
     total_lots_written = 0
+    now = datetime.now(timezone.utc).isoformat()
+    supabase_client.table("bidspotter_lot_pull_progress").upsert({
+        "business_id": business_id, "total_queued": len(queue_rows), "processed": 0,
+        "succeeded": 0, "total_lots_written": 0, "current_catalog_url": None,
+        "started_at": now, "updated_at": now, "finished_at": None,
+    }, on_conflict="business_id").execute()
     for row in queue_rows:
         catalog_url = row["catalog_url"]
         real_url = _reconstruct_full_url(catalog_url)
@@ -993,22 +1001,40 @@ async def _pull_lots_for_queued_catalogs(supabase_client, business_id: str) -> d
             continue
         catalog_slug = m.group(1)
         attempted += 1
-        lots = await _fetch_catalog_lots_via_browser(real_url, catalog_slug)
-        if not lots:
-            continue
-        succeeded += 1
-        rows_to_upsert = [
-            {"business_id": business_id, "catalog_url": catalog_url, "lot_number": lot["lot_number"],
-             "description": lot["description"], "last_seen_at": datetime.now(timezone.utc).isoformat()}
-            for lot in lots
-        ]
         try:
-            supabase_client.table("bidspotter_auto_catalog_lots").upsert(
-                rows_to_upsert, on_conflict="business_id,catalog_url,lot_number"
-            ).execute()
-            total_lots_written += len(rows_to_upsert)
+            supabase_client.table("bidspotter_lot_pull_progress").update({
+                "current_catalog_url": catalog_url, "updated_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("business_id", business_id).execute()
+        except Exception:
+            pass
+        lots = await _fetch_catalog_lots_via_browser(real_url, catalog_slug)
+        if lots:
+            succeeded += 1
+            rows_to_upsert = [
+                {"business_id": business_id, "catalog_url": catalog_url, "lot_number": lot["lot_number"],
+                 "description": lot["description"], "last_seen_at": datetime.now(timezone.utc).isoformat()}
+                for lot in lots
+            ]
+            try:
+                supabase_client.table("bidspotter_auto_catalog_lots").upsert(
+                    rows_to_upsert, on_conflict="business_id,catalog_url,lot_number"
+                ).execute()
+                total_lots_written += len(rows_to_upsert)
+            except Exception as e:
+                print(f"Failed to write lots for {catalog_url}: {e}")
+        try:
+            supabase_client.table("bidspotter_lot_pull_progress").update({
+                "processed": attempted, "succeeded": succeeded, "total_lots_written": total_lots_written,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("business_id", business_id).execute()
         except Exception as e:
-            print(f"Failed to write lots for {catalog_url}: {e}")
+            print(f"Failed to update lot-pull progress: {e}")
+    try:
+        supabase_client.table("bidspotter_lot_pull_progress").update({
+            "finished_at": datetime.now(timezone.utc).isoformat(), "current_catalog_url": None,
+        }).eq("business_id", business_id).execute()
+    except Exception:
+        pass
     return {"attempted": attempted, "succeeded": succeeded, "total_lots_written": total_lots_written}
 
 async def _daily_bidspotter_scan_loop():
