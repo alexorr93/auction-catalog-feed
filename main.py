@@ -1057,13 +1057,23 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
             MAX_PAGES = 40  # hard ceiling -- real safety net, not expected to be hit often
             for page_num in range(2, MAX_PAGES + 1):
                 next_url = f"{catalog_url_full}?searchTerm=&whereToSearch={where_to_search}&page={page_num}"
-                try:
-                    await page.goto(next_url, timeout=30000, wait_until="load")
-                    await page.wait_for_timeout(2000)
-                except Exception as e:
-                    print(f"Pagination stopped at page {page_num} for {catalog_url_full}: {type(e).__name__}: {e}")
+                page_html = None
+                for page_attempt in range(1, 4):
+                    try:
+                        await page.goto(next_url, timeout=30000, wait_until="load")
+                        await page.wait_for_timeout(2000)
+                        page_html = await page.content()
+                        break
+                    except Exception as e:
+                        print(f"Page {page_num} attempt {page_attempt}/3 failed for {catalog_url_full}: {type(e).__name__}: {e}")
+                        await page.wait_for_timeout(1500)
+                if page_html is None:
+                    # All 3 attempts on this specific page failed -- stop
+                    # pagination here (can't know if more real pages exist
+                    # beyond a page we can't even fetch), but this is now a
+                    # genuine exhaustion, not a single transient failure.
+                    print(f"Pagination stopped at page {page_num} for {catalog_url_full}: page unreachable after 3 attempts")
                     break
-                page_html = await page.content()
                 page_lots = extract_matching_lots(page_html)
                 new_on_this_page = [l for l in page_lots if l[0] not in seen_lot_numbers]
                 if not new_on_this_page:
@@ -1198,52 +1208,28 @@ async def _daily_bidspotter_scan_loop():
             print(f"BidSpotter daily scan loop failed: {e}")
         await asyncio.sleep(12 * 60 * 60)
 
-async def _debug_page2_stop_reason() -> None:
-    """TEMP, runs immediately at startup. This specific catalog's stored
-    lots only go up to #58 despite a real total of 395 -- pagination is
-    stopping right after page 1. Testing page=2 directly to see exactly
-    what's returned: genuinely empty, blocked, or lots present but wrongly
-    filtered out."""
-    from playwright.async_api import async_playwright
-    from urllib.parse import quote
+async def _debug_verify_retry_fix() -> None:
+    """TEMP, runs immediately at startup. Calls the EXACT production
+    function with the new per-page retry logic, on the real catalog
+    confirmed understated (56 stored vs 395 real). Prints the real total
+    found -- a genuine test, not a guess."""
     wss_url = os.environ.get("BRIGHT_DATA_BROWSER_WSS")
     if not wss_url:
-        print("=== PAGE2 STOP DEBUG: BRIGHT_DATA_BROWSER_WSS not set, skipping ===")
+        print("=== RETRY FIX VERIFY: BRIGHT_DATA_BROWSER_WSS not set, skipping ===")
         return
-    catalog_url_full = "https://www.bidspotter.com/en-us/auction-catalogues/bsclevy/catalogue-id-levy-r10200"
-    path_part = catalog_url_full.replace("https://www.bidspotter.com", "")
-    where_to_search = quote(path_part, safe="")
-    page2_url = f"{catalog_url_full}?searchTerm=&whereToSearch={where_to_search}&page=2"
-    print(f"=== PAGE2 STOP DEBUG: fetching {page2_url} directly ===")
-    try:
-        async with async_playwright() as pw:
-            browser = await pw.chromium.connect_over_cdp(wss_url, timeout=60000)
-            page = await browser.new_page()
-            try:
-                resp = await page.goto(page2_url, timeout=30000, wait_until="load")
-                print(f"=== PAGE2 STOP DEBUG: goto succeeded, status={resp.status if resp else 'unknown'} ===")
-            except Exception as e:
-                print(f"=== PAGE2 STOP DEBUG: goto FAILED: {type(e).__name__}: {e} ===")
-                await browser.close()
-                return
-            await page.wait_for_timeout(2000)
-            html = await page.content()
-            await browser.close()
-        print(f"=== PAGE2 STOP DEBUG: page is {len(html)} bytes, final URL after load ===")
-        title_cards = re.findall(r'data-click-type="title"', html)
-        print(f"=== {len(title_cards)} total 'title' lot cards found on this page ===")
-        cat_matches = re.findall(r'catalogue-id-([a-z0-9\-]+)/lot-', html, re.I)
-        from collections import Counter
-        print(f"=== catalog IDs represented in lot links: {dict(Counter(cat_matches))} ===")
-        for marker in ("levy-r10200", "no results", "No results", "0 results", "captcha", "blocked"):
-            print(f"Marker {marker!r}: {'FOUND' if marker in html else 'not found'}")
-    except Exception as e:
-        print(f"=== PAGE2 STOP DEBUG FAILED: {type(e).__name__}: {e} ===")
-    print("=== END PAGE2 STOP DEBUG ===")
+    catalog_url = "https://www.bidspotter.com/en-us/auction-catalogues/bsclevy/catalogue-id-levy-r10200"
+    print(f"=== RETRY FIX VERIFY: calling production function on {catalog_url} (previously only 56 of 395 real lots) ===")
+    result = await _fetch_catalog_lots_via_browser(catalog_url, "levy-r10200")
+    lots = result.get("lots", [])
+    print(f"=== RETRY FIX VERIFY: got {len(lots)} real lots (was 56 before this fix, real total is ~395) ===")
+    lot_numbers = sorted((int(l["lot_number"]) for l in lots if l["lot_number"].isdigit()))
+    if lot_numbers:
+        print(f"=== Lot number range: {lot_numbers[0]} to {lot_numbers[-1]} ===")
+    print("=== END RETRY FIX VERIFY ===")
 
 @app.on_event("startup")
 async def _start_bidspotter_scan_loop():
-    asyncio.create_task(_debug_page2_stop_reason())
+    asyncio.create_task(_debug_verify_retry_fix())
     asyncio.create_task(_daily_bidspotter_scan_loop())
 
 @app.api_route("/api/updates/trigger-scan", methods=["GET", "POST"])
