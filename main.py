@@ -644,18 +644,22 @@ def _parse_bidspotter_listing_page(html: str) -> list:
         r'"url"\s*:\s*"(https://www\.bidspotter\.com/en-us/auction-catalogues/[^"]*catalogue-id-[^"]+)"'
     )
     name_pattern = re.compile(r'"name"\s*:\s*"([^"]*)"')
+    end_date_pattern = re.compile(r'"endDate"\s*:\s*"([^"]*)"')
     for m in url_pattern.finditer(html):
         full_url = m.group(1)
         catalog_url = _full_url_to_catalog_url(full_url)
         if catalog_url in seen:
             continue
         seen.add(catalog_url)
-        # The catalog's display name is the nearest preceding "name" field in
-        # the same JSON object (schema.org Event puts name before url/location).
+        # The catalog's display name and end date are the nearest preceding
+        # fields in the same JSON object (schema.org Event puts name/dates
+        # before url/location).
         window = html[max(0, m.start() - 800):m.start()]
         name_matches = name_pattern.findall(window)
         title = name_matches[-1] if name_matches else full_url
-        listings.append({"catalog_url": catalog_url, "title": title, "full_url": full_url})
+        end_date_matches = end_date_pattern.findall(window)
+        end_date = end_date_matches[-1] if end_date_matches else None
+        listings.append({"catalog_url": catalog_url, "title": title, "full_url": full_url, "end_date": end_date})
     return listings
 
 def _parse_bidspotter_listing_page_OLD_UNUSED(html: str) -> list:
@@ -760,7 +764,8 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
 
     now_iso = datetime.now(timezone.utc).isoformat()
     snapshot_rows = [
-        {"business_id": business_id, "catalog_url": v["catalog_url"], "title": v["title"], "scanned_at": now_iso}
+        {"business_id": business_id, "catalog_url": v["catalog_url"], "title": v["title"],
+         "end_date": v.get("end_date"), "scanned_at": now_iso}
         for v in all_listings.values()
     ]
     for i in range(0, len(snapshot_rows), 500):
@@ -780,7 +785,7 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
         try:
             supabase_client.table("catalog_updates_queue").upsert({
                 "business_id": business_id, "catalog_url": catalog_url, "title": item["title"],
-                "kind": "new", "resolved": False,
+                "end_date": item.get("end_date"), "kind": "new", "resolved": False,
             }, on_conflict="business_id,catalog_url").execute()
             new_count += 1
         except Exception as e:
