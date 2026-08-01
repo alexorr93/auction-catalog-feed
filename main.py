@@ -928,6 +928,16 @@ async def _debug_browser_network_capture() -> None:
             html = await page.content()
             await browser.close()
         print(f"=== BROWSER RENDER TEST: rendered HTML is {len(html)} bytes ===")
+        ldjson_blocks = re.findall(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, re.I | re.S)
+        print(f"Found {len(ldjson_blocks)} ld+json block(s)")
+        for i, block in enumerate(ldjson_blocks):
+            try:
+                parsed = json.loads(block)
+                print(f"--- ld+json block {i} keys: {list(parsed.keys()) if isinstance(parsed, dict) else type(parsed)} ---")
+                print(f"--- ld+json block {i} FULL content ---\n{json.dumps(parsed, indent=2)[:6000]}")
+            except Exception as e:
+                print(f"--- ld+json block {i} failed to parse as JSON: {e}, raw (first 2000 chars): {block[:2000]} ---")
+
         for marker in ("lotNumber", "lot_number", "LotNumber", "class=\"lot", "data-lot", "search-filter?CategoryCode=", "itemListElement"):
             idx = html.find(marker)
             if idx >= 0:
