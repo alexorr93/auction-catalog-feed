@@ -925,6 +925,17 @@ async def _debug_browser_network_capture() -> None:
             print(f"=== BROWSER RENDER TEST: navigating to {catalog_url} ===")
             await page.goto(catalog_url, timeout=60000, wait_until="load")
             await page.wait_for_timeout(4000)
+            print("=== BROWSER RENDER TEST: dumping all form input fields ===")
+            try:
+                inputs = await page.eval_on_selector_all(
+                    "#main-search-form input, form#SearchForm input",
+                    "els => els.map(e => ({name: e.name, id: e.id, type: e.type, value: e.value, checked: e.checked}))"
+                )
+                for inp in inputs:
+                    print(f"  input: {inp}")
+            except Exception as e:
+                print(f"  form field dump failed: {e}")
+
             print("=== BROWSER RENDER TEST: clicking 'In this auction' + submitting search ===")
             try:
                 await page.click("#catalogueSearchOption", timeout=5000)
@@ -935,6 +946,11 @@ async def _debug_browser_network_capture() -> None:
             except Exception as e:
                 print(f"=== BROWSER RENDER TEST: search-form interaction failed: {type(e).__name__}: {e} ===")
             html = await page.content()
+            our_slug_count = html.count("bsckee10060")
+            other_lot_hrefs = re.findall(r'/en-us/auction-catalogues/([a-z0-9]+)/catalogue-id-([a-z0-9\-]+)/lot-', html, re.I)
+            distinct_catalogs_in_results = set(other_lot_hrefs)
+            print(f"=== SCOPE CHECK: 'bsckee10060' appears {our_slug_count} times in results HTML ===")
+            print(f"=== SCOPE CHECK: {len(distinct_catalogs_in_results)} distinct catalog(s) represented in lot links: {list(distinct_catalogs_in_results)[:10]} ===")
             await browser.close()
         print(f"=== BROWSER RENDER TEST: rendered HTML is {len(html)} bytes ===")
         ldjson_blocks = re.findall(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, re.I | re.S)
