@@ -906,34 +906,38 @@ async def _run_bidspotter_scan_for_business(supabase_client, business_id: str):
 async def _debug_browser_network_capture() -> None:
     """TEMP, runs immediately at startup. Uses Bright Data's Browser API (a
     real remote Chromium, connected via CDP -- no local browser binary
-    needed) to load a real catalog page and record every network request
-    the page's own JavaScript makes while loading. This is the real way to
-    find BidSpotter's lot-list API instead of guessing endpoint names."""
+    needed) to load a real, CONFIRMED-populated catalog page (103 known
+    lots) and grab the fully-rendered HTML after JS executes. First attempt
+    captured network requests and found no separate data-fetch API call --
+    so the lot data is likely rendered directly into the DOM by JS from
+    data already present, not fetched separately. Checking that now."""
     from playwright.async_api import async_playwright
     wss_url = os.environ.get("BRIGHT_DATA_BROWSER_WSS")
     if not wss_url:
         print("=== BROWSER CAPTURE: BRIGHT_DATA_BROWSER_WSS not set, skipping ===")
         return
     catalog_url = "https://www.bidspotter.com/en-us/auction-catalogues/bsckee/catalogue-id-bsckee10060"
-    captured = []
     try:
-        print(f"=== BROWSER CAPTURE: connecting to Bright Data Browser API ===")
+        print(f"=== BROWSER RENDER TEST: connecting to Bright Data Browser API ===")
         async with async_playwright() as pw:
             browser = await pw.chromium.connect_over_cdp(wss_url, timeout=60000)
             page = await browser.new_page()
-            page.on("request", lambda req: captured.append((req.method, req.url)))
-            print(f"=== BROWSER CAPTURE: navigating to {catalog_url} ===")
+            print(f"=== BROWSER RENDER TEST: navigating to {catalog_url} ===")
             await page.goto(catalog_url, timeout=90000, wait_until="networkidle")
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(4000)
+            html = await page.content()
             await browser.close()
-        print(f"=== BROWSER CAPTURE: {len(captured)} requests captured ===")
-        interesting = [(m, u) for m, u in captured if any(k in u.lower() for k in ("lot", "json", "api", "search", "auction")) and "bidspotter.com" in u]
-        print(f"=== {len(interesting)} interesting requests (contain lot/json/api/search/auction) ===")
-        for method, url in interesting[:40]:
-            print(f"  [{method}] {url}")
+        print(f"=== BROWSER RENDER TEST: rendered HTML is {len(html)} bytes ===")
+        for marker in ("lotNumber", "lot_number", "LotNumber", "class=\"lot", "data-lot", "search-filter?CategoryCode=", "itemListElement"):
+            idx = html.find(marker)
+            if idx >= 0:
+                around = re.sub(r'\s+', ' ', html[max(0, idx-200):idx+1200]).strip()
+                print(f"Marker {marker!r} found at {idx}: {around}")
+            else:
+                print(f"Marker {marker!r}: not found")
     except Exception as e:
-        print(f"=== BROWSER CAPTURE FAILED: {type(e).__name__}: {e} ===")
-    print("=== END BROWSER CAPTURE ===")
+        print(f"=== BROWSER RENDER TEST FAILED: {type(e).__name__}: {e} ===")
+    print("=== END BROWSER RENDER TEST ===")
 
 async def _daily_bidspotter_scan_loop():
     """Runs once at startup (after a short delay so the app is fully up
