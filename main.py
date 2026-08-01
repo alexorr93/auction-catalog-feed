@@ -768,8 +768,31 @@ async def _recheck_blank_catalogs(supabase_client, business_id: str) -> dict:
 
     blank_catalogs = [r for r in latest_status.values() if r["status"] == "empty"]
     reactivated_count = 0
+    growing_count = 0
     checked = 0
     first_error = None
+
+    # Small active catalogs (1-49 known lots) -- bounded on purpose, keeps this
+    # fast. Compares against last_category_count stored on bidspotter_scan_snapshot
+    # to detect growth, not just empty->active transitions.
+    try:
+        small_catalog_rows = supabase_client.rpc(
+            "get_small_active_catalogs", {"p_business_id": business_id, "p_max_lots": 50}
+        ).execute().data or []
+    except Exception as e:
+        print(f"BidSpotter recheck: failed to fetch small-catalog list: {e}")
+        small_catalog_rows = []
+    small_catalog_urls = {r["catalog_url"] for r in small_catalog_rows}
+
+    prior_counts = {}
+    if small_catalog_urls:
+        try:
+            snap_rows = _fetch_all_paginated(lambda: supabase_client.table("bidspotter_scan_snapshot").select("catalog_url,title,last_category_count").eq("business_id", business_id))
+            for r in snap_rows:
+                if r["catalog_url"] in small_catalog_urls:
+                    prior_counts[r["catalog_url"]] = r
+        except Exception as e:
+            print(f"BidSpotter recheck: failed to fetch prior category counts: {e}")
 
     async with httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
         for row in blank_catalogs:
@@ -790,17 +813,60 @@ async def _recheck_blank_catalogs(supabase_client, business_id: str) -> dict:
                     first_error = f"{catalog_url}: {type(e).__name__}: {e}"
                 continue
 
-            has_real_content = bool(re.search(r'search-filter\?CategoryCode=', text))
+            category_matches = re.findall(r'search-filter\?CategoryCode=', text)
+            category_count = len(category_matches)
+            has_real_content = category_count > 0
             if has_real_content:
                 try:
                     supabase_client.table("catalog_updates_queue").upsert({
                         "business_id": business_id, "catalog_url": catalog_url,
                         "title": row.get("filename", catalog_url), "kind": "reactivated", "resolved": False,
+                        "category_count": category_count,
                     }, on_conflict="business_id,catalog_url").execute()
                     reactivated_count += 1
                 except Exception as e:
                     print(f"BidSpotter recheck: failed to queue reactivated catalog {catalog_url}: {e}")
-    return {"total_blank": len(blank_catalogs), "checked": checked, "reactivated": reactivated_count, "first_error": first_error}
+
+        for catalog_url in small_catalog_urls:
+            real_url = _reconstruct_full_url(catalog_url)
+            if not real_url:
+                continue
+            try:
+                resp = await _brightdata_get(client, real_url)
+                if resp.status_code != 200:
+                    if first_error is None:
+                        first_error = f"{catalog_url}: HTTP {resp.status_code}"
+                    continue
+                text = resp.text
+                checked += 1
+            except Exception as e:
+                if first_error is None:
+                    first_error = f"{catalog_url}: {type(e).__name__}: {e}"
+                continue
+
+            new_count = len(re.findall(r'search-filter\?CategoryCode=', text))
+            prior_row = prior_counts.get(catalog_url)
+            prior_count = prior_row.get("last_category_count") if prior_row else None
+
+            if prior_count is not None and new_count > prior_count:
+                try:
+                    supabase_client.table("catalog_updates_queue").upsert({
+                        "business_id": business_id, "catalog_url": catalog_url,
+                        "title": (prior_row or {}).get("title", catalog_url), "kind": "growing", "resolved": False,
+                        "category_count": new_count,
+                    }, on_conflict="business_id,catalog_url").execute()
+                    growing_count += 1
+                except Exception as e:
+                    print(f"BidSpotter recheck: failed to queue growing catalog {catalog_url}: {e}")
+
+            try:
+                supabase_client.table("bidspotter_scan_snapshot").update(
+                    {"last_category_count": new_count}
+                ).eq("business_id", business_id).eq("catalog_url", catalog_url).execute()
+            except Exception as e:
+                print(f"BidSpotter recheck: failed to update last_category_count for {catalog_url}: {e}")
+
+    return {"total_blank": len(blank_catalogs), "checked": checked, "reactivated": reactivated_count, "growing": growing_count, "first_error": first_error}
 
 def _reconstruct_full_url(catalog_url: str) -> Optional[str]:
     """Inverse of _full_url_to_catalog_url -- rebuilds a real, fetchable
@@ -831,6 +897,7 @@ async def _run_bidspotter_scan_for_business(supabase_client, business_id: str):
         "listings_found": scan_result["listings"],
         "new_flagged": scan_result["new_flagged"],
         "reactivated_flagged": recheck_result["reactivated"],
+        "growing_flagged": recheck_result["growing"],
     }
     supabase_client.table("bidspotter_scan_status").upsert(status_row, on_conflict="business_id").execute()
     print(f"BidSpotter scan for {business_id}: {status_row}")
