@@ -924,8 +924,16 @@ async def _run_bidspotter_scan_for_business(supabase_client, business_id: str):
     doesn't need to happen before the lot-pull, and was previously blocking
     it for no real reason. Writes the outcome into bidspotter_scan_status --
     so what actually happened is checkable via a normal query, not lost in
-    server logs nobody can reach."""
-    scan_result = await _scan_bidspotter_new_catalogs(supabase_client, business_id)
+    server logs nobody can reach.
+
+    Set SKIP_JOB1=1 as a Railway variable to skip straight to the lot-pull
+    using whatever's already queued -- avoids re-running the ~10-page
+    listing scan on every single restart during active debugging."""
+    if os.environ.get("SKIP_JOB1") == "1":
+        print(f"SKIP_JOB1 is set -- skipping Job 1, going straight to the lot-pull for {business_id}")
+        scan_result = {"ok": True, "error": None, "pages": 0, "listings": 0, "new_flagged": 0}
+    else:
+        scan_result = await _scan_bidspotter_new_catalogs(supabase_client, business_id)
     lot_pull_result = await _pull_lots_for_queued_catalogs(supabase_client, business_id)
     print(f"BidSpotter lot pull for {business_id}: {lot_pull_result}")
     recheck_result = await _recheck_blank_catalogs(supabase_client, business_id)
@@ -1219,8 +1227,43 @@ async def _daily_bidspotter_scan_loop():
             print(f"BidSpotter daily scan loop failed: {e}")
         await asyncio.sleep(12 * 60 * 60)
 
+async def _debug_find_lot_count_display() -> None:
+    """TEMP, runs immediately at startup. The user can see a real total lot
+    count displayed directly on a catalog page (e.g. '425 lots') -- if we
+    can read that number directly, it's a far better ground-truth signal
+    for 'are we actually done paginating' than inferring end-of-results
+    from page behavior, which is the whole source of tonight's back-and-
+    forth. Checking the real catalog page for this."""
+    from playwright.async_api import async_playwright
+    wss_url = os.environ.get("BRIGHT_DATA_BROWSER_WSS")
+    if not wss_url:
+        print("=== LOT COUNT DISPLAY DEBUG: BRIGHT_DATA_BROWSER_WSS not set, skipping ===")
+        return
+    catalog_url = "https://www.bidspotter.com/en-us/auction-catalogues/bsclevy/catalogue-id-levy-r10200"
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.connect_over_cdp(wss_url, timeout=60000)
+            page = await browser.new_page()
+            await page.goto(catalog_url, timeout=60000, wait_until="load")
+            await page.wait_for_timeout(3000)
+            html = await page.content()
+            await browser.close()
+        print(f"=== LOT COUNT DISPLAY DEBUG: page is {len(html)} bytes ===")
+        for pattern_name, pattern in [
+            ("N lots/Lots", r'(\d[\d,]*)\s*[Ll]ots?\b'),
+            ("Lots: N or Lots (N)", r'[Ll]ots?[:\s\(]+(\d[\d,]*)'),
+            ("N results", r'(\d[\d,]*)\s*[Rr]esults?\b'),
+            ("results count/total-count classes", r'class="[^"]*(?:results?-count|total-count|lot-count)[^"]*"[^>]*>([^<]{0,20})'),
+        ]:
+            matches = re.findall(pattern, html)
+            print(f"Pattern {pattern_name!r}: {matches[:10]}")
+    except Exception as e:
+        print(f"=== LOT COUNT DISPLAY DEBUG FAILED: {type(e).__name__}: {e} ===")
+    print("=== END LOT COUNT DISPLAY DEBUG ===")
+
 @app.on_event("startup")
 async def _start_bidspotter_scan_loop():
+    asyncio.create_task(_debug_find_lot_count_display())
     asyncio.create_task(_daily_bidspotter_scan_loop())
 
 @app.api_route("/api/updates/trigger-scan", methods=["GET", "POST"])
