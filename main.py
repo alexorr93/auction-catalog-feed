@@ -1130,6 +1130,70 @@ async def _pull_lots_for_queued_catalogs(supabase_client, business_id: str) -> d
         pass
     return {"attempted": attempted, "succeeded": succeeded, "total_lots_written": total_lots_written}
 
+async def _debug_pagination_diagnostic() -> None:
+    """TEMP, runs immediately at startup. A real catalog is showing exactly
+    60 lots via the current mechanism -- smaller catalogs (32, 50, 71->
+    wait 71 shouldn't cap... ) show their real count, meaning 60 is a batch
+    size being hit, not a real total. Investigating the actual pagination
+    mechanism (load-more button vs true infinite scroll vs URL param)
+    before blindly increasing scroll count again."""
+    from playwright.async_api import async_playwright
+    wss_url = os.environ.get("BRIGHT_DATA_BROWSER_WSS")
+    if not wss_url:
+        print("=== PAGINATION DIAGNOSTIC: BRIGHT_DATA_BROWSER_WSS not set, skipping ===")
+        return
+    catalog_url = "https://www.bidspotter.com/en-us/auction-catalogues/eamagroup/catalogue-id-eama-g11661"
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.connect_over_cdp(wss_url, timeout=60000)
+            page = await browser.new_page()
+            await page.goto(catalog_url, timeout=60000, wait_until="load")
+            await page.wait_for_timeout(3000)
+            checked = False
+            for attempt in range(3):
+                try:
+                    await page.click("#catalogueSearchOption", timeout=5000)
+                    checked = await page.eval_on_selector("#catalogueSearchOption", "el => el.checked")
+                    if checked:
+                        break
+                except Exception:
+                    pass
+                await page.wait_for_timeout(1000)
+            if not checked:
+                print("=== PAGINATION DIAGNOSTIC: click never registered, aborting ===")
+                await browser.close()
+                return
+            await page.click("#searchSubmit", timeout=5000)
+            await page.wait_for_load_state("load", timeout=30000)
+            await page.wait_for_timeout(3000)
+
+            html_before = await page.content()
+            count_before = len(re.findall(r'data-click-type="title"', html_before))
+            print(f"=== PAGINATION DIAGNOSTIC: {count_before} lot cards BEFORE any scroll ===")
+
+            for marker in ("load-more", "loadMore", "LoadMore", "pagination", "next-page", "TotalRecords", "totalResults", "totalRecords", "resultCount", "class=\"pager", "aria-label=\"Next"):
+                idx = html_before.find(marker)
+                if idx >= 0:
+                    around = re.sub(r'\s+', ' ', html_before[max(0, idx-150):idx+400]).strip()
+                    print(f"Marker {marker!r} found at {idx}: {around}")
+                else:
+                    print(f"Marker {marker!r}: not found")
+
+            # Try aggressive scrolling -- 15 iterations, longer waits -- to see
+            # if the count genuinely increases with more time/scroll, or is
+            # truly capped regardless.
+            for i in range(15):
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await page.wait_for_timeout(2000)
+
+            html_after = await page.content()
+            count_after = len(re.findall(r'data-click-type="title"', html_after))
+            print(f"=== PAGINATION DIAGNOSTIC: {count_after} lot cards AFTER 15 aggressive scrolls ===")
+            await browser.close()
+    except Exception as e:
+        print(f"=== PAGINATION DIAGNOSTIC FAILED: {type(e).__name__}: {e} ===")
+    print("=== END PAGINATION DIAGNOSTIC ===")
+
 async def _daily_bidspotter_scan_loop():
     """Runs once at startup (after a short delay so the app is fully up
     first), then once every 12 hours after that, for every business_id that
@@ -1149,6 +1213,7 @@ async def _daily_bidspotter_scan_loop():
 
 @app.on_event("startup")
 async def _start_bidspotter_scan_loop():
+    asyncio.create_task(_debug_pagination_diagnostic())
     asyncio.create_task(_daily_bidspotter_scan_loop())
 
 @app.api_route("/api/updates/trigger-scan", methods=["GET", "POST"])
