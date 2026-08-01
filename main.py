@@ -913,11 +913,16 @@ def _reconstruct_full_url(catalog_url: str) -> Optional[str]:
     return f"https://{m.group(1)}/en-us/auction-catalogues/{m.group(2)}/{m.group(3)}"
 
 async def _run_bidspotter_scan_for_business(supabase_client, business_id: str):
-    """Runs both jobs once for one business and writes the outcome (success
-    or the real error) into bidspotter_scan_status -- so what actually
-    happened is checkable via a normal query, not lost in server logs
-    nobody can reach."""
+    """Runs Job 1 (detect new/existing catalogs), then IMMEDIATELY pulls real
+    lot data for anything newly queued (the actual point of this whole
+    pipeline), THEN runs Job 2 (recheck blanks + growth detection) -- Job 2
+    doesn't need to happen before the lot-pull, and was previously blocking
+    it for no real reason. Writes the outcome into bidspotter_scan_status --
+    so what actually happened is checkable via a normal query, not lost in
+    server logs nobody can reach."""
     scan_result = await _scan_bidspotter_new_catalogs(supabase_client, business_id)
+    lot_pull_result = await _pull_lots_for_queued_catalogs(supabase_client, business_id)
+    print(f"BidSpotter lot pull for {business_id}: {lot_pull_result}")
     recheck_result = await _recheck_blank_catalogs(supabase_client, business_id)
     error_parts = []
     if not scan_result["ok"]:
@@ -1108,8 +1113,6 @@ async def _daily_bidspotter_scan_loop():
             business_ids = {r["business_id"] for r in biz_rows}
             for business_id in business_ids:
                 await _run_bidspotter_scan_for_business(supabase_client, business_id)
-                lot_pull_result = await _pull_lots_for_queued_catalogs(supabase_client, business_id)
-                print(f"BidSpotter lot pull for {business_id}: {lot_pull_result}")
         except Exception as e:
             print(f"BidSpotter daily scan loop failed: {e}")
         await asyncio.sleep(12 * 60 * 60)
