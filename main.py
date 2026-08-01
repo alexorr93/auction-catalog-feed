@@ -903,82 +903,113 @@ async def _run_bidspotter_scan_for_business(supabase_client, business_id: str):
     print(f"BidSpotter scan for {business_id}: {status_row}")
     return status_row
 
-async def _debug_browser_network_capture() -> None:
-    """TEMP, runs immediately at startup. Uses Bright Data's Browser API (a
-    real remote Chromium, connected via CDP -- no local browser binary
-    needed) to load a real, CONFIRMED-populated catalog page (103 known
-    lots) and grab the fully-rendered HTML after JS executes. First attempt
-    captured network requests and found no separate data-fetch API call --
-    so the lot data is likely rendered directly into the DOM by JS from
-    data already present, not fetched separately. Checking that now."""
+async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: str) -> list:
+    """The real, proven mechanism: loads a catalog page in a real remote
+    browser (Bright Data Browser API), clicks 'In this auction' + submits
+    the search form, scrolls to trigger lazy-loaded results, then extracts
+    every lot card and filters to only ones actually belonging to this
+    catalog (BidSpotter's own scoping isn't fully reliable, so we filter
+    client-side using each lot's own href). Returns [{lot_number,
+    description}, ...]. catalog_slug is the catalogue-id- value, e.g.
+    'ncm-au11447', used both for the client-side filter and detecting a
+    flaky click (checked state) before submitting."""
     from playwright.async_api import async_playwright
     wss_url = os.environ.get("BRIGHT_DATA_BROWSER_WSS")
     if not wss_url:
-        print("=== BROWSER CAPTURE: BRIGHT_DATA_BROWSER_WSS not set, skipping ===")
-        return
-    catalog_url = "https://www.bidspotter.com/en-us/auction-catalogues/ncm/catalogue-id-ncm-au11447"
+        return []
+    lots = []
     try:
-        print(f"=== BROWSER RENDER TEST: connecting to Bright Data Browser API ===")
         async with async_playwright() as pw:
             browser = await pw.chromium.connect_over_cdp(wss_url, timeout=60000)
             page = await browser.new_page()
-            print(f"=== BROWSER RENDER TEST: navigating to {catalog_url} ===")
-            await page.goto(catalog_url, timeout=60000, wait_until="load")
-            await page.wait_for_timeout(4000)
-            print("=== BROWSER RENDER TEST: dumping all form input fields ===")
-            try:
-                inputs = await page.eval_on_selector_all(
-                    "#main-search-form input, form#SearchForm input",
-                    "els => els.map(e => ({name: e.name, id: e.id, type: e.type, value: e.value, checked: e.checked}))"
-                )
-                for inp in inputs:
-                    print(f"  input: {inp}")
-            except Exception as e:
-                print(f"  form field dump failed: {e}")
+            await page.goto(catalog_url_full, timeout=60000, wait_until="load")
+            await page.wait_for_timeout(3000)
 
-            print("=== BROWSER RENDER TEST: clicking 'In this auction' + submitting search ===")
-            try:
-                await page.click("#catalogueSearchOption", timeout=5000)
-                await page.click("#searchSubmit", timeout=5000)
-                await page.wait_for_load_state("load", timeout=30000)
-                await page.wait_for_timeout(4000)
-                print(f"=== BROWSER RENDER TEST: after search submit, URL is now: {page.url} ===")
-            except Exception as e:
-                print(f"=== BROWSER RENDER TEST: search-form interaction failed: {type(e).__name__}: {e} ===")
+            # The 'In this auction' click was observed to be flaky (didn't
+            # always register before submit) -- retry until it's actually
+            # checked, not just attempted once.
+            checked = False
+            for attempt in range(3):
+                try:
+                    await page.click("#catalogueSearchOption", timeout=5000)
+                    checked = await page.eval_on_selector("#catalogueSearchOption", "el => el.checked")
+                    if checked:
+                        break
+                except Exception:
+                    pass
+                await page.wait_for_timeout(1000)
+            if not checked:
+                await browser.close()
+                return []
+
+            await page.click("#searchSubmit", timeout=5000)
+            await page.wait_for_load_state("load", timeout=30000)
+            await page.wait_for_timeout(3000)
+
+            # Scroll a few times to trigger any lazy-loaded additional lots
+            for _ in range(5):
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await page.wait_for_timeout(1500)
+
             html = await page.content()
-            our_slug_count = html.count("ncm-au11447")
-            all_lot_matches = re.findall(
-                r'href="(/en-us/auction-catalogues/([a-z0-9]+)/catalogue-id-([a-z0-9\-]+)/lot-[a-z0-9\-]+)"[^>]*data-click-type="title"[^>]*>\s*<span class="lot-number">(\d+)</span><span class="lot-title">([^<]+)</span>',
-                html, re.I
-            )
-            print(f"=== SCOPE CHECK: 'ncm-au11447' appears {our_slug_count} times in results HTML ===")
-            print(f"=== Found {len(all_lot_matches)} total lot cards across all auctions in this results page ===")
-            our_lots = [m for m in all_lot_matches if m[2].lower() == "ncm-au11447"]
-            print(f"=== {len(our_lots)} of those belong to OUR target catalog (ncm-au11447) ===")
-            for href, auctioneer, cat_id, lot_num, lot_title in our_lots[:60]:
-                print(f"  LOT #{lot_num}: {lot_title}")
             await browser.close()
-        print(f"=== BROWSER RENDER TEST: rendered HTML is {len(html)} bytes ===")
-        ldjson_blocks = re.findall(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, re.I | re.S)
-        print(f"Found {len(ldjson_blocks)} ld+json block(s)")
-        for i, block in enumerate(ldjson_blocks):
-            try:
-                parsed = json.loads(block)
-                print(f"--- ld+json block {i} keys: {list(parsed.keys()) if isinstance(parsed, dict) else type(parsed)} ---")
-                print(f"--- ld+json block {i} FULL content ---\n{json.dumps(parsed, indent=2)[:6000]}")
-            except Exception as e:
-                print(f"--- ld+json block {i} failed to parse as JSON: {e}, raw (first 2000 chars): {block[:2000]} ---")
 
-        for marker in ("lotNumber", "lot_number", "LotNumber", "class=\"lot", "data-lot-id=\"", "search-filter?CategoryCode=", "itemListElement", "Current Bid", "class=\"search-result", "lot-number", "\"Lots\"", "\"TotalRecords\""):
-            idx = html.find(marker)
-            if idx >= 0:
-                around = re.sub(r'\s+', ' ', html[max(0, idx-200):idx+1200]).strip()
-                print(f"Marker {marker!r} found at {idx}: {around}")
-            else:
-                print(f"Marker {marker!r}: not found")
+        all_matches = re.findall(
+            r'href="(/en-us/auction-catalogues/([a-z0-9]+)/catalogue-id-([a-z0-9\-]+)/lot-[a-z0-9\-]+)"[^>]*data-click-type="title"[^>]*>\s*<span class="lot-number">(\d+)</span><span class="lot-title">([^<]+)</span>',
+            html, re.I
+        )
+        seen_lot_numbers = set()
+        for href, auctioneer, cat_id, lot_num, lot_title in all_matches:
+            if cat_id.lower() != catalog_slug.lower():
+                continue
+            if lot_num in seen_lot_numbers:
+                continue
+            seen_lot_numbers.add(lot_num)
+            lots.append({"lot_number": lot_num, "description": lot_title.strip()})
     except Exception as e:
-        print(f"=== BROWSER RENDER TEST FAILED: {type(e).__name__}: {e} ===")
-    print("=== END BROWSER RENDER TEST ===")
+        print(f"Browser lot fetch failed for {catalog_url_full}: {type(e).__name__}: {e}")
+    return lots
+
+async def _pull_lots_for_queued_catalogs(supabase_client, business_id: str) -> dict:
+    """Runs the real browser-based lot pull for every catalog currently
+    sitting unresolved in the VA queue (new or reactivated) -- these are
+    exactly the ones a VA would otherwise have to open and read by hand.
+    Writes into bidspotter_auto_catalog_lots (the staging table, kept
+    separate from the trusted bidspotter_catalog_lots table the real
+    listing pipeline depends on)."""
+    if not os.environ.get("BRIGHT_DATA_BROWSER_WSS"):
+        return {"attempted": 0, "succeeded": 0, "total_lots_written": 0}
+    queue_rows = _fetch_all_paginated(lambda: supabase_client.table("catalog_updates_queue").select("catalog_url,title").eq("business_id", business_id).eq("resolved", False))
+    attempted = 0
+    succeeded = 0
+    total_lots_written = 0
+    for row in queue_rows:
+        catalog_url = row["catalog_url"]
+        real_url = _reconstruct_full_url(catalog_url)
+        if not real_url:
+            continue
+        m = re.search(r'catalogue-id-([a-z0-9\-]+)$', real_url, re.I)
+        if not m:
+            continue
+        catalog_slug = m.group(1)
+        attempted += 1
+        lots = await _fetch_catalog_lots_via_browser(real_url, catalog_slug)
+        if not lots:
+            continue
+        succeeded += 1
+        rows_to_upsert = [
+            {"business_id": business_id, "catalog_url": catalog_url, "lot_number": lot["lot_number"],
+             "description": lot["description"], "last_seen_at": datetime.now(timezone.utc).isoformat()}
+            for lot in lots
+        ]
+        try:
+            supabase_client.table("bidspotter_auto_catalog_lots").upsert(
+                rows_to_upsert, on_conflict="business_id,catalog_url,lot_number"
+            ).execute()
+            total_lots_written += len(rows_to_upsert)
+        except Exception as e:
+            print(f"Failed to write lots for {catalog_url}: {e}")
+    return {"attempted": attempted, "succeeded": succeeded, "total_lots_written": total_lots_written}
 
 async def _daily_bidspotter_scan_loop():
     """Runs once at startup (after a short delay so the app is fully up
@@ -993,13 +1024,14 @@ async def _daily_bidspotter_scan_loop():
             business_ids = {r["business_id"] for r in biz_rows}
             for business_id in business_ids:
                 await _run_bidspotter_scan_for_business(supabase_client, business_id)
+                lot_pull_result = await _pull_lots_for_queued_catalogs(supabase_client, business_id)
+                print(f"BidSpotter lot pull for {business_id}: {lot_pull_result}")
         except Exception as e:
             print(f"BidSpotter daily scan loop failed: {e}")
         await asyncio.sleep(12 * 60 * 60)
 
 @app.on_event("startup")
 async def _start_bidspotter_scan_loop():
-    asyncio.create_task(_debug_browser_network_capture())
     asyncio.create_task(_daily_bidspotter_scan_loop())
 
 @app.api_route("/api/updates/trigger-scan", methods=["GET", "POST"])
