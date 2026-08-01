@@ -952,24 +952,39 @@ async def _run_bidspotter_scan_for_business(supabase_client, business_id: str):
 async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: str) -> dict:
     """The real, proven mechanism: loads a catalog page in a real remote
     browser (Bright Data Browser API), clicks 'In this auction' + submits
-    the search form, scrolls to trigger lazy-loaded results, then extracts
-    every lot card and filters to only ones actually belonging to this
-    catalog (BidSpotter's own scoping isn't fully reliable, so we filter
-    client-side using each lot's own href). Returns {lots: [{lot_number,
-    description}, ...], state, zip_code} -- state/zip come from the
-    catalog's own structured location data (schema.org addressRegion /
-    postalCode, standard field names) on the INITIAL page load, captured
-    before the search-form interaction replaces the page content.
-    catalog_slug is the catalogue-id- value, e.g. 'ncm-au11447', used both
-    for the client-side filter and detecting a flaky click (checked state)
-    before submitting."""
+    the search form, then pages through ALL results using BidSpotter's real
+    page=N URL parameter (confirmed via a live diagnostic: results are
+    NOT infinite-scroll/lazy-loaded -- scrolling 15x changed nothing, but a
+    real 'next-page' link with &page=2 was found in the page's own HTML).
+    Extracts every lot card on every page and filters to only ones actually
+    belonging to this catalog (BidSpotter's own scoping isn't fully
+    reliable, so we filter client-side using each lot's own href). Returns
+    {lots: [{lot_number, description}, ...], state, zip_code} -- state/zip
+    come from the catalog's own structured location data (schema.org
+    addressRegion/postalCode) on the INITIAL page load, captured before the
+    search-form interaction replaces the page content. catalog_slug is the
+    catalogue-id- value, e.g. 'ncm-au11447', used both for the client-side
+    filter and detecting a flaky click (checked state) before submitting."""
     from playwright.async_api import async_playwright
+    from urllib.parse import quote
     wss_url = os.environ.get("BRIGHT_DATA_BROWSER_WSS")
     if not wss_url:
         return {"lots": [], "state": None, "zip_code": None}
     lots = []
     state = None
     zip_code = None
+    lot_pattern = re.compile(
+        r'href="(/en-us/auction-catalogues/([a-z0-9]+)/catalogue-id-([a-z0-9\-]+)/lot-[a-z0-9\-]+)"[^>]*data-click-type="title"[^>]*>\s*<span class="lot-number">(\d+)</span><span class="lot-title">([^<]+)</span>',
+        re.I
+    )
+
+    def extract_matching_lots(html: str) -> list:
+        found = []
+        for href, auctioneer, cat_id, lot_num, lot_title in lot_pattern.findall(html):
+            if cat_id.lower() == catalog_slug.lower():
+                found.append((lot_num, lot_title.strip()))
+        return found
+
     try:
         async with async_playwright() as pw:
             browser = await pw.chromium.connect_over_cdp(wss_url, timeout=60000)
@@ -1006,29 +1021,46 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
             await page.wait_for_load_state("load", timeout=30000)
             await page.wait_for_timeout(3000)
 
-            # Scroll a few times to trigger any lazy-loaded additional lots
-            for _ in range(5):
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(1500)
+            page1_html = await page.content()
+            seen_lot_numbers = set()
+            for lot_num, lot_title in extract_matching_lots(page1_html):
+                if lot_num not in seen_lot_numbers:
+                    seen_lot_numbers.add(lot_num)
+                    lots.append({"lot_number": lot_num, "description": lot_title})
 
-            html = await page.content()
+            # Build the direct page=N URL from the catalog's own path -- the
+            # same whereToSearch param the site's own 'next page' link uses,
+            # confirmed via diagnostic. Direct navigation per page is faster
+            # and more reliable than re-clicking the form each time.
+            path_part = catalog_url_full.replace("https://www.bidspotter.com", "")
+            where_to_search = quote(path_part, safe="")
+
+            MAX_PAGES = 40  # hard ceiling -- real safety net, not expected to be hit often
+            for page_num in range(2, MAX_PAGES + 1):
+                next_url = f"{catalog_url_full}?searchTerm=&whereToSearch={where_to_search}&page={page_num}"
+                try:
+                    await page.goto(next_url, timeout=30000, wait_until="load")
+                    await page.wait_for_timeout(2000)
+                except Exception as e:
+                    print(f"Pagination stopped at page {page_num} for {catalog_url_full}: {type(e).__name__}: {e}")
+                    break
+                page_html = await page.content()
+                page_lots = extract_matching_lots(page_html)
+                new_on_this_page = [l for l in page_lots if l[0] not in seen_lot_numbers]
+                if not new_on_this_page:
+                    # No new lots at all -- either genuinely out of pages, or
+                    # this page redirected back to page 1's content. Either
+                    # way, nothing left to gain by continuing.
+                    break
+                for lot_num, lot_title in new_on_this_page:
+                    seen_lot_numbers.add(lot_num)
+                    lots.append({"lot_number": lot_num, "description": lot_title})
+
             await browser.close()
-
-        all_matches = re.findall(
-            r'href="(/en-us/auction-catalogues/([a-z0-9]+)/catalogue-id-([a-z0-9\-]+)/lot-[a-z0-9\-]+)"[^>]*data-click-type="title"[^>]*>\s*<span class="lot-number">(\d+)</span><span class="lot-title">([^<]+)</span>',
-            html, re.I
-        )
-        seen_lot_numbers = set()
-        for href, auctioneer, cat_id, lot_num, lot_title in all_matches:
-            if cat_id.lower() != catalog_slug.lower():
-                continue
-            if lot_num in seen_lot_numbers:
-                continue
-            seen_lot_numbers.add(lot_num)
-            lots.append({"lot_number": lot_num, "description": lot_title.strip()})
     except Exception as e:
         print(f"Browser lot fetch failed for {catalog_url_full}: {type(e).__name__}: {e}")
     return {"lots": lots, "state": state, "zip_code": zip_code}
+
 
 async def _pull_lots_for_queued_catalogs(supabase_client, business_id: str) -> dict:
     """Runs the real browser-based lot pull for every catalog currently
@@ -1130,69 +1162,25 @@ async def _pull_lots_for_queued_catalogs(supabase_client, business_id: str) -> d
         pass
     return {"attempted": attempted, "succeeded": succeeded, "total_lots_written": total_lots_written}
 
-async def _debug_pagination_diagnostic() -> None:
-    """TEMP, runs immediately at startup. A real catalog is showing exactly
-    60 lots via the current mechanism -- smaller catalogs (32, 50, 71->
-    wait 71 shouldn't cap... ) show their real count, meaning 60 is a batch
-    size being hit, not a real total. Investigating the actual pagination
-    mechanism (load-more button vs true infinite scroll vs URL param)
-    before blindly increasing scroll count again."""
-    from playwright.async_api import async_playwright
+async def _debug_verify_pagination_fix() -> None:
+    """TEMP, runs immediately at startup. Calls the EXACT production
+    function (_fetch_catalog_lots_via_browser) with the new page=N
+    pagination logic, on the same real catalog confirmed truncated at 60
+    lots under the old scroll-based logic. Prints the real total found --
+    a genuine test of the fix, not a guess."""
     wss_url = os.environ.get("BRIGHT_DATA_BROWSER_WSS")
     if not wss_url:
-        print("=== PAGINATION DIAGNOSTIC: BRIGHT_DATA_BROWSER_WSS not set, skipping ===")
+        print("=== PAGINATION FIX VERIFY: BRIGHT_DATA_BROWSER_WSS not set, skipping ===")
         return
     catalog_url = "https://www.bidspotter.com/en-us/auction-catalogues/eamagroup/catalogue-id-eama-g11661"
-    try:
-        async with async_playwright() as pw:
-            browser = await pw.chromium.connect_over_cdp(wss_url, timeout=60000)
-            page = await browser.new_page()
-            await page.goto(catalog_url, timeout=60000, wait_until="load")
-            await page.wait_for_timeout(3000)
-            checked = False
-            for attempt in range(3):
-                try:
-                    await page.click("#catalogueSearchOption", timeout=5000)
-                    checked = await page.eval_on_selector("#catalogueSearchOption", "el => el.checked")
-                    if checked:
-                        break
-                except Exception:
-                    pass
-                await page.wait_for_timeout(1000)
-            if not checked:
-                print("=== PAGINATION DIAGNOSTIC: click never registered, aborting ===")
-                await browser.close()
-                return
-            await page.click("#searchSubmit", timeout=5000)
-            await page.wait_for_load_state("load", timeout=30000)
-            await page.wait_for_timeout(3000)
-
-            html_before = await page.content()
-            count_before = len(re.findall(r'data-click-type="title"', html_before))
-            print(f"=== PAGINATION DIAGNOSTIC: {count_before} lot cards BEFORE any scroll ===")
-
-            for marker in ("load-more", "loadMore", "LoadMore", "pagination", "next-page", "TotalRecords", "totalResults", "totalRecords", "resultCount", "class=\"pager", "aria-label=\"Next"):
-                idx = html_before.find(marker)
-                if idx >= 0:
-                    around = re.sub(r'\s+', ' ', html_before[max(0, idx-150):idx+400]).strip()
-                    print(f"Marker {marker!r} found at {idx}: {around}")
-                else:
-                    print(f"Marker {marker!r}: not found")
-
-            # Try aggressive scrolling -- 15 iterations, longer waits -- to see
-            # if the count genuinely increases with more time/scroll, or is
-            # truly capped regardless.
-            for i in range(15):
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(2000)
-
-            html_after = await page.content()
-            count_after = len(re.findall(r'data-click-type="title"', html_after))
-            print(f"=== PAGINATION DIAGNOSTIC: {count_after} lot cards AFTER 15 aggressive scrolls ===")
-            await browser.close()
-    except Exception as e:
-        print(f"=== PAGINATION DIAGNOSTIC FAILED: {type(e).__name__}: {e} ===")
-    print("=== END PAGINATION DIAGNOSTIC ===")
+    print(f"=== PAGINATION FIX VERIFY: calling production function on {catalog_url} (previously truncated at 60) ===")
+    result = await _fetch_catalog_lots_via_browser(catalog_url, "eama-g11661")
+    lots = result.get("lots", [])
+    print(f"=== PAGINATION FIX VERIFY: got {len(lots)} real lots (was 60 before the fix) ===")
+    lot_numbers = sorted((int(l["lot_number"]) for l in lots if l["lot_number"].isdigit()))
+    if lot_numbers:
+        print(f"=== Lot number range: {lot_numbers[0]} to {lot_numbers[-1]} ===")
+    print("=== END PAGINATION FIX VERIFY ===")
 
 async def _daily_bidspotter_scan_loop():
     """Runs once at startup (after a short delay so the app is fully up
@@ -1213,7 +1201,7 @@ async def _daily_bidspotter_scan_loop():
 
 @app.on_event("startup")
 async def _start_bidspotter_scan_loop():
-    asyncio.create_task(_debug_pagination_diagnostic())
+    asyncio.create_task(_debug_verify_pagination_fix())
     asyncio.create_task(_daily_bidspotter_scan_loop())
 
 @app.api_route("/api/updates/trigger-scan", methods=["GET", "POST"])
