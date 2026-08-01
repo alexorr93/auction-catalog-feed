@@ -1162,26 +1162,6 @@ async def _pull_lots_for_queued_catalogs(supabase_client, business_id: str) -> d
         pass
     return {"attempted": attempted, "succeeded": succeeded, "total_lots_written": total_lots_written}
 
-async def _debug_verify_pagination_fix() -> None:
-    """TEMP, runs immediately at startup. Calls the EXACT production
-    function (_fetch_catalog_lots_via_browser) with the new page=N
-    pagination logic, on the same real catalog confirmed truncated at 60
-    lots under the old scroll-based logic. Prints the real total found --
-    a genuine test of the fix, not a guess."""
-    wss_url = os.environ.get("BRIGHT_DATA_BROWSER_WSS")
-    if not wss_url:
-        print("=== PAGINATION FIX VERIFY: BRIGHT_DATA_BROWSER_WSS not set, skipping ===")
-        return
-    catalog_url = "https://www.bidspotter.com/en-us/auction-catalogues/eamagroup/catalogue-id-eama-g11661"
-    print(f"=== PAGINATION FIX VERIFY: calling production function on {catalog_url} (previously truncated at 60) ===")
-    result = await _fetch_catalog_lots_via_browser(catalog_url, "eama-g11661")
-    lots = result.get("lots", [])
-    print(f"=== PAGINATION FIX VERIFY: got {len(lots)} real lots (was 60 before the fix) ===")
-    lot_numbers = sorted((int(l["lot_number"]) for l in lots if l["lot_number"].isdigit()))
-    if lot_numbers:
-        print(f"=== Lot number range: {lot_numbers[0]} to {lot_numbers[-1]} ===")
-    print("=== END PAGINATION FIX VERIFY ===")
-
 async def _daily_bidspotter_scan_loop():
     """Runs once at startup (after a short delay so the app is fully up
     first), then once every 12 hours after that, for every business_id that
@@ -1201,7 +1181,6 @@ async def _daily_bidspotter_scan_loop():
 
 @app.on_event("startup")
 async def _start_bidspotter_scan_loop():
-    asyncio.create_task(_debug_verify_pagination_fix())
     asyncio.create_task(_daily_bidspotter_scan_loop())
 
 @app.api_route("/api/updates/trigger-scan", methods=["GET", "POST"])
