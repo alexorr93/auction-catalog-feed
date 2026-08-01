@@ -916,7 +916,7 @@ async def _debug_browser_network_capture() -> None:
     if not wss_url:
         print("=== BROWSER CAPTURE: BRIGHT_DATA_BROWSER_WSS not set, skipping ===")
         return
-    catalog_url = "https://www.bidspotter.com/en-us/auction-catalogues/bsckee/catalogue-id-bsckee10060"
+    catalog_url = "https://www.bidspotter.com/en-us/auction-catalogues/ncm/catalogue-id-ncm-au11447"
     try:
         print(f"=== BROWSER RENDER TEST: connecting to Bright Data Browser API ===")
         async with async_playwright() as pw:
@@ -946,11 +946,17 @@ async def _debug_browser_network_capture() -> None:
             except Exception as e:
                 print(f"=== BROWSER RENDER TEST: search-form interaction failed: {type(e).__name__}: {e} ===")
             html = await page.content()
-            our_slug_count = html.count("bsckee10060")
-            other_lot_hrefs = re.findall(r'/en-us/auction-catalogues/([a-z0-9]+)/catalogue-id-([a-z0-9\-]+)/lot-', html, re.I)
-            distinct_catalogs_in_results = set(other_lot_hrefs)
-            print(f"=== SCOPE CHECK: 'bsckee10060' appears {our_slug_count} times in results HTML ===")
-            print(f"=== SCOPE CHECK: {len(distinct_catalogs_in_results)} distinct catalog(s) represented in lot links: {list(distinct_catalogs_in_results)[:10]} ===")
+            our_slug_count = html.count("ncm-au11447")
+            all_lot_matches = re.findall(
+                r'href="(/en-us/auction-catalogues/([a-z0-9]+)/catalogue-id-([a-z0-9\-]+)/lot-[a-z0-9\-]+)"[^>]*data-click-type="title"[^>]*>\s*<span class="lot-number">(\d+)</span><span class="lot-title">([^<]+)</span>',
+                html, re.I
+            )
+            print(f"=== SCOPE CHECK: 'ncm-au11447' appears {our_slug_count} times in results HTML ===")
+            print(f"=== Found {len(all_lot_matches)} total lot cards across all auctions in this results page ===")
+            our_lots = [m for m in all_lot_matches if m[2].lower() == "ncm-au11447"]
+            print(f"=== {len(our_lots)} of those belong to OUR target catalog (ncm-au11447) ===")
+            for href, auctioneer, cat_id, lot_num, lot_title in our_lots[:60]:
+                print(f"  LOT #{lot_num}: {lot_title}")
             await browser.close()
         print(f"=== BROWSER RENDER TEST: rendered HTML is {len(html)} bytes ===")
         ldjson_blocks = re.findall(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, re.I | re.S)
