@@ -1208,28 +1208,8 @@ async def _daily_bidspotter_scan_loop():
             print(f"BidSpotter daily scan loop failed: {e}")
         await asyncio.sleep(12 * 60 * 60)
 
-async def _debug_verify_retry_fix() -> None:
-    """TEMP, runs immediately at startup. Calls the EXACT production
-    function with the new per-page retry logic, on the real catalog
-    confirmed understated (56 stored vs 395 real). Prints the real total
-    found -- a genuine test, not a guess."""
-    wss_url = os.environ.get("BRIGHT_DATA_BROWSER_WSS")
-    if not wss_url:
-        print("=== RETRY FIX VERIFY: BRIGHT_DATA_BROWSER_WSS not set, skipping ===")
-        return
-    catalog_url = "https://www.bidspotter.com/en-us/auction-catalogues/bsclevy/catalogue-id-levy-r10200"
-    print(f"=== RETRY FIX VERIFY: calling production function on {catalog_url} (previously only 56 of 395 real lots) ===")
-    result = await _fetch_catalog_lots_via_browser(catalog_url, "levy-r10200")
-    lots = result.get("lots", [])
-    print(f"=== RETRY FIX VERIFY: got {len(lots)} real lots (was 56 before this fix, real total is ~395) ===")
-    lot_numbers = sorted((int(l["lot_number"]) for l in lots if l["lot_number"].isdigit()))
-    if lot_numbers:
-        print(f"=== Lot number range: {lot_numbers[0]} to {lot_numbers[-1]} ===")
-    print("=== END RETRY FIX VERIFY ===")
-
 @app.on_event("startup")
 async def _start_bidspotter_scan_loop():
-    asyncio.create_task(_debug_verify_retry_fix())
     asyncio.create_task(_daily_bidspotter_scan_loop())
 
 @app.api_route("/api/updates/trigger-scan", methods=["GET", "POST"])
