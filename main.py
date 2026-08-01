@@ -903,6 +903,38 @@ async def _run_bidspotter_scan_for_business(supabase_client, business_id: str):
     print(f"BidSpotter scan for {business_id}: {status_row}")
     return status_row
 
+async def _debug_browser_network_capture() -> None:
+    """TEMP, runs immediately at startup. Uses Bright Data's Browser API (a
+    real remote Chromium, connected via CDP -- no local browser binary
+    needed) to load a real catalog page and record every network request
+    the page's own JavaScript makes while loading. This is the real way to
+    find BidSpotter's lot-list API instead of guessing endpoint names."""
+    from playwright.async_api import async_playwright
+    wss_url = os.environ.get("BRIGHT_DATA_BROWSER_WSS")
+    if not wss_url:
+        print("=== BROWSER CAPTURE: BRIGHT_DATA_BROWSER_WSS not set, skipping ===")
+        return
+    catalog_url = "https://www.bidspotter.com/en-us/auction-catalogues/bsckee/catalogue-id-bsckee10060"
+    captured = []
+    try:
+        print(f"=== BROWSER CAPTURE: connecting to Bright Data Browser API ===")
+        async with async_playwright() as pw:
+            browser = await pw.chromium.connect_over_cdp(wss_url, timeout=60000)
+            page = await browser.new_page()
+            page.on("request", lambda req: captured.append((req.method, req.url)))
+            print(f"=== BROWSER CAPTURE: navigating to {catalog_url} ===")
+            await page.goto(catalog_url, timeout=90000, wait_until="networkidle")
+            await page.wait_for_timeout(3000)
+            await browser.close()
+        print(f"=== BROWSER CAPTURE: {len(captured)} requests captured ===")
+        interesting = [(m, u) for m, u in captured if any(k in u.lower() for k in ("lot", "json", "api", "search", "auction")) and "bidspotter.com" in u]
+        print(f"=== {len(interesting)} interesting requests (contain lot/json/api/search/auction) ===")
+        for method, url in interesting[:40]:
+            print(f"  [{method}] {url}")
+    except Exception as e:
+        print(f"=== BROWSER CAPTURE FAILED: {type(e).__name__}: {e} ===")
+    print("=== END BROWSER CAPTURE ===")
+
 async def _daily_bidspotter_scan_loop():
     """Runs once at startup (after a short delay so the app is fully up
     first), then once every 12 hours after that, for every business_id that
@@ -922,6 +954,7 @@ async def _daily_bidspotter_scan_loop():
 
 @app.on_event("startup")
 async def _start_bidspotter_scan_loop():
+    asyncio.create_task(_debug_browser_network_capture())
     asyncio.create_task(_daily_bidspotter_scan_loop())
 
 @app.api_route("/api/updates/trigger-scan", methods=["GET", "POST"])
