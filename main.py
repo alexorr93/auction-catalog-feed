@@ -572,12 +572,26 @@ async def _brightdata_get(client: httpx.AsyncClient, target_url: str, expect_sel
 
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
-        resp = await client.post(
-            "https://api.brightdata.com/request",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json=payload,
-            timeout=150.0,  # BidSpotter's WAF challenge can take well over 60s to solve
-        )
+        try:
+            # Hard outer ceiling on top of the 150s httpx timeout= below --
+            # tonight's real hangs sat well past that 150s with zero
+            # exception ever raised, meaning the connection died in a way
+            # httpx's own timeout didn't catch. This forces a kill regardless.
+            resp = await asyncio.wait_for(
+                client.post(
+                    "https://api.brightdata.com/request",
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json=payload,
+                    timeout=150.0,  # BidSpotter's WAF challenge can take well over 60s to solve
+                ),
+                timeout=180.0,
+            )
+        except Exception as e:
+            if attempt < max_attempts:
+                print(f"BrightData attempt {attempt}/{max_attempts} for {target_url}: HARD TIMEOUT/error ({type(e).__name__}: {e}), retrying with a fresh connection...")
+                continue
+            print(f"BrightData still failing after {max_attempts} attempts for {target_url}: {type(e).__name__}: {e}")
+            raise
         if resp.status_code != 200:
             # Bright Data's own request-level failure (bad zone/auth/rate-limit) --
             # not BidSpotter's status, that's the point of checking this first.
