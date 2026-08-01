@@ -924,7 +924,16 @@ async def _debug_browser_network_capture() -> None:
             page = await browser.new_page()
             print(f"=== BROWSER RENDER TEST: navigating to {catalog_url} ===")
             await page.goto(catalog_url, timeout=60000, wait_until="load")
-            await page.wait_for_timeout(6000)
+            await page.wait_for_timeout(4000)
+            print("=== BROWSER RENDER TEST: clicking 'In this auction' + submitting search ===")
+            try:
+                await page.click("#catalogueSearchOption", timeout=5000)
+                await page.click("#searchSubmit", timeout=5000)
+                await page.wait_for_load_state("load", timeout=30000)
+                await page.wait_for_timeout(4000)
+                print(f"=== BROWSER RENDER TEST: after search submit, URL is now: {page.url} ===")
+            except Exception as e:
+                print(f"=== BROWSER RENDER TEST: search-form interaction failed: {type(e).__name__}: {e} ===")
             html = await page.content()
             await browser.close()
         print(f"=== BROWSER RENDER TEST: rendered HTML is {len(html)} bytes ===")
@@ -938,7 +947,7 @@ async def _debug_browser_network_capture() -> None:
             except Exception as e:
                 print(f"--- ld+json block {i} failed to parse as JSON: {e}, raw (first 2000 chars): {block[:2000]} ---")
 
-        for marker in ("lotNumber", "lot_number", "LotNumber", "class=\"lot", "data-lot", "search-filter?CategoryCode=", "itemListElement"):
+        for marker in ("lotNumber", "lot_number", "LotNumber", "class=\"lot", "data-lot-id=\"", "search-filter?CategoryCode=", "itemListElement", "Current Bid", "class=\"search-result", "lot-number", "\"Lots\"", "\"TotalRecords\""):
             idx = html.find(marker)
             if idx >= 0:
                 around = re.sub(r'\s+', ' ', html[max(0, idx-200):idx+1200]).strip()
