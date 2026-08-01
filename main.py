@@ -1030,8 +1030,22 @@ async def _daily_bidspotter_scan_loop():
             print(f"BidSpotter daily scan loop failed: {e}")
         await asyncio.sleep(12 * 60 * 60)
 
+async def _immediate_lot_pull_test() -> None:
+    """TEMP, runs immediately at startup. Calls the EXACT SAME production
+    function (_fetch_catalog_lots_via_browser) that the real 12-hour loop
+    uses, directly, on one known real catalog -- so this is a true test of
+    the shipped feature, just without waiting through Job 1/2/queue first."""
+    test_url = "https://www.bidspotter.com/en-us/auction-catalogues/ncm/catalogue-id-ncm-au11447"
+    print(f"=== IMMEDIATE LOT PULL TEST: calling production function on {test_url} ===")
+    lots = await _fetch_catalog_lots_via_browser(test_url, "ncm-au11447")
+    print(f"=== IMMEDIATE LOT PULL TEST: got {len(lots)} lots ===")
+    for lot in lots[:70]:
+        print(f"  LOT #{lot['lot_number']}: {lot['description']}")
+    print("=== END IMMEDIATE LOT PULL TEST ===")
+
 @app.on_event("startup")
 async def _start_bidspotter_scan_loop():
+    asyncio.create_task(_immediate_lot_pull_test())
     asyncio.create_task(_daily_bidspotter_scan_loop())
 
 @app.api_route("/api/updates/trigger-scan", methods=["GET", "POST"])
