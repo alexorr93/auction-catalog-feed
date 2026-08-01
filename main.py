@@ -1189,6 +1189,20 @@ async def api_lots(catalog_url: str = None):
     rows = _fetch_all_paginated(build_query)
     return {"lots": rows}
 
+@app.get("/api/bright-lots")
+async def api_bright_lots(catalog_url: str = None):
+    """Purely the automated Bright Data pull's own data -- a separate view
+    so it can be compared directly against the VA's manually-uploaded
+    bidspotter_catalog_lots data above, without the two ever mixing."""
+    supabase_client, business_id = _require_config()
+    def build_query():
+        q = supabase_client.table("bidspotter_auto_catalog_lots").select("*").eq("business_id", business_id)
+        if catalog_url:
+            q = q.eq("catalog_url", catalog_url)
+        return q.order("last_seen_at", desc=True)
+    rows = _fetch_all_paginated(build_query)
+    return {"lots": rows}
+
 
 def _process_one_pdf(supabase_client, business_id: str, filename: str, contents: bytes,
                        title: str = "", auctioneer: str = "", end_date: str = "", state: str = "", zip_code: str = "") -> dict:

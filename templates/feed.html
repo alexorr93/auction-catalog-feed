@@ -73,6 +73,7 @@ a:hover { color: #93c5fd; }
     <button class="tab-btn active" id="tab-catalogs" onclick="setView('catalogs')">Catalogs</button>
     <button class="tab-btn" id="tab-lots" onclick="setView('lots')">All Lots</button>
     <button class="tab-btn" id="tab-log" onclick="setView('log')">Upload Log</button>
+    <button class="tab-btn" id="tab-bright" onclick="setView('bright')">Bright Data (Auto)</button>
   </div>
 
   <input type="text" class="field-input" id="search-input" placeholder="Search..." oninput="renderCurrentView()" style="width:280px;margin-bottom:14px;" autocomplete="off"/>
@@ -80,10 +81,11 @@ a:hover { color: #93c5fd; }
   <div id="catalogs-panel"><div class="empty">Loading...</div></div>
   <div id="lots-panel" style="display:none;"><div class="empty">Loading...</div></div>
   <div id="log-panel" style="display:none;"><div class="empty">Loading...</div></div>
+  <div id="bright-panel" style="display:none;"><div class="empty">Loading...</div></div>
 </div>
 
 <script>
-let catalogs = [], lots = [], uploads = [];
+let catalogs = [], lots = [], uploads = [], brightLots = [];
 let currentView = 'catalogs';
 
 function setView(view) {
@@ -91,15 +93,18 @@ function setView(view) {
   document.getElementById('tab-catalogs').classList.toggle('active', view === 'catalogs');
   document.getElementById('tab-lots').classList.toggle('active', view === 'lots');
   document.getElementById('tab-log').classList.toggle('active', view === 'log');
+  document.getElementById('tab-bright').classList.toggle('active', view === 'bright');
   document.getElementById('catalogs-panel').style.display = view === 'catalogs' ? '' : 'none';
   document.getElementById('lots-panel').style.display = view === 'lots' ? '' : 'none';
   document.getElementById('log-panel').style.display = view === 'log' ? '' : 'none';
+  document.getElementById('bright-panel').style.display = view === 'bright' ? '' : 'none';
   renderCurrentView();
 }
 
 function renderCurrentView() {
   if (currentView === 'catalogs') renderCatalogs();
   else if (currentView === 'lots') renderLots();
+  else if (currentView === 'bright') renderBrightLots();
   else renderLog();
 }
 
@@ -130,7 +135,7 @@ function titleAsLink(title, displayText) {
 async function loadAll() {
   loadNeedsUpdateQueue(); // starts immediately and renders itself the moment it resolves -- not gated behind the heavier fetches below
   loadUpdatesToMake();
-  await Promise.all([loadCatalogs(), loadLots(), loadPdfUploadLog()]);
+  await Promise.all([loadCatalogs(), loadLots(), loadPdfUploadLog(), loadBrightLots()]);
   renderCurrentView();
 }
 
@@ -148,6 +153,41 @@ async function loadLots() {
     const data = await r.json();
     lots = data.lots || [];
   } catch(e) { console.error(e); }
+}
+
+async function loadBrightLots() {
+  try {
+    const r = await fetch('/api/bright-lots');
+    const data = await r.json();
+    brightLots = data.lots || [];
+  } catch(e) { console.error(e); }
+}
+
+function renderBrightLots() {
+  const el = document.getElementById('bright-panel');
+  const search = document.getElementById('search-input').value.toLowerCase();
+  let rows = brightLots;
+  if (search) rows = rows.filter(l => (l.description || '').toLowerCase().includes(search) || (l.lot_number || '').toLowerCase().includes(search) || (l.catalog_title || '').toLowerCase().includes(search));
+  if (!rows.length) { el.innerHTML = '<div class="empty">No Bright Data lots pulled yet -- this fills in automatically as the automated pull runs.</div>'; return; }
+  let html = `<div class="sub" style="margin-bottom:10px;">Purely from the automated Bright Data pull -- nothing here came from a VA upload. ${rows.length} lot(s) across ${new Set(rows.map(l => l.catalog_url)).size} catalog(s).</div>`;
+  html += `<table><thead><tr><th>Catalog</th><th>Lot #</th><th>Description</th><th>State</th><th>ZIP</th><th>Date</th><th>Pulled At</th></tr></thead><tbody>`;
+  for (const l of rows.slice(0, 500)) {
+    const pulledCell = l.last_seen_at
+      ? new Date(l.last_seen_at).toLocaleString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+      : '—';
+    html += `<tr>
+      <td>${titleAsLink(l.catalog_url, l.catalog_title)}</td>
+      <td>${escapeHtml(l.lot_number)}</td>
+      <td>${escapeHtml(l.description)}</td>
+      <td>${escapeHtml(l.state)}</td>
+      <td class="muted">${escapeHtml(l.zip_code)}</td>
+      <td class="muted">${escapeHtml(l.date)}</td>
+      <td class="muted" style="white-space:nowrap;">${pulledCell}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  if (rows.length > 500) html += `<div class="sub" style="margin-top:8px;">Showing first 500 of ${rows.length} -- narrow with search to see more specific results.</div>`;
+  el.innerHTML = html;
 }
 
 function renderCatalogs() {
