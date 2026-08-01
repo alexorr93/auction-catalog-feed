@@ -1017,9 +1017,7 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
             if country and country.lower() not in ("united states", "usa", "us"):
                 print(f"Skipping non-US catalog ({country}): {catalog_url_full}")
                 await browser.close()
-                return {"lots": [], "state": None, "zip_code": None}
-
-            # The 'In this auction' click was observed to be flaky (didn't
+                return {"lots": [], "state": None, "zip_code": None, "country": country}
             # always register before submit) -- retry until it's actually
             # checked, not just attempted once.
             checked = False
@@ -1034,7 +1032,7 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
                 await page.wait_for_timeout(1000)
             if not checked:
                 await browser.close()
-                return {"lots": [], "state": state, "zip_code": zip_code}
+                return {"lots": [], "state": state, "zip_code": zip_code, "country": country}
 
             await page.click("#searchSubmit", timeout=5000)
             await page.wait_for_load_state("load", timeout=30000)
@@ -1057,29 +1055,34 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
             MAX_PAGES = 40  # hard ceiling -- real safety net, not expected to be hit often
             for page_num in range(2, MAX_PAGES + 1):
                 next_url = f"{catalog_url_full}?searchTerm=&whereToSearch={where_to_search}&page={page_num}"
-                page_html = None
-                for page_attempt in range(1, 4):
+                new_on_this_page = []
+                got_real_page = False
+                for page_attempt in range(1, 5):
                     try:
                         await page.goto(next_url, timeout=30000, wait_until="load")
                         await page.wait_for_timeout(2000)
                         page_html = await page.content()
-                        break
                     except Exception as e:
-                        print(f"Page {page_num} attempt {page_attempt}/3 failed for {catalog_url_full}: {type(e).__name__}: {e}")
+                        print(f"Page {page_num} attempt {page_attempt}/4 failed for {catalog_url_full}: {type(e).__name__}: {e}")
                         await page.wait_for_timeout(1500)
-                if page_html is None:
-                    # All 3 attempts on this specific page failed -- stop
-                    # pagination here (can't know if more real pages exist
-                    # beyond a page we can't even fetch), but this is now a
-                    # genuine exhaustion, not a single transient failure.
-                    print(f"Pagination stopped at page {page_num} for {catalog_url_full}: page unreachable after 3 attempts")
+                        continue
+                    got_real_page = True
+                    page_lots = extract_matching_lots(page_html)
+                    new_on_this_page = [l for l in page_lots if l[0] not in seen_lot_numbers]
+                    if new_on_this_page:
+                        break
+                    # Fetched fine but zero new lots -- could be genuine
+                    # end-of-results, OR a soft-block/captcha page returned
+                    # successfully (no exception) with no real content.
+                    # Retry the SAME page before trusting it as the real end.
+                    print(f"Page {page_num} attempt {page_attempt}/4 for {catalog_url_full}: fetched OK but 0 new lots, retrying in case of a soft block")
+                    await page.wait_for_timeout(1500)
+                if not got_real_page:
+                    print(f"Pagination stopped at page {page_num} for {catalog_url_full}: page unreachable after 4 attempts")
                     break
-                page_lots = extract_matching_lots(page_html)
-                new_on_this_page = [l for l in page_lots if l[0] not in seen_lot_numbers]
                 if not new_on_this_page:
-                    # No new lots at all -- either genuinely out of pages, or
-                    # this page redirected back to page 1's content. Either
-                    # way, nothing left to gain by continuing.
+                    # All 4 attempts on this page genuinely returned zero new
+                    # lots -- trust this as real end-of-results now.
                     break
                 for lot_num, lot_title in new_on_this_page:
                     seen_lot_numbers.add(lot_num)
@@ -1088,7 +1091,7 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
             await browser.close()
     except Exception as e:
         print(f"Browser lot fetch failed for {catalog_url_full}: {type(e).__name__}: {e}")
-    return {"lots": lots, "state": state, "zip_code": zip_code}
+    return {"lots": lots, "state": state, "zip_code": zip_code, "country": country}
 
 
 async def _pull_lots_for_queued_catalogs(supabase_client, business_id: str) -> dict:
@@ -1130,7 +1133,7 @@ async def _pull_lots_for_queued_catalogs(supabase_client, business_id: str) -> d
         except Exception:
             pass
         lots = []
-        fetch_result = {"lots": [], "state": None, "zip_code": None}
+        fetch_result = {"lots": [], "state": None, "zip_code": None, "country": None}
         max_attempts = 3
         for retry_num in range(1, max_attempts + 1):
             try:
@@ -1159,7 +1162,8 @@ async def _pull_lots_for_queued_catalogs(supabase_client, business_id: str) -> d
                 {"business_id": business_id, "catalog_url": catalog_url, "lot_number": lot["lot_number"],
                  "description": lot["description"], "last_seen_at": datetime.now(timezone.utc).isoformat(),
                  "catalog_title": row.get("title"), "state": fetch_result.get("state"),
-                 "zip_code": fetch_result.get("zip_code"), "date": row.get("end_date")}
+                 "zip_code": fetch_result.get("zip_code"), "date": row.get("end_date"),
+                 "country": fetch_result.get("country")}
                 for lot in lots
             ]
             try:
