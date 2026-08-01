@@ -1219,8 +1219,36 @@ async def _daily_bidspotter_scan_loop():
             print(f"BidSpotter daily scan loop failed: {e}")
         await asyncio.sleep(12 * 60 * 60)
 
+async def _debug_verify_full_fix() -> None:
+    """TEMP, runs immediately at startup. Direct test of the real
+    catalog (395 real lots) with BOTH fixes in place: the 600s outer
+    timeout (was 120s, was killing everything mid-operation) and the
+    per-page soft-block retry. A fast, isolated yes/no instead of waiting
+    on the full 139-catalog sequence."""
+    wss_url = os.environ.get("BRIGHT_DATA_BROWSER_WSS")
+    if not wss_url:
+        print("=== FULL FIX VERIFY: BRIGHT_DATA_BROWSER_WSS not set, skipping ===")
+        return
+    catalog_url = "https://www.bidspotter.com/en-us/auction-catalogues/bsclevy/catalogue-id-levy-r10200"
+    print(f"=== FULL FIX VERIFY: calling production function on {catalog_url} (real total ~395) ===")
+    try:
+        result = await asyncio.wait_for(
+            _fetch_catalog_lots_via_browser(catalog_url, "levy-r10200"), timeout=600.0
+        )
+        lots = result.get("lots", [])
+        print(f"=== FULL FIX VERIFY: got {len(lots)} real lots (real total ~395) ===")
+        lot_numbers = sorted((int(l["lot_number"]) for l in lots if l["lot_number"].isdigit()))
+        if lot_numbers:
+            print(f"=== Lot number range: {lot_numbers[0]} to {lot_numbers[-1]} ===")
+    except asyncio.TimeoutError:
+        print("=== FULL FIX VERIFY: still timed out even at 600s ===")
+    except Exception as e:
+        print(f"=== FULL FIX VERIFY FAILED: {type(e).__name__}: {e} ===")
+    print("=== END FULL FIX VERIFY ===")
+
 @app.on_event("startup")
 async def _start_bidspotter_scan_loop():
+    asyncio.create_task(_debug_verify_full_fix())
     asyncio.create_task(_daily_bidspotter_scan_loop())
 
 @app.api_route("/api/updates/trigger-scan", methods=["GET", "POST"])
