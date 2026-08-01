@@ -1134,26 +1134,33 @@ async def _pull_lots_for_queued_catalogs(supabase_client, business_id: str) -> d
             pass
         lots = []
         fetch_result = {"lots": [], "state": None, "zip_code": None, "country": None}
-        max_attempts = 3
+        max_attempts = 2  # reduced from 3 -- each attempt can now legitimately take much longer
         for retry_num in range(1, max_attempts + 1):
             try:
-                # Hard outer ceiling -- 120s gives real comfortable margin over
-                # the ~50s a genuine successful run takes (page load +
-                # click-retry + submit + 5x scroll), but guarantees this
-                # single attempt can't hang forever no matter WHAT breaks
-                # internally, even if a Playwright/CDP call's own timeout
-                # param mysteriously doesn't fire (which is what happened
-                # tonight -- the run sat well past its 60-90s internal
-                # timeouts with zero log output).
+                # Hard outer ceiling -- raised from 120s to 600s. The
+                # per-page retry logic inside (added to fix soft-blocks
+                # being misread as end-of-results) means a real catalog can
+                # legitimately need several minutes now, especially with
+                # several blocked pages each eating up to 4 retries. The old
+                # 120s ceiling was firing WHILE the inner logic was still
+                # legitimately working, forcibly killing the browser
+                # mid-operation (TargetClosedError cascade) -- this wasn't
+                # protecting against a hang, it was causing failures on
+                # every catalog that took normal-but-longer real time.
                 fetch_result = await asyncio.wait_for(
-                    _fetch_catalog_lots_via_browser(real_url, catalog_slug), timeout=120.0
+                    _fetch_catalog_lots_via_browser(real_url, catalog_slug), timeout=600.0
                 )
                 lots = fetch_result["lots"]
                 if lots:
                     break
+                if fetch_result.get("country") and fetch_result["country"].lower() not in ("united states", "usa", "us"):
+                    # Confirmed non-US -- retrying won't change the country,
+                    # stop wasting time/requests on this catalog.
+                    print(f"Lot pull for {catalog_url}: confirmed non-US ({fetch_result['country']}), not retrying")
+                    break
                 print(f"Lot pull attempt {retry_num}/{max_attempts} for {catalog_url}: got 0 lots, retrying from scratch")
             except asyncio.TimeoutError:
-                print(f"Lot pull attempt {retry_num}/{max_attempts} for {catalog_url}: HARD TIMEOUT (120s), redoing from scratch")
+                print(f"Lot pull attempt {retry_num}/{max_attempts} for {catalog_url}: HARD TIMEOUT (600s), redoing from scratch")
             except Exception as e:
                 print(f"Lot pull attempt {retry_num}/{max_attempts} for {catalog_url} failed: {type(e).__name__}: {e}")
         if lots:
