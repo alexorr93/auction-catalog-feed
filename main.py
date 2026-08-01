@@ -944,27 +944,41 @@ async def _run_bidspotter_scan_for_business(supabase_client, business_id: str):
     print(f"BidSpotter scan for {business_id}: {status_row}")
     return status_row
 
-async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: str) -> list:
+async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: str) -> dict:
     """The real, proven mechanism: loads a catalog page in a real remote
     browser (Bright Data Browser API), clicks 'In this auction' + submits
     the search form, scrolls to trigger lazy-loaded results, then extracts
     every lot card and filters to only ones actually belonging to this
     catalog (BidSpotter's own scoping isn't fully reliable, so we filter
-    client-side using each lot's own href). Returns [{lot_number,
-    description}, ...]. catalog_slug is the catalogue-id- value, e.g.
-    'ncm-au11447', used both for the client-side filter and detecting a
-    flaky click (checked state) before submitting."""
+    client-side using each lot's own href). Returns {lots: [{lot_number,
+    description}, ...], state, zip_code} -- state/zip come from the
+    catalog's own structured location data (schema.org addressRegion /
+    postalCode, standard field names) on the INITIAL page load, captured
+    before the search-form interaction replaces the page content.
+    catalog_slug is the catalogue-id- value, e.g. 'ncm-au11447', used both
+    for the client-side filter and detecting a flaky click (checked state)
+    before submitting."""
     from playwright.async_api import async_playwright
     wss_url = os.environ.get("BRIGHT_DATA_BROWSER_WSS")
     if not wss_url:
-        return []
+        return {"lots": [], "state": None, "zip_code": None}
     lots = []
+    state = None
+    zip_code = None
     try:
         async with async_playwright() as pw:
             browser = await pw.chromium.connect_over_cdp(wss_url, timeout=60000)
             page = await browser.new_page()
             await page.goto(catalog_url_full, timeout=60000, wait_until="load")
             await page.wait_for_timeout(3000)
+
+            # Capture the catalog's own location data BEFORE the search
+            # interaction below replaces the page content with results.
+            initial_html = await page.content()
+            region_match = re.search(r'"addressRegion"\s*:\s*"([^"]+)"', initial_html)
+            postal_match = re.search(r'"postalCode"\s*:\s*"([^"]+)"', initial_html)
+            state = region_match.group(1) if region_match else None
+            zip_code = postal_match.group(1) if postal_match else None
 
             # The 'In this auction' click was observed to be flaky (didn't
             # always register before submit) -- retry until it's actually
@@ -981,7 +995,7 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
                 await page.wait_for_timeout(1000)
             if not checked:
                 await browser.close()
-                return []
+                return {"lots": [], "state": state, "zip_code": zip_code}
 
             await page.click("#searchSubmit", timeout=5000)
             await page.wait_for_load_state("load", timeout=30000)
@@ -1009,7 +1023,7 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
             lots.append({"lot_number": lot_num, "description": lot_title.strip()})
     except Exception as e:
         print(f"Browser lot fetch failed for {catalog_url_full}: {type(e).__name__}: {e}")
-    return lots
+    return {"lots": lots, "state": state, "zip_code": zip_code}
 
 async def _pull_lots_for_queued_catalogs(supabase_client, business_id: str) -> dict:
     """Runs the real browser-based lot pull for every catalog currently
@@ -1022,7 +1036,7 @@ async def _pull_lots_for_queued_catalogs(supabase_client, business_id: str) -> d
     moment, not just guessed from logs."""
     if not os.environ.get("BRIGHT_DATA_BROWSER_WSS"):
         return {"attempted": 0, "succeeded": 0, "total_lots_written": 0}
-    queue_rows = _fetch_all_paginated(lambda: supabase_client.table("catalog_updates_queue").select("catalog_url,title").eq("business_id", business_id).eq("resolved", False))
+    queue_rows = _fetch_all_paginated(lambda: supabase_client.table("catalog_updates_queue").select("catalog_url,title,auctioneer,end_date").eq("business_id", business_id).eq("resolved", False))
     attempted = 0
     succeeded = 0
     total_lots_written = 0
@@ -1050,6 +1064,7 @@ async def _pull_lots_for_queued_catalogs(supabase_client, business_id: str) -> d
         except Exception:
             pass
         lots = []
+        fetch_result = {"lots": [], "state": None, "zip_code": None}
         max_attempts = 3
         for retry_num in range(1, max_attempts + 1):
             try:
@@ -1061,9 +1076,10 @@ async def _pull_lots_for_queued_catalogs(supabase_client, business_id: str) -> d
                 # param mysteriously doesn't fire (which is what happened
                 # tonight -- the run sat well past its 60-90s internal
                 # timeouts with zero log output).
-                lots = await asyncio.wait_for(
+                fetch_result = await asyncio.wait_for(
                     _fetch_catalog_lots_via_browser(real_url, catalog_slug), timeout=120.0
                 )
+                lots = fetch_result["lots"]
                 if lots:
                     break
                 print(f"Lot pull attempt {retry_num}/{max_attempts} for {catalog_url}: got 0 lots, retrying from scratch")
@@ -1075,7 +1091,9 @@ async def _pull_lots_for_queued_catalogs(supabase_client, business_id: str) -> d
             succeeded += 1
             rows_to_upsert = [
                 {"business_id": business_id, "catalog_url": catalog_url, "lot_number": lot["lot_number"],
-                 "description": lot["description"], "last_seen_at": datetime.now(timezone.utc).isoformat()}
+                 "description": lot["description"], "last_seen_at": datetime.now(timezone.utc).isoformat(),
+                 "catalog_title": row.get("title"), "state": fetch_result.get("state"),
+                 "zip_code": fetch_result.get("zip_code"), "date": row.get("end_date")}
                 for lot in lots
             ]
             try:
