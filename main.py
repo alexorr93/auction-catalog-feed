@@ -1106,6 +1106,13 @@ async def _pull_lots_for_queued_catalogs(supabase_client, business_id: str) -> d
                     rows_to_upsert, on_conflict="business_id,catalog_url,lot_number"
                 ).execute()
                 total_lots_written += len(rows_to_upsert)
+                # A successful automated pull is treated the same as the VA
+                # having handled this catalog manually -- clears it from the
+                # front-facing queue. Without this, the queue never empties
+                # even when the automation is working perfectly.
+                supabase_client.table("catalog_updates_queue").update(
+                    {"resolved": True}
+                ).eq("business_id", business_id).eq("catalog_url", catalog_url).execute()
             except Exception as e:
                 print(f"Failed to write lots for {catalog_url}: {e}")
         try:
