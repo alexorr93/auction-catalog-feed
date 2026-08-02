@@ -1012,7 +1012,17 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
             # fingerprinting, CAPTCHA solving) runs DURING this navigation
             # and needs real time. Our previous 30s timeout was very likely
             # killing requests mid-unlock, not because the page was slow.
-            await page.goto(target_url, timeout=120000, wait_until="load")
+            #
+            # wait_until: "load" -> "networkidle". This is a documented
+            # Playwright race condition (github.com/microsoft/playwright
+            # issue #16108): calling page.content() right after a "load"-
+            # resolved navigation can still hit "Unable to retrieve content
+            # because the page is navigating and changing the content" --
+            # exactly our recurring error. "networkidle" waits until network
+            # activity actually settles, which avoids the race AND gives
+            # Bright Data's unlock/CAPTCHA activity (which shows as ongoing
+            # requests) room to actually finish first.
+            await page.goto(target_url, timeout=120000, wait_until="networkidle")
             await page.wait_for_timeout(2000)
             return await page.content()
         finally:
