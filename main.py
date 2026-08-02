@@ -1255,6 +1255,10 @@ def _scan_for_count(html: str, label: str) -> None:
         print(f"[{label}] Pattern {pattern_name!r}: {matches[:15]}")
     for m in list(re.finditer(r'.{40}\d[\d,]{1,4}.{0,15}[Ll]ot.{40}', html))[:10]:
         print(f"[{label}] CONTEXT: ...{m.group(0)!r}...")
+    # Specifically identify what surrounds every occurrence of "Items" near a
+    # number -- this is what fired above, need the real key name it belongs to.
+    for m in list(re.finditer(r'.{60}[Ii]tems?.{20}', html))[:15]:
+        print(f"[{label}] ITEMS-CONTEXT: ...{m.group(0)!r}...")
 
 async def _debug_find_lot_count_display() -> None:
     """TEMP, runs immediately at startup. The user can see a real total lot
