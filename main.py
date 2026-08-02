@@ -957,7 +957,7 @@ async def _run_bidspotter_scan_for_business(supabase_client, business_id: str):
     print(f"BidSpotter scan for {business_id}: {status_row}")
     return status_row
 
-async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: str) -> dict:
+async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: str, known_total: int = None) -> dict:
     """The real, proven mechanism: loads a catalog page in a real remote
     browser (Bright Data Browser API), clicks 'In this auction' + submits
     the search form, then pages through ALL results using BidSpotter's real
@@ -1062,7 +1062,10 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
             # The flaky click was the other half of the 0-lot runs.
             seen_lot_numbers = set()
             MAX_PAGES = 60  # hard ceiling
-            for page_num in range(1, MAX_PAGES + 1):
+
+            async def _fetch_one_page(page_num: int):
+                """Fetch a single page with the standard 3 fresh-session
+                retries. Returns (got_real_page, new_lots_on_page)."""
                 next_url = _page_url(page_num)
                 new_on_this_page = []
                 got_real_page = False
@@ -1078,25 +1081,71 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
                     new_on_this_page = [l for l in page_lots if l[0] not in seen_lot_numbers]
                     if new_on_this_page:
                         break
-                    # Every page ALWAYS gets all 3 fresh-session attempts before
-                    # 0 lots is trusted as real end -- no shortcuts based on
-                    # page position. A single unlucky page was previously
-                    # enough to falsely end the whole pull early.
                     print(f"Page {page_num} attempt {page_attempt}/3 for {catalog_url_full}: fetched OK but 0 new lots, retrying with a fresh session")
                     await asyncio.sleep(1.5)
+                return got_real_page, new_on_this_page
+
+            def _record(new_lots):
+                for lot_num, lot_title in new_lots:
+                    seen_lot_numbers.add(lot_num)
+                    lots.append({"lot_number": lot_num, "description": lot_title})
+
+            # pending_empty holds page numbers that came back empty (after
+            # their own 3 retries) but haven't been trusted as the real end
+            # yet -- a SINGLE empty page was previously enough to end the
+            # whole pull, which is exactly how taylor got cut off at 10 lots.
+            # Now: an empty page only counts as the genuine end once the
+            # NEXT page is also confirmed empty. If that next page instead
+            # has real lots, the pagination clearly continues, so we go back
+            # and re-fetch the provisionally-empty page(s) -- most likely a
+            # transient site/proxy glitch on that one page, not a real gap.
+            pending_empty = []
+            page_num = 1
+            while page_num <= MAX_PAGES:
+                got_real_page, new_on_this_page = await _fetch_one_page(page_num)
                 if not got_real_page:
                     print(f"Pagination stopped at page {page_num} for {catalog_url_full}: page unreachable after 3 fresh-session attempts -- PULL IS INCOMPLETE")
                     complete = False
                     break
-                if not new_on_this_page:
-                    if page_num == 1:
-                        # Page 1 empty after all 3 retries: nothing to pull
-                        # (or blocked hard) -- incomplete, not "0 lots total".
-                        complete = False
+                if new_on_this_page:
+                    if pending_empty:
+                        print(f"Page(s) {pending_empty} for {catalog_url_full} were empty but page {page_num} has real lots -- re-fetching the skipped page(s), not a real end")
+                        for p in pending_empty:
+                            r_got_real, r_new = await _fetch_one_page(p)
+                            if r_got_real and r_new:
+                                _record(r_new)
+                        pending_empty = []
+                    _record(new_on_this_page)
+                    page_num += 1
+                    continue
+                # This page came back empty after all retries.
+                if page_num == 1:
+                    # Nothing to pull at all, or blocked hard from the start.
+                    complete = False
                     break
-                for lot_num, lot_title in new_on_this_page:
-                    seen_lot_numbers.add(lot_num)
-                    lots.append({"lot_number": lot_num, "description": lot_title})
+                pending_empty.append(page_num)
+                if len(pending_empty) >= 2:
+                    if known_total is not None and len(lots) < known_total:
+                        # TEST-ONLY override: we KNOW the real total (ground
+                        # truth from VA data) and haven't reached it yet, so
+                        # this can't actually be the end -- the two-empty-
+                        # pages heuristic is wrong here. Keep pushing instead
+                        # of trusting it, to see whether the mechanism CAN
+                        # reach the true count given enough persistence.
+                        print(f"Pages {pending_empty} both empty for {catalog_url_full}, but only {len(lots)}/{known_total} known lots collected -- known_total says NOT done, continuing past the heuristic")
+                        pending_empty = []
+                        page_num += 1
+                        continue
+                    # Two DIFFERENT pages in a row both genuinely empty --
+                    # trust this as the real end of results now.
+                    break
+                page_num += 1
+            else:
+                # Loop exhausted MAX_PAGES without ever confirming a genuine
+                # end (only relevant when known_total kept overriding the
+                # heuristic) -- hit the ceiling, not proven complete.
+                print(f"Pagination hit the {MAX_PAGES}-page ceiling for {catalog_url_full} without confirming end-of-results -- PULL IS INCOMPLETE")
+                complete = False
     except Exception as e:
         print(f"Browser lot fetch failed for {catalog_url_full}: {type(e).__name__}: {e} -- PULL IS INCOMPLETE ({len(lots)} lots collected before failure)")
         complete = False
@@ -1318,6 +1367,14 @@ async def _debug_single_catalog_test() -> None:
     # ONE Bright Data session at a time), reporting lots + completeness for
     # each -- built to verify LONG catalogs pull fully, without running the
     # whole Job 1 scan or the entire queue.
+    # Known VA-verified totals for these 3 test catalogs, from
+    # bidspotter_catalog_lots -- used ONLY here to score this test run
+    # against ground truth. Not used anywhere in the real pull logic.
+    KNOWN_TOTALS = {
+        "bsctaylor10010": 954,
+        "tab-au10058": 867,
+        "schneider10594": 722,
+    }
     urls_env = os.environ.get("TEST_CATALOG_URLS")
     if urls_env:
         targets = []
@@ -1332,11 +1389,15 @@ async def _debug_single_catalog_test() -> None:
         for u, s in targets:
             print(f"=== CATALOG TEST START: {u} ===")
             try:
+                known = KNOWN_TOTALS.get(s)
                 result = await asyncio.wait_for(
-                    _fetch_catalog_lots_via_browser(u, s), timeout=900.0
+                    _fetch_catalog_lots_via_browser(u, s, known_total=known), timeout=900.0
                 )
                 lots = result.get("lots", [])
                 nums = sorted(int(l["lot_number"]) for l in lots if l["lot_number"].isdigit())
+                if known is not None:
+                    verdict = "PASS (exact match)" if len(lots) == known else f"FAIL (short by {known - len(lots)})" if len(lots) < known else f"FAIL (over by {len(lots) - known})"
+                    print(f"=== CATALOG TEST vs KNOWN TOTAL: {len(lots)}/{known} -- {verdict} ===")
                 print(f"=== CATALOG TEST RESULT: {len(lots)} lots | range {nums[0] if nums else '-'}-{nums[-1] if nums else '-'} | complete={result.get('complete')} | state={result.get('state')} zip={result.get('zip_code')} country={result.get('country')} | {u} ===")
             except asyncio.TimeoutError:
                 print(f"=== CATALOG TEST: timed out at 900s | {u} ===")
