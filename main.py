@@ -1027,6 +1027,25 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
                 await cdp_client.send("Proxy.useSession", {"sessionId": session_id})
             except Exception as e:
                 print(f"Proxy.useSession failed (continuing without pinning): {type(e).__name__}: {e}")
+
+            # CONFIRMED via live diagnostic: direct page=N navigation
+            # returns REAL lot-card count=0 even when the fetch itself
+            # succeeds cleanly -- the "In this auction" search-submit isn't
+            # just about scoping results, it's what makes the server return
+            # any lot listing at all. This is session/cookie state, not a
+            # URL parameter, so it must be redone in THIS fresh session
+            # before reading the target page -- the old one-session-per-
+            # catalog code did this once at the start; the session-per-page
+            # rewrite dropped it entirely, which is the real root cause of
+            # tonight's recurring "fetched OK but 0 lots" failures.
+            try:
+                await page.goto(catalog_url_full, timeout=120000, wait_until="domcontentloaded")
+                await page.click("#catalogueSearchOption", timeout=5000)
+                await page.click("#searchSubmit", timeout=5000)
+                await page.wait_for_load_state("domcontentloaded", timeout=30000)
+            except Exception as e:
+                print(f"Search-submit context setup failed for {target_url}: {type(e).__name__}: {e} (continuing anyway -- extraction will correctly find 0 lots if this didn't work)")
+
             # Bright Data's own guidance: navigation timeout must be >=60s
             # (they recommend 120s) -- their unlocking (proxy rotation,
             # fingerprinting, CAPTCHA solving) runs DURING this navigation
