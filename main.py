@@ -1372,9 +1372,9 @@ async def _debug_single_catalog_test() -> None:
     # bidspotter_catalog_lots -- used ONLY here to score this test run
     # against ground truth. Not used anywhere in the real pull logic.
     KNOWN_TOTALS = {
-        "bsctaylor10010": 954,
-        "tab-au10058": 867,
         "schneider10594": 722,
+        "schneider10606": 713,
+        "bsckee10064": 702,
     }
     urls_env = os.environ.get("TEST_CATALOG_URLS")
     if urls_env:
