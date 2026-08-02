@@ -1618,6 +1618,95 @@ async def api_trigger_scan():
     happened (including the real error, if any) directly in the response."""
     supabase_client, business_id = _require_config()
     status_row = await _run_bidspotter_scan_for_business(supabase_client, business_id)
+
+@app.api_route("/api/updates/backfill-locations", methods=["GET", "POST"])
+async def api_backfill_locations():
+    """One-off, on-demand backfill for catalogs already sitting in
+    bidspotter_auto_catalog_lots with missing state/zip/country -- fixes
+    them WITHOUT touching the main scan loop or re-pulling any lots.
+    Completely separate from the background loop: safe to call anytime,
+    does not compete with or interrupt whatever the main loop is doing.
+    For each affected catalog: fetches ONLY the catalog root page (cheap,
+    no search-submit, no pagination) to get real state/zip/country.
+    - If it turns out to be non-US: DELETES those rows entirely (this data
+      should never have been staged -- the original non-US skip couldn't
+      fire because location capture had failed and returned nothing).
+    - If real US location is found: UPDATEs all rows for that catalog_url.
+    - If it still can't be determined after 3 tries: leaves rows as-is and
+      reports it, does not guess."""
+    from playwright.async_api import async_playwright
+    supabase_client, business_id = _require_config()
+    wss_url = os.environ.get("BRIGHT_DATA_BROWSER_WSS")
+    if not wss_url:
+        return {"error": "BRIGHT_DATA_BROWSER_WSS not set"}
+
+    rows = supabase_client.table("bidspotter_auto_catalog_lots") \
+        .select("catalog_url") \
+        .eq("business_id", business_id) \
+        .is_("state", "null") \
+        .is_("country", "null") \
+        .execute()
+    catalog_urls = sorted(set(r["catalog_url"] for r in rows.data))
+    results = []
+
+    def _itemprop_from(html: str, name: str) -> str:
+        m = re.search(rf'<[^>]*itemprop="{name}"[^>]*\scontent="([^"]*)"', html)
+        if not m:
+            m = re.search(rf'<[^>]*itemprop="{name}"[^>]*>([^<]*)<', html)
+        val = (m.group(1).strip() if m else "")
+        return val if val and val != "." else ""
+
+    def _rebuild_full_url(stored_url: str) -> str:
+        # Stored catalog_url has https:// and slashes stripped -- rebuild a
+        # real fetchable URL: httpswww.bidspotter.comen-us... ->
+        # https://www.bidspotter.com/en-us/...
+        u = stored_url.replace("httpswww.bidspotter.comen-us", "https://www.bidspotter.com/en-us/", 1)
+        u = re.sub(r'(auction-catalogues)([a-z0-9]+)(catalogue-id-)', r'\1/\2/\3', u)
+        return u
+
+    try:
+        async with async_playwright() as pw:
+            for stored_url in catalog_urls:
+                full_url = _rebuild_full_url(stored_url)
+                state = zip_code = country = None
+                for attempt in range(1, 4):
+                    browser = None
+                    try:
+                        browser = await pw.chromium.connect_over_cdp(wss_url, timeout=120000)
+                        page = await browser.new_page()
+                        await page.goto(full_url, timeout=120000, wait_until="domcontentloaded")
+                        await page.wait_for_timeout(2500)
+                        html = await page.content()
+                        state = _itemprop_from(html, "addressRegion") or None
+                        zip_code = _itemprop_from(html, "postalCode") or None
+                        country = _itemprop_from(html, "addressCountry") or None
+                        if state or zip_code or country:
+                            break
+                    except Exception as e:
+                        print(f"Backfill attempt {attempt}/3 failed for {full_url}: {type(e).__name__}: {e}")
+                    finally:
+                        if browser is not None:
+                            try:
+                                await browser.close()
+                            except Exception:
+                                pass
+
+                if country and country.lower() not in ("united states", "usa", "us"):
+                    del_result = supabase_client.table("bidspotter_auto_catalog_lots") \
+                        .delete().eq("business_id", business_id).eq("catalog_url", stored_url).execute()
+                    results.append({"catalog_url": stored_url, "action": "DELETED (non-US)", "country": country})
+                elif state or zip_code or country:
+                    supabase_client.table("bidspotter_auto_catalog_lots") \
+                        .update({"state": state, "zip_code": zip_code, "country": country}) \
+                        .eq("business_id", business_id).eq("catalog_url", stored_url).execute()
+                    results.append({"catalog_url": stored_url, "action": "UPDATED", "state": state, "zip_code": zip_code, "country": country})
+                else:
+                    results.append({"catalog_url": stored_url, "action": "STILL UNKNOWN after 3 tries"})
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}", "partial_results": results}
+
+    return {"catalogs_processed": len(catalog_urls), "results": results}
+
     return status_row
 
 @app.get("/api/updates-to-make")
