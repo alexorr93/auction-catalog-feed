@@ -1058,15 +1058,33 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
                         print(f"[BRIGHTDATA ERROR HEADERS] status={response.status} code={brd_err_code!r} msg={brd_err_msg!r} proxy-status={proxy_status!r} url={target_url}")
                 except Exception:
                     pass
-                # Read the body IMMEDIATELY, not after a wait -- confirmed
-                # via live testing that the previous 1.5s delay here caused
-                # Bright Data's remote browser to evict the response buffer
-                # first, producing "No resource with given identifier
-                # found". response.text() must be the very next call after
-                # goto() resolves.
-                return await response.text()
-            # Fallback only if goto somehow returned no response object.
-            await page.wait_for_timeout(1500)
+
+            # CONFIRMED via live diagnostic: the empty-page failures are the
+            # raw AWS WAF challenge stub (2395 bytes, "window.awsWafCookie"),
+            # not a block that response.text() failed to see -- WAF serves
+            # this shell, runs a JS challenge, THEN client-side-redirects to
+            # the real page. response.text() only ever captures the body of
+            # the ONE navigation goto() resolved on -- if WAF redirects
+            # afterward, that redirect is invisible to it. page.content()
+            # instead reflects the page's CURRENT (post-redirect) DOM, so
+            # switch back to it -- but wait for actual proof the WAF
+            # challenge has resolved (real lot markup present) before
+            # reading it, instead of trusting a navigation lifecycle event
+            # (which is exactly what caused the original page.content()
+            # race in the first place).
+            try:
+                await page.wait_for_function(
+                    "document.body && document.body.innerHTML.includes('lot-number')"
+                    " || (document.title && document.title.length > 0"
+                    " && !window.awsWafCookieDomainList)",
+                    timeout=15000
+                )
+            except Exception:
+                # Didn't confirm real content within 15s -- fall through and
+                # read whatever's there now; extract_matching_lots will
+                # correctly find 0 lots if it's still the WAF stub, and the
+                # retry loop handles that the same as before.
+                pass
             return await page.content()
         finally:
             try:
