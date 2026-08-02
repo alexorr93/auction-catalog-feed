@@ -769,6 +769,14 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
                     first_page_error = err
                 break
             pages_fetched += 1
+            # DEFINITIVE PROBE, not a fix: checking whether the raw response
+            # for this "US-filtered" URL contains a KNOWN-Canadian
+            # auctioneer's data at all. If it's present in the raw HTML,
+            # the filter genuinely doesn't restrict server output and
+            # expect_selector/JS-timing is the wrong theory entirely -- the
+            # embedded schema.org data is identical regardless of country.
+            if "infinity-asset-solutions" in resp.text.lower() or "bscinf" in resp.text.lower():
+                print(f"[COUNTRY FILTER PROBE] page {page}: raw response DOES contain infinity-asset-solutions/bscinf data even though URL says countryName=United%20States -- filter does not restrict server-side output")
             listings = _parse_bidspotter_listing_page(resp.text)
             if page == 1:
                 # Capture real evidence of what came back -- status, length, final
