@@ -1045,15 +1045,22 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
         try:
             await page.wait_for_selector("#catalogueSearchOption", timeout=30000, state="visible")
         except Exception:
-            # Look, don't guess: dump what the page ACTUALLY contains when
-            # the search form never appears -- same diagnostic move that
-            # cracked the last systemic failure (WAF challenge stub).
+            # CONFIRMED via live diagnostic (Bryan MERX, Schneider multi-
+            # location): some catalogs render a REAL, fully-loaded page
+            # (~373KB, real title) that simply has NO search form at all --
+            # the element isn't slow or hidden, it's absent from the HTML.
+            # If real lot cards are already present, proceed WITHOUT the
+            # search-submit instead of failing; downstream empty-page +
+            # completeness logic stays as the honest safety net if
+            # pagination doesn't work on this variant.
             try:
                 cur_html = await page.content()
+                real_lot_cards = cur_html.count('class="lot-number"')
+                if "catalogueSearchOption" not in cur_html and real_lot_cards > 0:
+                    print(f"[FORM-LESS VARIANT] {page.url}: no search form in HTML but {real_lot_cards} real lot cards present -- proceeding without search-submit")
+                    return browser, page
                 title_match = re.search(r'<title[^>]*>([^<]*)</title>', cur_html, re.I)
-                print(f"[SEARCH-FORM MISSING DIAGNOSTIC] url={page.url} html_length={len(cur_html)} title={title_match.group(1) if title_match else None!r}")
-                print(f"[SEARCH-FORM MISSING DIAGNOSTIC] awswaf={'awswaf' in cur_html} captcha={'captcha' in cur_html.lower()} challenge={'challenge' in cur_html.lower()} searchOption-in-html={'catalogueSearchOption' in cur_html} auction-closed={'auction closed' in cur_html.lower()}")
-                print(f"[SEARCH-FORM MISSING DIAGNOSTIC] first 300 chars: {cur_html[:300]!r}")
+                print(f"[SEARCH-FORM MISSING DIAGNOSTIC] url={page.url} html_length={len(cur_html)} title={title_match.group(1) if title_match else None!r} real-lot-cards={real_lot_cards}")
             except Exception as de:
                 print(f"[SEARCH-FORM MISSING DIAGNOSTIC] could not read page content either: {type(de).__name__}: {de}")
             raise
