@@ -1034,6 +1034,10 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
             print(f"Proxy.useSession failed (continuing without pinning): {type(e).__name__}: {e}")
         await page.goto(catalog_url_full, timeout=120000, wait_until="domcontentloaded")
         if state is None and zip_code is None and country is None:
+            # domcontentloaded can fire before the schema.org microdata is
+            # actually rendered into the DOM -- brief settle wait before
+            # reading, matching the original working capture behavior.
+            await page.wait_for_timeout(2500)
             root_html = await page.content()
             state = _itemprop_from(root_html, "addressRegion") or None
             zip_code = _itemprop_from(root_html, "postalCode") or None
