@@ -1010,20 +1010,23 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
             # Bright Data's own guidance: navigation timeout must be >=60s
             # (they recommend 120s) -- their unlocking (proxy rotation,
             # fingerprinting, CAPTCHA solving) runs DURING this navigation
-            # and needs real time. Our previous 30s timeout was very likely
-            # killing requests mid-unlock, not because the page was slow.
+            # and needs real time.
             #
-            # wait_until: "load" -> "networkidle". This is a documented
-            # Playwright race condition (github.com/microsoft/playwright
-            # issue #16108): calling page.content() right after a "load"-
-            # resolved navigation can still hit "Unable to retrieve content
-            # because the page is navigating and changing the content" --
-            # exactly our recurring error. "networkidle" waits until network
-            # activity actually settles, which avoids the race AND gives
-            # Bright Data's unlock/CAPTCHA activity (which shows as ongoing
-            # requests) room to actually finish first.
-            await page.goto(target_url, timeout=120000, wait_until="networkidle")
-            await page.wait_for_timeout(2000)
+            # STRUCTURAL FIX, not another timing tweak: page.goto() returns
+            # the actual HTTP Response object. Reading response.text() gets
+            # the raw response body directly -- it has NO dependency on the
+            # page's live DOM state, so it cannot hit the documented
+            # Playwright race (issue #16108) where page.content() reads a
+            # DOM that's already navigating again. Confirmed via direct
+            # test: switching wait_until to "networkidle" alone did NOT
+            # stop the error, because page.content() was still the thing
+            # racing -- this removes page.content() from the fetch path
+            # entirely instead of trying to time around the race.
+            response = await page.goto(target_url, timeout=120000, wait_until="domcontentloaded")
+            await page.wait_for_timeout(1500)
+            if response is not None:
+                return await response.text()
+            # Fallback only if goto somehow returned no response object.
             return await page.content()
         finally:
             try:
