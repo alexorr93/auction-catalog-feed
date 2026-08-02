@@ -1239,6 +1239,23 @@ async def _daily_bidspotter_scan_loop():
             print(f"BidSpotter daily scan loop failed: {e}")
         await asyncio.sleep(12 * 60 * 60)
 
+def _scan_for_count(html: str, label: str) -> None:
+    for pattern_name, pattern in [
+        ("N lots/Lots", r'(\d[\d,]*)\s*[Ll]ots?\b'),
+        ("Lots: N or Lots (N)", r'[Ll]ots?[:\s\(]+(\d[\d,]*)'),
+        ("N results", r'(\d[\d,]*)\s*[Rr]esults?\b'),
+        ("results count/total-count classes", r'class="[^"]*(?:results?-count|total-count|lot-count)[^"]*"[^>]*>([^<]{0,20})'),
+        ("of N (pagination)", r'\bof\s+(\d[\d,]*)\b'),
+        ("N Items", r'(\d[\d,]*)\s*[Ii]tems?\b'),
+        ("totalCount/totalItems/itemCount JSON keys", r'"(?:total[A-Za-z]*|item[A-Za-z]*)[Cc]ount"\s*:\s*(\d+)'),
+        ("totalRecords/recordCount JSON keys", r'"(?:total)?[Rr]ecord[Cc]ount"\s*:\s*(\d+)'),
+        ("numberOfItems (schema.org)", r'"numberOfItems"\s*:\s*(\d+)'),
+    ]:
+        matches = re.findall(pattern, html)
+        print(f"[{label}] Pattern {pattern_name!r}: {matches[:15]}")
+    for m in list(re.finditer(r'.{40}\d[\d,]{1,4}.{0,15}[Ll]ot.{40}', html))[:10]:
+        print(f"[{label}] CONTEXT: ...{m.group(0)!r}...")
+
 async def _debug_find_lot_count_display() -> None:
     """TEMP, runs immediately at startup. The user can see a real total lot
     count displayed directly on a catalog page (e.g. '425 lots') -- if we
@@ -1251,7 +1268,7 @@ async def _debug_find_lot_count_display() -> None:
     if not wss_url:
         print("=== LOT COUNT DISPLAY DEBUG: BRIGHT_DATA_BROWSER_WSS not set, skipping ===")
         return
-    catalog_url = "https://www.bidspotter.com/en-us/auction-catalogues/bsclevy/catalogue-id-levy-r10200"
+    catalog_url = "https://www.bidspotter.com/en-us/auction-catalogues/bsctabauc/catalogue-id-tab-au10058"  # known 867 lots
     try:
         async with async_playwright() as pw:
             browser = await pw.chromium.connect_over_cdp(wss_url, timeout=60000)
@@ -1259,16 +1276,24 @@ async def _debug_find_lot_count_display() -> None:
             await page.goto(catalog_url, timeout=60000, wait_until="load")
             await page.wait_for_timeout(3000)
             html = await page.content()
+            print(f"=== LOT COUNT DISPLAY DEBUG: plain catalog page is {len(html)} bytes ===")
+            _scan_for_count(html, "PLAIN PAGE")
+
+            # Now do what the real lot pull does: click "In this auction" +
+            # submit, and check the RESULTS page -- far more likely to show
+            # a total, since that's the actual results/pagination view.
+            try:
+                await page.click("#catalogueSearchOption", timeout=5000)
+                await page.click("#searchSubmit", timeout=5000)
+                await page.wait_for_load_state("load", timeout=30000)
+                await page.wait_for_timeout(3000)
+                html = await page.content()
+                print(f"=== LOT COUNT DISPLAY DEBUG: results page is {len(html)} bytes ===")
+                _scan_for_count(html, "RESULTS PAGE")
+            except Exception as e:
+                print(f"=== LOT COUNT DISPLAY DEBUG: search-submit step failed: {type(e).__name__}: {e} ===")
+
             await browser.close()
-        print(f"=== LOT COUNT DISPLAY DEBUG: page is {len(html)} bytes ===")
-        for pattern_name, pattern in [
-            ("N lots/Lots", r'(\d[\d,]*)\s*[Ll]ots?\b'),
-            ("Lots: N or Lots (N)", r'[Ll]ots?[:\s\(]+(\d[\d,]*)'),
-            ("N results", r'(\d[\d,]*)\s*[Rr]esults?\b'),
-            ("results count/total-count classes", r'class="[^"]*(?:results?-count|total-count|lot-count)[^"]*"[^>]*>([^<]{0,20})'),
-        ]:
-            matches = re.findall(pattern, html)
-            print(f"Pattern {pattern_name!r}: {matches[:10]}")
     except Exception as e:
         print(f"=== LOT COUNT DISPLAY DEBUG FAILED: {type(e).__name__}: {e} ===")
     print("=== END LOT COUNT DISPLAY DEBUG ===")
