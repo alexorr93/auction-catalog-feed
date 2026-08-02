@@ -958,44 +958,33 @@ async def _run_bidspotter_scan_for_business(supabase_client, business_id: str):
     return status_row
 
 async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: str, known_total: int = None) -> dict:
-    """The real, proven mechanism: loads a catalog page in a real remote
-    browser (Bright Data Browser API), clicks 'In this auction' + submits
-    the search form, then pages through ALL results using BidSpotter's real
-    page=N URL parameter (confirmed via a live diagnostic: results are
-    NOT infinite-scroll/lazy-loaded -- scrolling 15x changed nothing, but a
-    real 'next-page' link with &page=2 was found in the page's own HTML).
-    Extracts every lot card on every page and filters to only ones actually
-    belonging to this catalog (BidSpotter's own scoping isn't fully
-    reliable, so we filter client-side using each lot's own href). Returns
-    {lots: [{lot_number, description}, ...], state, zip_code} -- state/zip
-    come from the catalog's own structured location data (schema.org
-    addressRegion/postalCode) on the INITIAL page load, captured before the
-    search-form interaction replaces the page content. catalog_slug is the
-    catalogue-id- value, e.g. 'ncm-au11447', used both for the client-side
-    filter and detecting a flaky click (checked state) before submitting."""
+    """ONE Bright Data browser session per catalog (reverted from
+    session-per-page): does 'In this auction' search-submit ONCE, then
+    pages through ALL results within that SAME session using BidSpotter's
+    page=N URL parameter. This is deliberately back to the original
+    architecture -- session-per-page was built earlier to fix what looked
+    like session degradation, but the REAL root cause (confirmed via live
+    diagnostic) was that direct page=N navigation returns zero lots without
+    first submitting the search; session-per-page never fixed anything real
+    and its dozens of fresh connections per catalog were very likely what
+    triggered Bright Data's "cooldown (no_peers)" proxy error seen live.
+    One session per catalog matches the two confirmed-exact runs from
+    earlier tonight (722/722, 858/858) and opens far fewer connections.
+    Hedge against a session genuinely dying mid-catalog: on any hard
+    failure, reconnect a fresh session, redo the search-submit, and RESUME
+    from the current page (checkpointed via seen_lot_numbers/lots/page_num
+    in this function's scope) instead of restarting the whole catalog."""
     from playwright.async_api import async_playwright
     from urllib.parse import quote
     import uuid
     wss_url = os.environ.get("BRIGHT_DATA_BROWSER_WSS")
     if not wss_url:
         return {"lots": [], "state": None, "zip_code": None, "complete": False}
-    # One Bright Data session ID per CATALOG (not per page, not one for the
-    # whole app). Proxy.useSession (a Bright Data CDP extension) pins every
-    # fresh browser connection below to the SAME underlying proxy peer/IP --
-    # this is their documented middle ground between one long-lived browser
-    # connection (degrades mid-catalog, confirmed earlier tonight) and a
-    # truly new connection per page (may trip the zone's concurrent-session
-    # limit, which matches tonight's Client connect timeout/ETIMEDOUT
-    # errors). Each page still gets its own Playwright browser/page object
-    # (avoids the content-race issues), but they all share one proxy peer.
     session_id = f"catalog-{catalog_slug}-{uuid.uuid4().hex[:8]}"
     lots = []
     state = None
     zip_code = None
-    # complete=True only if pagination reached the genuine end of results.
-    # Any mid-pull failure (unreachable page, browser crash) flips this to
-    # False so the caller KNOWS the lot list may be partial instead of
-    # silently treating whatever was collected as the full catalog.
+    country = None
     complete = True
     lot_pattern = re.compile(
         r'href="(/en-us/auction-catalogues/([a-z0-9]+)/catalogue-id-([a-z0-9\-]+)/lot-[a-z0-9\-]+)"[^>]*data-click-type="title"[^>]*>\s*<span class="lot-number">([^<]+)</span><span class="lot-title">([^<]+)</span>',
@@ -1009,120 +998,12 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
                 found.append((lot_num, lot_title.strip()))
         return found
 
-    async def _fetch_page_html_fresh(pw, target_url: str, need_search_context: bool = True) -> str:
-        """ONE page load in its OWN fresh Bright Data browser session.
-        Session-per-page is the whole fix: previously one session did the
-        entire catalog, so a session that degraded mid-catalog silently
-        killed every page after it (819 lots one run, 0 the next, same
-        catalog). Now one bad session costs one attempt on one page.
-        need_search_context=False skips the search-submit setup entirely --
-        the location-only fetch just reads the plain catalog page for
-        schema.org data and doesn't need it, so doing it anyway was pure
-        wasted navigation time (confirmed: it was pushing that fetch over
-        the 120s timeout)."""
-        browser = await pw.chromium.connect_over_cdp(wss_url, timeout=120000)
-        try:
-            page = await browser.new_page()
-            # Pin this connection to the catalog's shared proxy peer before
-            # navigating -- Bright Data CDP extension, must be called before
-            # goto(). If this fails for any reason, fall back to no pinning
-            # rather than aborting the whole fetch over it.
-            try:
-                cdp_client = await page.context.new_cdp_session(page)
-                await cdp_client.send("Proxy.useSession", {"sessionId": session_id})
-            except Exception as e:
-                print(f"Proxy.useSession failed (continuing without pinning): {type(e).__name__}: {e}")
-
-            # CONFIRMED via live diagnostic: direct page=N navigation
-            # returns REAL lot-card count=0 even when the fetch itself
-            # succeeds cleanly -- the "In this auction" search-submit isn't
-            # just about scoping results, it's what makes the server return
-            # any lot listing at all. This is session/cookie state, not a
-            # URL parameter, so it must be redone in THIS fresh session
-            # before reading the target page -- the old one-session-per-
-            # catalog code did this once at the start; the session-per-page
-            # rewrite dropped it entirely, which is the real root cause of
-            # tonight's recurring "fetched OK but 0 lots" failures.
-            if need_search_context:
-                try:
-                    await page.goto(catalog_url_full, timeout=120000, wait_until="domcontentloaded")
-                    await page.wait_for_selector("#catalogueSearchOption", timeout=30000, state="visible")
-                    # Confirmed via live log: the click was resolving,
-                    # scrolling into view, and reporting "visible, enabled,
-                    # stable" -- then still timing out at 5s waiting for the
-                    # actual click action to register. force=True skips
-                    # Playwright's actionability re-checks after that point
-                    # and just dispatches the click directly.
-                    await page.click("#catalogueSearchOption", timeout=15000, force=True)
-                    await page.click("#searchSubmit", timeout=15000, force=True)
-                    await page.wait_for_load_state("domcontentloaded", timeout=90000)
-                except Exception as e:
-                    print(f"Search-submit context setup failed for {target_url}: {type(e).__name__}: {e} (continuing anyway -- extraction will correctly find 0 lots if this didn't work)")
-
-            # Bright Data's own guidance: navigation timeout must be >=60s
-            # (they recommend 120s) -- their unlocking (proxy rotation,
-            # fingerprinting, CAPTCHA solving) runs DURING this navigation
-            # and needs real time.
-            #
-            # STRUCTURAL FIX, not another timing tweak: page.goto() returns
-            # the actual HTTP Response object. Reading response.text() gets
-            # the raw response body directly -- it has NO dependency on the
-            # page's live DOM state, so it cannot hit the documented
-            # Playwright race (issue #16108) where page.content() reads a
-            # DOM that's already navigating again. Confirmed via direct
-            # test: switching wait_until to "networkidle" alone did NOT
-            # stop the error, because page.content() was still the thing
-            # racing -- this removes page.content() from the fetch path
-            # entirely instead of trying to time around the race.
-            response = await page.goto(target_url, timeout=120000, wait_until="domcontentloaded")
-            if response is not None:
-                # Bright Data returns real machine-readable error info in
-                # these headers on proxy-level problems (rate limit, IP
-                # block, account/KYC issue, etc.) -- check every response,
-                # not just failures, since a "successful" 200 with 0 lots
-                # could still be a soft block reported this way.
-                try:
-                    hdrs = response.headers
-                    brd_err_code = hdrs.get("x-brd-err-code")
-                    brd_err_msg = hdrs.get("x-brd-err-msg")
-                    proxy_status = hdrs.get("proxy-status")
-                    if brd_err_code or brd_err_msg or proxy_status:
-                        print(f"[BRIGHTDATA ERROR HEADERS] status={response.status} code={brd_err_code!r} msg={brd_err_msg!r} proxy-status={proxy_status!r} url={target_url}")
-                except Exception:
-                    pass
-
-            # CONFIRMED via live diagnostic: the empty-page failures are the
-            # raw AWS WAF challenge stub (2395 bytes, "window.awsWafCookie"),
-            # not a block that response.text() failed to see -- WAF serves
-            # this shell, runs a JS challenge, THEN client-side-redirects to
-            # the real page. response.text() only ever captures the body of
-            # the ONE navigation goto() resolved on -- if WAF redirects
-            # afterward, that redirect is invisible to it. page.content()
-            # instead reflects the page's CURRENT (post-redirect) DOM, so
-            # switch back to it -- but wait for actual proof the WAF
-            # challenge has resolved (real lot markup present) before
-            # reading it, instead of trusting a navigation lifecycle event
-            # (which is exactly what caused the original page.content()
-            # race in the first place).
-            try:
-                await page.wait_for_function(
-                    "document.body && document.body.innerHTML.includes('lot-number')"
-                    " || (document.title && document.title.length > 0"
-                    " && !window.awsWafCookieDomainList)",
-                    timeout=15000
-                )
-            except Exception:
-                # Didn't confirm real content within 15s -- fall through and
-                # read whatever's there now; extract_matching_lots will
-                # correctly find 0 lots if it's still the WAF stub, and the
-                # retry loop handles that the same as before.
-                pass
-            return await page.content()
-        finally:
-            try:
-                await browser.close()
-            except Exception:
-                pass
+    def _itemprop_from(html: str, name: str) -> str:
+        m = re.search(rf'<[^>]*itemprop="{name}"[^>]*\scontent="([^"]*)"', html)
+        if not m:
+            m = re.search(rf'<[^>]*itemprop="{name}"[^>]*>([^<]*)<', html)
+        val = (m.group(1).strip() if m else "")
+        return val if val and val != "." else ""
 
     path_part = catalog_url_full.replace("https://www.bidspotter.com", "")
     where_to_search = quote(path_part, safe="")
@@ -1130,146 +1011,145 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
     def _page_url(page_num: int) -> str:
         return f"{catalog_url_full}?searchTerm=&whereToSearch={where_to_search}&page={page_num}"
 
+    MAX_PAGES = 60
+    seen_lot_numbers = set()
+
+    def _record(new_lots):
+        for lot_num, lot_title in new_lots:
+            seen_lot_numbers.add(lot_num)
+            lots.append({"lot_number": lot_num, "description": lot_title})
+
+    async def _open_fresh_session_and_search(pw):
+        """Connect one browser session, pin the shared proxy peer, load the
+        catalog root (capturing location data on the way if not already
+        captured), then perform the 'In this auction' search-submit ONCE.
+        Returns the (browser, page) to reuse for all subsequent pages."""
+        nonlocal state, zip_code, country
+        browser = await pw.chromium.connect_over_cdp(wss_url, timeout=120000)
+        page = await browser.new_page()
+        try:
+            cdp_client = await page.context.new_cdp_session(page)
+            await cdp_client.send("Proxy.useSession", {"sessionId": session_id})
+        except Exception as e:
+            print(f"Proxy.useSession failed (continuing without pinning): {type(e).__name__}: {e}")
+        await page.goto(catalog_url_full, timeout=120000, wait_until="domcontentloaded")
+        if state is None and zip_code is None and country is None:
+            root_html = await page.content()
+            state = _itemprop_from(root_html, "addressRegion") or None
+            zip_code = _itemprop_from(root_html, "postalCode") or None
+            country = _itemprop_from(root_html, "addressCountry") or None
+        await page.wait_for_selector("#catalogueSearchOption", timeout=30000, state="visible")
+        await page.click("#catalogueSearchOption", timeout=15000, force=True)
+        await page.click("#searchSubmit", timeout=15000, force=True)
+        await page.wait_for_load_state("domcontentloaded", timeout=90000)
+        return browser, page
+
+    async def _read_page(page, target_url: str) -> str:
+        """Navigate the EXISTING session to target_url and return real
+        content, waiting for proof the AWS WAF challenge stub (if served)
+        has resolved before reading -- same proof-of-content check proven
+        during tonight's diagnostics."""
+        response = await page.goto(target_url, timeout=120000, wait_until="domcontentloaded")
+        if response is not None:
+            try:
+                hdrs = response.headers
+                brd_err_code = hdrs.get("x-brd-err-code")
+                brd_err_msg = hdrs.get("x-brd-err-msg")
+                proxy_status = hdrs.get("proxy-status")
+                if brd_err_code or brd_err_msg or proxy_status:
+                    print(f"[BRIGHTDATA ERROR HEADERS] status={response.status} code={brd_err_code!r} msg={brd_err_msg!r} proxy-status={proxy_status!r} url={target_url}")
+            except Exception:
+                pass
+        try:
+            await page.wait_for_function(
+                "document.body && document.body.innerHTML.includes('lot-number')"
+                " || (document.title && document.title.length > 0"
+                " && !window.awsWafCookieDomainList)",
+                timeout=15000
+            )
+        except Exception:
+            pass
+        return await page.content()
+
     try:
         async with async_playwright() as pw:
-            # --- Location data: its own fresh session on the plain catalog URL ---
-            initial_html = ""
-            for loc_attempt in range(1, 4):
-                try:
-                    initial_html = await _fetch_page_html_fresh(pw, catalog_url_full, need_search_context=False)
-                    if initial_html:
-                        break
-                except Exception as e:
-                    print(f"Location fetch attempt {loc_attempt}/3 failed for {catalog_url_full}: {type(e).__name__}: {e}")
-
-            def _itemprop(name: str) -> str:
-                m = re.search(rf'<[^>]*itemprop="{name}"[^>]*\scontent="([^"]*)"', initial_html)
-                if not m:
-                    m = re.search(rf'<[^>]*itemprop="{name}"[^>]*>([^<]*)<', initial_html)
-                val = (m.group(1).strip() if m else "")
-                return val if val and val != "." else ""
-
-            state = _itemprop("addressRegion") or None
-            zip_code = _itemprop("postalCode") or None
-            country = _itemprop("addressCountry")
-
+            browser, page = await _open_fresh_session_and_search(pw)
             if country and country.lower() not in ("united states", "usa", "us"):
                 print(f"Skipping non-US catalog ({country}): {catalog_url_full}")
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
                 return {"lots": [], "state": None, "zip_code": None, "country": country, "complete": True}
 
-            # --- Lots: direct page=N URLs, EACH page in its own fresh session.
-            # No search-form/radio-click interaction anymore -- the direct URL
-            # returns the same result page (confirmed: pages 2+ always used it),
-            # and the client-side catalog_slug filter already guards against
-            # any mixed-in results, which was the radio click's only job.
-            # The flaky click was the other half of the 0-lot runs.
-            seen_lot_numbers = set()
-            MAX_PAGES = 60  # hard ceiling
-
-            async def _fetch_one_page(page_num: int):
-                """Fetch a single page with the standard 3 fresh-session
-                retries. Returns (got_real_page, new_lots_on_page)."""
-                next_url = _page_url(page_num)
-                new_on_this_page = []
-                got_real_page = False
-                for page_attempt in range(1, 4):
-                    try:
-                        page_html = await _fetch_page_html_fresh(pw, next_url)
-                    except Exception as e:
-                        print(f"Page {page_num} attempt {page_attempt}/3 (fresh session) failed for {catalog_url_full}: {type(e).__name__}: {e}")
-                        await asyncio.sleep(1.5)
-                        continue
-                    got_real_page = True
-                    page_lots = extract_matching_lots(page_html)
-                    new_on_this_page = [l for l in page_lots if l[0] not in seen_lot_numbers]
-                    if new_on_this_page:
-                        break
-                    print(f"Page {page_num} attempt {page_attempt}/3 for {catalog_url_full}: fetched OK but 0 new lots, retrying with a fresh session")
-                    # Never actually looked at WHAT comes back on a 0-lot
-                    # page tonight -- only inferred "probably blocked" from
-                    # the symptom. Dump real signal on the first empty
-                    # result: length, title, and whether known markers
-                    # (WAF challenge, captcha, the lot-card class itself,
-                    # the "In this auction" search markup) are present.
-                    if page_attempt == 1:
-                        title_match = re.search(r'<title[^>]*>([^<]*)</title>', page_html, re.I)
-                        print(f"[EMPTY PAGE DIAGNOSTIC] page {page_num}: html_length={len(page_html)} title={title_match.group(1) if title_match else None!r}")
-                        real_lot_card_count = page_html.count('class="lot-number"')
-                        title_attr_count = page_html.count('data-click-type="title"')
-                        print(f"[EMPTY PAGE DIAGNOSTIC] contains 'awswaf'={('awswaf' in page_html)} contains 'captcha'={('captcha' in page_html.lower())} REAL lot-card class=\"lot-number\" count={real_lot_card_count} data-click-type=title count={title_attr_count} contains 'catalogueSearchOption'={('catalogueSearchOption' in page_html)} contains catalog_slug={(catalog_slug.lower() in page_html.lower())}")
-                        print(f"[EMPTY PAGE DIAGNOSTIC] first 300 chars: {page_html[:300]!r}")
-                        # Previous "lot-number" substring hit was a FALSE
-                        # POSITIVE -- it matched inside an unrelated search-
-                        # form URL ("url-for-lot-number-lotnumber"), not a
-                        # real lot card. Target the actual class instead.
-                        ln_idx = page_html.find('class="lot-number"')
-                        if ln_idx != -1:
-                            print(f"[EMPTY PAGE DIAGNOSTIC] raw markup around first lot-number: {page_html[max(0,ln_idx-400):ln_idx+200]!r}")
-                    await asyncio.sleep(1.5)
-                return got_real_page, new_on_this_page
-
-            def _record(new_lots):
-                for lot_num, lot_title in new_lots:
-                    seen_lot_numbers.add(lot_num)
-                    lots.append({"lot_number": lot_num, "description": lot_title})
-
-            # pending_empty holds page numbers that came back empty (after
-            # their own 3 retries) but haven't been trusted as the real end
-            # yet -- a SINGLE empty page was previously enough to end the
-            # whole pull, which is exactly how taylor got cut off at 10 lots.
-            # Now: an empty page only counts as the genuine end once the
-            # NEXT page is also confirmed empty. If that next page instead
-            # has real lots, the pagination clearly continues, so we go back
-            # and re-fetch the provisionally-empty page(s) -- most likely a
-            # transient site/proxy glitch on that one page, not a real gap.
             pending_empty = []
             page_num = 1
+            reconnects_used = 0
+            MAX_RECONNECTS = 4  # hedge budget for the whole catalog, not per-page
             while page_num <= MAX_PAGES:
-                got_real_page, new_on_this_page = await _fetch_one_page(page_num)
-                if not got_real_page:
-                    print(f"Pagination stopped at page {page_num} for {catalog_url_full}: page unreachable after 3 fresh-session attempts -- PULL IS INCOMPLETE")
-                    complete = False
-                    break
+                try:
+                    page_html = await _read_page(page, _page_url(page_num))
+                except Exception as e:
+                    print(f"Page {page_num} failed on current session for {catalog_url_full}: {type(e).__name__}: {e}")
+                    if reconnects_used >= MAX_RECONNECTS:
+                        print(f"Reconnect budget ({MAX_RECONNECTS}) exhausted for {catalog_url_full} -- PULL IS INCOMPLETE at page {page_num} ({len(lots)} lots so far)")
+                        complete = False
+                        break
+                    reconnects_used += 1
+                    print(f"Reconnecting fresh session ({reconnects_used}/{MAX_RECONNECTS}) and resuming at page {page_num} ({len(lots)} lots checkpointed)")
+                    try:
+                        try:
+                            await browser.close()
+                        except Exception:
+                            pass
+                        browser, page = await _open_fresh_session_and_search(pw)
+                    except Exception as e2:
+                        print(f"Reconnect itself failed for {catalog_url_full}: {type(e2).__name__}: {e2}")
+                        complete = False
+                        break
+                    continue  # retry the SAME page_num on the new session
+
+                page_lots = extract_matching_lots(page_html)
+                new_on_this_page = [l for l in page_lots if l[0] not in seen_lot_numbers]
+
                 if new_on_this_page:
                     if pending_empty:
                         print(f"Page(s) {pending_empty} for {catalog_url_full} were empty but page {page_num} has real lots -- re-fetching the skipped page(s), not a real end")
                         for p in pending_empty:
-                            r_got_real, r_new = await _fetch_one_page(p)
-                            if r_got_real and r_new:
-                                _record(r_new)
+                            try:
+                                r_html = await _read_page(page, _page_url(p))
+                                r_new = [l for l in extract_matching_lots(r_html) if l[0] not in seen_lot_numbers]
+                                if r_new:
+                                    _record(r_new)
+                            except Exception as e:
+                                print(f"Re-fetch of skipped page {p} failed: {type(e).__name__}: {e}")
                         pending_empty = []
                     _record(new_on_this_page)
                     print(f"Page {page_num} for {catalog_url_full}: running total {len(lots)} lots")
                     page_num += 1
                     continue
-                # This page came back empty after all retries.
+
+                # Empty page (fetched fine, zero new lots on THIS session).
                 if page_num == 1:
-                    # Nothing to pull at all, or blocked hard from the start.
                     complete = False
                     break
                 pending_empty.append(page_num)
                 if len(pending_empty) >= 2:
                     if known_total is not None and len(lots) < known_total:
-                        # TEST-ONLY override: we KNOW the real total (ground
-                        # truth from VA data) and haven't reached it yet, so
-                        # this can't actually be the end -- the two-empty-
-                        # pages heuristic is wrong here. Keep pushing instead
-                        # of trusting it, to see whether the mechanism CAN
-                        # reach the true count given enough persistence.
                         print(f"Pages {pending_empty} both empty for {catalog_url_full}, but only {len(lots)}/{known_total} known lots collected -- known_total says NOT done, continuing past the heuristic")
                         pending_empty = []
                         page_num += 1
                         continue
-                    # Two DIFFERENT pages in a row both genuinely empty --
-                    # trust this as the real end of results now.
                     break
                 page_num += 1
             else:
-                # Loop exhausted MAX_PAGES without ever confirming a genuine
-                # end (only relevant when known_total kept overriding the
-                # heuristic) -- hit the ceiling, not proven complete.
                 print(f"Pagination hit the {MAX_PAGES}-page ceiling for {catalog_url_full} without confirming end-of-results -- PULL IS INCOMPLETE")
                 complete = False
+
+            try:
+                await browser.close()
+            except Exception:
+                pass
     except Exception as e:
         print(f"Browser lot fetch failed for {catalog_url_full}: {type(e).__name__}: {e} -- PULL IS INCOMPLETE ({len(lots)} lots collected before failure)")
         complete = False
