@@ -1047,8 +1047,14 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
                 try:
                     await page.goto(catalog_url_full, timeout=120000, wait_until="domcontentloaded")
                     await page.wait_for_selector("#catalogueSearchOption", timeout=30000, state="visible")
-                    await page.click("#catalogueSearchOption", timeout=5000)
-                    await page.click("#searchSubmit", timeout=5000)
+                    # Confirmed via live log: the click was resolving,
+                    # scrolling into view, and reporting "visible, enabled,
+                    # stable" -- then still timing out at 5s waiting for the
+                    # actual click action to register. force=True skips
+                    # Playwright's actionability re-checks after that point
+                    # and just dispatches the click directly.
+                    await page.click("#catalogueSearchOption", timeout=15000, force=True)
+                    await page.click("#searchSubmit", timeout=15000, force=True)
                     await page.wait_for_load_state("domcontentloaded", timeout=30000)
                 except Exception as e:
                     print(f"Search-submit context setup failed for {target_url}: {type(e).__name__}: {e} (continuing anyway -- extraction will correctly find 0 lots if this didn't work)")
