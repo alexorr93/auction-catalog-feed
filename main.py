@@ -1484,6 +1484,42 @@ async def _debug_capture_network() -> None:
                 print(f"=== NETWORK CAPTURE: page=2 nav failed: {type(e).__name__}: {e} ===")
             print(f"=== NETWORK CAPTURE: {len(captured)} candidate responses after page=2 ===")
 
+            # Found "en-us/lots-images?take=2&skip=1&imageSize=175" tied to
+            # a real auction GUID -- probe sibling endpoint names that might
+            # return actual lot data (title/number), not just images, using
+            # the SAME take/skip convention. Fired from inside the page via
+            # fetch() so the browser's own cookies/session/WAF-clearance
+            # carry over automatically -- a raw new request from us would
+            # hit the WAF challenge again.
+            auction_id_match = re.search(r'auctionid=([a-f0-9\-]{36})', str(captured))
+            auction_id = auction_id_match.group(1) if auction_id_match else None
+            if auction_id:
+                print(f"=== NETWORK CAPTURE: probing lot-data API variants for auctionid={auction_id} ===")
+                candidate_paths = [
+                    f"/en-us/lots?take=5&skip=0&auctionid={auction_id}",
+                    f"/en-us/lots-data?take=5&skip=0&auctionid={auction_id}",
+                    f"/en-us/auction-catalogues/lots?take=5&skip=0&auctionid={auction_id}",
+                    f"/en-us/catalogue/lots?take=5&skip=0&auctionid={auction_id}",
+                    f"/en-us/lot/search?take=5&skip=0&auctionid={auction_id}",
+                ]
+                for path in candidate_paths:
+                    full_url = f"https://www.bidspotter.com{path}"
+                    try:
+                        result = await page.evaluate(
+                            """async (url) => {
+                                const r = await fetch(url, {credentials: 'include'});
+                                const text = await r.text();
+                                return {status: r.status, ct: r.headers.get('content-type'), body: text.slice(0, 500)};
+                            }""",
+                            full_url
+                        )
+                        print(f"[PROBE] {result.get('status')} | {result.get('ct')} | {full_url}")
+                        print(f"[PROBE BODY] {result.get('body')!r}")
+                    except Exception as e:
+                        print(f"[PROBE FAILED] {full_url}: {type(e).__name__}: {e}")
+            else:
+                print("=== NETWORK CAPTURE: no auction GUID found in captured URLs, cannot probe ===")
+
             await browser.close()
 
         print(f"=== NETWORK CAPTURE: {len(captured)} TOTAL candidate responses ===")
