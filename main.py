@@ -799,13 +799,32 @@ async def _recheck_blank_catalogs(supabase_client, business_id: str) -> dict:
     placeholder for its lot-count widget regardless of whether it actually
     has lots (that's just an unrendered JS component in a static fetch, not
     a real signal) -- but the category tag list underneath it IS real, and
-    is genuinely absent when a catalog has nothing in it yet."""
+    is genuinely absent when a catalog has nothing in it yet.
+
+    ROOT-CAUSE FIX: this function draws its candidate list from
+    auction_pdf_uploads (the VA's own known-catalog history), which is NOT
+    country-filtered -- unlike Job 1's listing scan, which only ever visits
+    BidSpotter's countryName=United%20States URL. That mismatch was the
+    actual source of Canadian/UK/Mexican catalogs reaching
+    catalog_updates_queue, not a scraping failure -- fixing it at the lot-
+    pull stage was always going to be whack-a-mole. Real fix: cross-
+    reference against bidspotter_scan_snapshot (which IS built exclusively
+    from the US-filtered listing pages) before re-queuing anything here. A
+    catalog not seen on the current US listing simply never gets queued."""
+    us_catalog_urls = set()
+    try:
+        snap_rows = _fetch_all_paginated(lambda: supabase_client.table("bidspotter_scan_snapshot").select("catalog_url").eq("business_id", business_id))
+        us_catalog_urls = {r["catalog_url"] for r in snap_rows}
+    except Exception as e:
+        print(f"BidSpotter recheck: failed to fetch US-filtered snapshot, cannot safely re-queue anything this run: {e}")
+        return {"ok": False, "error": f"snapshot fetch failed: {e}", "reactivated": 0, "growing": 0, "checked": 0}
+
     latest_status = {}
     rows = _fetch_all_paginated(lambda: supabase_client.table("auction_pdf_uploads").select("catalog_url,status,uploaded_at,filename").eq("business_id", business_id).order("uploaded_at"))
     for r in rows:
         latest_status[r["catalog_url"]] = r  # later rows overwrite earlier -- ends up holding the latest per catalog_url
 
-    blank_catalogs = [r for r in latest_status.values() if r["status"] == "empty"]
+    blank_catalogs = [r for r in latest_status.values() if r["status"] == "empty" and r["catalog_url"] in us_catalog_urls]
     reactivated_count = 0
     growing_count = 0
     checked = 0
@@ -821,7 +840,7 @@ async def _recheck_blank_catalogs(supabase_client, business_id: str) -> dict:
     except Exception as e:
         print(f"BidSpotter recheck: failed to fetch small-catalog list: {e}")
         small_catalog_rows = []
-    small_catalog_urls = {r["catalog_url"] for r in small_catalog_rows}
+    small_catalog_urls = {r["catalog_url"] for r in small_catalog_rows if r["catalog_url"] in us_catalog_urls}
 
     prior_counts = {}
     if small_catalog_urls:
@@ -1313,8 +1332,15 @@ async def _pull_lots_for_queued_catalogs(supabase_client, business_id: str) -> d
                     break
                 if fetch_result.get("country") and fetch_result["country"].lower() not in ("united states", "usa", "us"):
                     # Confirmed non-US -- retrying won't change the country,
-                    # stop wasting time/requests on this catalog.
-                    print(f"Lot pull for {catalog_url}: confirmed non-US ({fetch_result['country']}), not retrying")
+                    # and rechecking it every future cycle forever is pure
+                    # waste. Resolve it PERMANENTLY, not just skip this run.
+                    print(f"Lot pull for {catalog_url}: confirmed non-US ({fetch_result['country']}), resolving permanently (never rechecking)")
+                    try:
+                        supabase_client.table("catalog_updates_queue").update(
+                            {"resolved": True}
+                        ).eq("business_id", business_id).eq("catalog_url", catalog_url).execute()
+                    except Exception as e:
+                        print(f"Failed to permanently resolve non-US catalog {catalog_url}: {e}")
                     break
                 print(f"Lot pull attempt {retry_num}/{max_attempts} for {catalog_url}: got 0 lots, retrying from scratch")
             except asyncio.TimeoutError:
