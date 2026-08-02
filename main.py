@@ -65,6 +65,47 @@ async def _pdf_worker_loop():
 @app.on_event("startup")
 async def _start_pdf_worker():
     asyncio.create_task(_pdf_worker_loop())
+    asyncio.create_task(_recover_orphaned_uploads())
+
+async def _recover_orphaned_uploads():
+    """Runs once, ~10s after startup. Finds any upload stuck at
+    status='processing' with a real storage_path (meaning the file itself
+    survived, per _create_upload_record's durability fix) -- these are
+    uploads whose queued processing job was wiped by a container restart
+    before it ran. Downloads the file back from storage and re-queues it
+    for real, automatically. This is the recovery half of the durability
+    fix: the file being safe in storage only matters if something also
+    goes and finishes the job later, or it just sits there forever looking
+    like 'processing' with no path to actually resolve."""
+    await asyncio.sleep(10)
+    try:
+        supabase_client, business_id, error = _get_supabase_and_business_id()
+        if error:
+            return
+        stuck = supabase_client.table("auction_pdf_uploads") \
+            .select("id,filename,catalog_url,catalog_title,storage_path") \
+            .eq("business_id", business_id).eq("status", "processing") \
+            .not_.is_("storage_path", "null").execute().data or []
+        if not stuck:
+            return
+        print(f"[upload-recovery] found {len(stuck)} orphaned upload(s) from a prior container restart, re-queuing")
+        for row in stuck:
+            try:
+                file_bytes = supabase_client.storage.from_("auction-pdfs").download(row["storage_path"])
+            except Exception as e:
+                print(f"[upload-recovery] could not download {row['storage_path']} for recovery: {e}")
+                continue
+            record = {"log_id": row["id"], "catalog_url": row["catalog_url"], "storage_path": row["storage_path"]}
+            filename = row["filename"]
+            title = row.get("catalog_title") or filename
+
+            def _job(fb=file_bytes, fn=filename, t=title, rec=record):
+                _process_one_pdf(supabase_client, business_id, fn, fb, t, existing_record=rec)
+            _pdf_processing_queue.put_nowait(_job)
+            print(f"[upload-recovery] re-queued {filename} ({row['catalog_url']})")
+    except Exception as e:
+        print(f"[upload-recovery] recovery pass failed: {type(e).__name__}: {e}")
+
 
 # --- Startup no longer crashes the whole process, on purpose ---------------
 # The previous version connected to Supabase and looked up the business_id
@@ -1845,16 +1886,17 @@ async def api_bright_lots(catalog_url: str = None):
     return {"lots": rows}
 
 
-def _process_one_pdf(supabase_client, business_id: str, filename: str, contents: bytes,
-                       title: str = "", auctioneer: str = "", end_date: str = "", state: str = "", zip_code: str = "") -> dict:
-    """Does everything for one catalog PDF: stores it, extracts text, pulls
-    every lot out via Gemini (the sole, authoritative parser -- see
-    _extract_lots_via_gemini), ingests into bidspotter_catalog_lots/
-    auction_catalogs, and logs the attempt to auction_pdf_uploads regardless
-    of outcome. Shared by both the single-file upload endpoint and the
-    zip-batch endpoint, so a zip upload behaves identically to uploading each
-    file one at a time -- same parsing, same empty-catalog handling, same
-    was_ever_empty flag, same logging."""
+def _create_upload_record(supabase_client, business_id: str, filename: str, contents: bytes, title: str = "") -> dict:
+    """Durable, SYNCHRONOUS step run immediately when a file is received --
+    BEFORE it ever touches the in-memory processing queue. Real bug this
+    fixes: uploads used to only get logged/stored once the queue worker
+    actually got around to them, which meant a redeploy (container
+    restart wipes the in-memory queue instantly, no trace) could silently
+    lose an uploaded file completely -- the client got a fake 'queued: true'
+    success response, and there was nothing anywhere to show the upload
+    ever existed. Now the file is safely in storage and logged as
+    'processing' the moment it's received; the queue only decides WHEN the
+    (recoverable) parsing work happens, not WHETHER the upload is durable."""
     title = title.strip() or filename
     raw_name = filename.rsplit(".", 1)[0] if filename else str(uuid.uuid4())
     catalog_key = re.sub(r'[^A-Za-z0-9._-]', '_', raw_name)
@@ -1874,6 +1916,8 @@ def _process_one_pdf(supabase_client, business_id: str, filename: str, contents:
             path=storage_path, file=contents,
             file_options={"content-type": "application/pdf", "upsert": "true"}
         )
+        if log_id:
+            supabase_client.table("auction_pdf_uploads").update({"storage_path": storage_path}).eq("id", log_id).execute()
     except Exception as e:
         # Real bug this caught before: the "auction-pdfs" bucket never
         # actually existed, so every single upload silently failed here for
@@ -1891,6 +1935,36 @@ def _process_one_pdf(supabase_client, business_id: str, filename: str, contents:
                 }).eq("id", log_id).execute()
             except Exception:
                 pass  # never let a logging failure break the actual upload
+
+    return {"log_id": log_id, "catalog_url": catalog_url, "catalog_key": catalog_key, "storage_path": storage_path}
+
+
+def _process_one_pdf(supabase_client, business_id: str, filename: str, contents: bytes,
+                       title: str = "", auctioneer: str = "", end_date: str = "", state: str = "", zip_code: str = "",
+                       existing_record: dict = None) -> dict:
+    """Does everything for one catalog PDF: extracts text, pulls every lot
+    out via Gemini (the sole, authoritative parser -- see
+    _extract_lots_via_gemini), ingests into bidspotter_catalog_lots/
+    auction_catalogs, and updates the upload log with the real outcome.
+    Shared by both the single-file upload endpoint and the zip-batch
+    endpoint, so a zip upload behaves identically to uploading each file
+    one at a time -- same parsing, same empty-catalog handling, same
+    was_ever_empty flag, same logging.
+
+    existing_record: pass the dict from _create_upload_record if the
+    durable log+storage step already ran (the normal path now) -- skips
+    redoing it. If not passed, falls back to doing it here (kept for any
+    other caller that hasn't been updated yet)."""
+    title = title.strip() or filename
+    if existing_record:
+        log_id = existing_record["log_id"]
+        catalog_url = existing_record["catalog_url"]
+        storage_path = existing_record["storage_path"]
+    else:
+        rec = _create_upload_record(supabase_client, business_id, filename, contents, title)
+        log_id = rec["log_id"]
+        catalog_url = rec["catalog_url"]
+        storage_path = rec["storage_path"]
 
     try:
         doc = fitz.open(stream=contents, filetype="pdf")
@@ -1998,10 +2072,14 @@ def _process_one_pdf(supabase_client, business_id: str, filename: str, contents:
 
 @app.post("/api/upload-pdf")
 async def upload_pdf(request: Request):
-    """Queues this file for processing -- see _pdf_processing_queue above for
-    why this is a queue now instead of an independent background task per
-    upload. Returns immediately either way; the Upload Log fills in once this
-    file's actual turn comes up, same as before."""
+    """The file is saved to storage and logged as 'processing' SYNCHRONOUSLY
+    here, before anything touches the queue -- if the container restarts
+    while this file is still waiting its turn, the file and its record
+    survive intact and get picked up by the recovery pass on next startup,
+    instead of vanishing with a fake 'queued: true' success response and no
+    trace anywhere (a real incident, not hypothetical -- this exact thing
+    happened during tonight's redeploys). Only the actual Gemini parsing
+    step (the slow, recoverable part) waits on _pdf_processing_queue."""
     supabase_client, business_id = _require_config()
 
     form = await request.form()
@@ -2015,10 +2093,11 @@ async def upload_pdf(request: Request):
     zip_code = (form.get("zip_code") or "").strip()
 
     contents = await file.read()
+    record = _create_upload_record(supabase_client, business_id, file.filename, contents, title)
 
     def _run_and_backfill():
         result = _process_one_pdf(supabase_client, business_id, file.filename, contents,
-                                   title, auctioneer, end_date, state, zip_code)
+                                   title, auctioneer, end_date, state, zip_code, existing_record=record)
         if result.get("needs_backfill") and result.get("raw_text"):
             _backfill_catalog_metadata(supabase_client, business_id, result["catalog_url"],
                                         result["raw_text"], file.filename, state, zip_code, end_date)
@@ -2049,7 +2128,7 @@ def _process_zip_batch(supabase_client, business_id: str, pdf_entries: list) -> 
     that one file, logs it as a real timeout error, and moves on to the next
     file immediately instead of stalling the other 349 behind it."""
     print(f"Zip batch: starting {len(pdf_entries)} catalog(s)")
-    for i, (filename, contents) in enumerate(pdf_entries):
+    for i, (filename, contents, record) in enumerate(pdf_entries):
         try:
             # Deliberately NOT a `with ThreadPoolExecutor() as ex:` block --
             # caught via direct testing before this shipped: the context
@@ -2062,7 +2141,8 @@ def _process_zip_batch(supabase_client, business_id: str, pdf_entries: list) -> 
             # file really is stuck forever) just keeps running harmlessly
             # in the background instead of blocking anything else.
             ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            future = ex.submit(_process_one_pdf, supabase_client, business_id, filename, contents)
+            future = ex.submit(_process_one_pdf, supabase_client, business_id, filename, contents,
+                                "", "", "", "", "", record)
             try:
                 result = future.result(timeout=1500)
             except concurrent.futures.TimeoutError:
@@ -2071,15 +2151,18 @@ def _process_zip_batch(supabase_client, business_id: str, pdf_entries: list) -> 
                       f"giving up on this file and moving on (the stuck attempt may still finish "
                       f"on its own later and overwrite this with a real result)")
                 try:
-                    supabase_client.table("auction_pdf_uploads").insert({
-                        "business_id": business_id, "filename": filename,
-                        "catalog_url": re.sub(r'[^A-Za-z0-9._-]', '_', filename.rsplit(".", 1)[0]),
-                        "status": "error",
-                        "error_message": "Hard watchdog timeout: this file's processing did not "
-                                          "complete within 25 minutes, so it was skipped to let the "
-                                          "rest of the batch continue. Try uploading this one file "
-                                          "again on its own.",
-                    }).execute()
+                    # UPDATE the existing durable record (created up front),
+                    # not a fresh insert -- a fresh insert here would leave
+                    # the original 'processing' row orphaned forever
+                    # alongside a second error row for the same file.
+                    if record.get("log_id"):
+                        supabase_client.table("auction_pdf_uploads").update({
+                            "status": "error",
+                            "error_message": "Hard watchdog timeout: this file's processing did not "
+                                              "complete within 25 minutes, so it was skipped to let the "
+                                              "rest of the batch continue. Try uploading this one file "
+                                              "again on its own.",
+                        }).eq("id", record["log_id"]).execute()
                 except Exception as log_err:
                     print(f"Zip batch: also failed to log the watchdog timeout for {filename}: {log_err}")
                 continue
@@ -2125,7 +2208,19 @@ async def upload_zip(request: Request):
     if not pdf_entries:
         raise HTTPException(400, "No PDF files found inside this zip")
 
-    _pdf_processing_queue.put_nowait(lambda: _process_zip_batch(supabase_client, business_id, pdf_entries))
+    # Same durability fix as the single-PDF endpoint, same real incident
+    # class this prevents -- a zip batch can be hundreds of files, so this
+    # matters even more here: every file is logged + stored NOW, synchron-
+    # ously, before any of them touch the queue. A restart mid-batch used
+    # to silently drop every file that hadn't been reached yet; now they're
+    # all durable immediately and the startup recovery pass picks up
+    # whichever ones the restart caught mid-processing.
+    entries_with_records = []
+    for filename, contents in pdf_entries:
+        record = _create_upload_record(supabase_client, business_id, filename, contents)
+        entries_with_records.append((filename, contents, record))
+
+    _pdf_processing_queue.put_nowait(lambda: _process_zip_batch(supabase_client, business_id, entries_with_records))
     return {"ok": True, "queued": len(pdf_entries)}
 
 
