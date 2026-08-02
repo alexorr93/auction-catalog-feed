@@ -37,10 +37,15 @@ a:hover { color: #93c5fd; }
   <h1>📋 Auction Catalog Feed</h1>
   <div class="sub">Public view of tracked auction catalogs and lots. Anyone with this link can see and add catalogs — no login required.</div>
 
-  <div style="margin-bottom:22px;">
-    <div style="font-size:15px;font-weight:700;margin-bottom:8px;">🔄 Updates to Make</div>
-    <div class="sub" style="margin-bottom:8px;">Auto-detected daily from BidSpotter's own site: catalogs that are brand new (never pulled here) or that were blank before and now have real lots posted. Click "View on BidSpotter" to grab the PDF, then upload it below — this clears itself automatically the moment lots land for that catalog.</div>
-    <div id="updates-to-make"><div class="empty">Loading...</div></div>
+  <div style="display:flex;gap:10px;margin-bottom:18px;">
+    <div style="flex:1;background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px 16px;">
+      <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.03em;margin-bottom:4px;">🆕 New / Reactivated</div>
+      <div id="count-updates-to-make" style="font-size:28px;font-weight:800;line-height:1;">–</div>
+    </div>
+    <div style="flex:1;background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px 16px;">
+      <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.03em;margin-bottom:4px;">⏳ Blank / Needs Update</div>
+      <div id="count-needs-update" style="font-size:28px;font-weight:800;line-height:1;">–</div>
+    </div>
   </div>
 
   <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:22px;align-items:flex-start;">
@@ -61,6 +66,12 @@ a:hover { color: #93c5fd; }
       <input type="text" class="field-input" id="pdf-state-input" placeholder="State" style="width:80px;" autocomplete="off"/>
       <input type="text" class="field-input" id="pdf-zip-input" placeholder="ZIP" style="width:80px;" autocomplete="off"/>
     </div>
+  </div>
+
+  <div style="margin-bottom:22px;">
+    <div style="font-size:15px;font-weight:700;margin-bottom:8px;">🔄 Updates to Make</div>
+    <div class="sub" style="margin-bottom:8px;">Auto-detected daily from BidSpotter's own site: catalogs that are brand new (never pulled here) or that were blank before and now have real lots posted. Click "View on BidSpotter" to grab the PDF, then upload it below — this clears itself automatically the moment lots land for that catalog.</div>
+    <div id="updates-to-make"><div class="empty">Loading...</div></div>
   </div>
 
   <div style="margin-bottom:22px;">
@@ -317,15 +328,12 @@ async function uploadZipFile(file) {
 
 let autoRefreshTimer = null;
 function startAutoRefresh() {
-  // Runs every 8s for 20 minutes so a large zip batch's progress shows up
-  // without needing a manual refresh -- stops itself automatically so this
-  // doesn't run forever in an idle open tab.
+  // Runs every 8s continuously -- Job 1/Job 2 run in the background for
+  // hours, and the point of the top counts is to watch them move live for
+  // as long as that's happening, not just for 20 minutes after an upload.
   if (autoRefreshTimer) return;
-  let elapsed = 0;
   autoRefreshTimer = setInterval(async () => {
     await loadAll();
-    elapsed += 8000;
-    if (elapsed > 20 * 60 * 1000) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
   }, 8000);
 }
 
@@ -415,10 +423,12 @@ function renderNeedsUpdateTable() {
 
 async function loadUpdatesToMake() {
   const el = document.getElementById('updates-to-make');
+  const countEl = document.getElementById('count-updates-to-make');
   try {
     const r = await fetch('/api/updates-to-make');
     const data = await r.json();
     const items = data.updates || [];
+    if (countEl) countEl.textContent = items.length;
     if (!items.length) { el.innerHTML = '<div class="empty">Nothing pending — all caught up.</div>'; return; }
     let html = `<table><thead><tr><th>Title</th><th>Type</th><th>Flagged</th><th></th></tr></thead><tbody>`;
     for (const it of items) {
@@ -448,10 +458,12 @@ function reconstructBidspotterUrl(catalogUrl) {
 
 async function loadNeedsUpdateQueue() {
   const el = document.getElementById('pdf-needs-update');
+  const countEl = document.getElementById('count-needs-update');
   try {
     const r = await fetch('/api/needs-update');
     const data = await r.json();
     needsUpdateItems = data.needs_update || [];
+    if (countEl) countEl.textContent = needsUpdateItems.length;
     renderNeedsUpdateTable();
   } catch(e) {
     el.innerHTML = `<div class="empty">Failed to load: ${e.message}</div>`;
@@ -459,6 +471,7 @@ async function loadNeedsUpdateQueue() {
 }
 
 loadAll();
+startAutoRefresh();
 </script>
 </body>
 </html>
