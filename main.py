@@ -1023,10 +1023,16 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
             # racing -- this removes page.content() from the fetch path
             # entirely instead of trying to time around the race.
             response = await page.goto(target_url, timeout=120000, wait_until="domcontentloaded")
-            await page.wait_for_timeout(1500)
             if response is not None:
+                # Read the body IMMEDIATELY, not after a wait -- confirmed
+                # via live testing that the previous 1.5s delay here caused
+                # Bright Data's remote browser to evict the response buffer
+                # first, producing "No resource with given identifier
+                # found". response.text() must be the very next call after
+                # goto() resolves.
                 return await response.text()
             # Fallback only if goto somehow returned no response object.
+            await page.wait_for_timeout(1500)
             return await page.content()
         finally:
             try:
