@@ -1009,12 +1009,17 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
                 found.append((lot_num, lot_title.strip()))
         return found
 
-    async def _fetch_page_html_fresh(pw, target_url: str) -> str:
+    async def _fetch_page_html_fresh(pw, target_url: str, need_search_context: bool = True) -> str:
         """ONE page load in its OWN fresh Bright Data browser session.
         Session-per-page is the whole fix: previously one session did the
         entire catalog, so a session that degraded mid-catalog silently
         killed every page after it (819 lots one run, 0 the next, same
-        catalog). Now one bad session costs one attempt on one page."""
+        catalog). Now one bad session costs one attempt on one page.
+        need_search_context=False skips the search-submit setup entirely --
+        the location-only fetch just reads the plain catalog page for
+        schema.org data and doesn't need it, so doing it anyway was pure
+        wasted navigation time (confirmed: it was pushing that fetch over
+        the 120s timeout)."""
         browser = await pw.chromium.connect_over_cdp(wss_url, timeout=120000)
         try:
             page = await browser.new_page()
@@ -1038,14 +1043,15 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
             # catalog code did this once at the start; the session-per-page
             # rewrite dropped it entirely, which is the real root cause of
             # tonight's recurring "fetched OK but 0 lots" failures.
-            try:
-                await page.goto(catalog_url_full, timeout=120000, wait_until="domcontentloaded")
-                await page.wait_for_selector("#catalogueSearchOption", timeout=30000, state="visible")
-                await page.click("#catalogueSearchOption", timeout=5000)
-                await page.click("#searchSubmit", timeout=5000)
-                await page.wait_for_load_state("domcontentloaded", timeout=30000)
-            except Exception as e:
-                print(f"Search-submit context setup failed for {target_url}: {type(e).__name__}: {e} (continuing anyway -- extraction will correctly find 0 lots if this didn't work)")
+            if need_search_context:
+                try:
+                    await page.goto(catalog_url_full, timeout=120000, wait_until="domcontentloaded")
+                    await page.wait_for_selector("#catalogueSearchOption", timeout=30000, state="visible")
+                    await page.click("#catalogueSearchOption", timeout=5000)
+                    await page.click("#searchSubmit", timeout=5000)
+                    await page.wait_for_load_state("domcontentloaded", timeout=30000)
+                except Exception as e:
+                    print(f"Search-submit context setup failed for {target_url}: {type(e).__name__}: {e} (continuing anyway -- extraction will correctly find 0 lots if this didn't work)")
 
             # Bright Data's own guidance: navigation timeout must be >=60s
             # (they recommend 120s) -- their unlocking (proxy rotation,
@@ -1124,7 +1130,7 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
             initial_html = ""
             for loc_attempt in range(1, 4):
                 try:
-                    initial_html = await _fetch_page_html_fresh(pw, catalog_url_full)
+                    initial_html = await _fetch_page_html_fresh(pw, catalog_url_full, need_search_context=False)
                     if initial_html:
                         break
                 except Exception as e:
