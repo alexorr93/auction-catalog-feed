@@ -998,17 +998,22 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
                 found.append((lot_num, lot_title.strip()))
         return found
 
-    async def _fetch_page_html_fresh(pw, target_url: str, wait_mode: str) -> str:
+    async def _fetch_page_html_fresh(pw, target_url: str) -> str:
         """ONE page load in its OWN fresh Bright Data browser session.
         Session-per-page is the whole fix: previously one session did the
         entire catalog, so a session that degraded mid-catalog silently
         killed every page after it (819 lots one run, 0 the next, same
         catalog). Now one bad session costs one attempt on one page."""
-        browser = await pw.chromium.connect_over_cdp(wss_url, timeout=60000)
+        browser = await pw.chromium.connect_over_cdp(wss_url, timeout=120000)
         try:
             page = await browser.new_page()
-            await page.goto(target_url, timeout=30000, wait_until=wait_mode)
-            await page.wait_for_timeout(2000 if wait_mode == "domcontentloaded" else 5000)
+            # Bright Data's own guidance: navigation timeout must be >=60s
+            # (they recommend 120s) -- their unlocking (proxy rotation,
+            # fingerprinting, CAPTCHA solving) runs DURING this navigation
+            # and needs real time. Our previous 30s timeout was very likely
+            # killing requests mid-unlock, not because the page was slow.
+            await page.goto(target_url, timeout=120000, wait_until="load")
+            await page.wait_for_timeout(2000)
             return await page.content()
         finally:
             try:
@@ -1028,9 +1033,7 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
             initial_html = ""
             for loc_attempt in range(1, 4):
                 try:
-                    initial_html = await _fetch_page_html_fresh(
-                        pw, catalog_url_full,
-                        "domcontentloaded" if loc_attempt < 3 else "commit")
+                    initial_html = await _fetch_page_html_fresh(pw, catalog_url_full)
                     if initial_html:
                         break
                 except Exception as e:
@@ -1064,9 +1067,8 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
                 new_on_this_page = []
                 got_real_page = False
                 for page_attempt in range(1, 4):
-                    wait_mode = "domcontentloaded" if page_attempt < 3 else "commit"
                     try:
-                        page_html = await _fetch_page_html_fresh(pw, next_url, wait_mode)
+                        page_html = await _fetch_page_html_fresh(pw, next_url)
                     except Exception as e:
                         print(f"Page {page_num} attempt {page_attempt}/3 (fresh session) failed for {catalog_url_full}: {type(e).__name__}: {e}")
                         await asyncio.sleep(1.5)
