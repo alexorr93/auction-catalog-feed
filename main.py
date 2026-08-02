@@ -1135,6 +1135,17 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
                     if new_on_this_page:
                         break
                     print(f"Page {page_num} attempt {page_attempt}/3 for {catalog_url_full}: fetched OK but 0 new lots, retrying with a fresh session")
+                    # Never actually looked at WHAT comes back on a 0-lot
+                    # page tonight -- only inferred "probably blocked" from
+                    # the symptom. Dump real signal on the first empty
+                    # result: length, title, and whether known markers
+                    # (WAF challenge, captcha, the lot-card class itself,
+                    # the "In this auction" search markup) are present.
+                    if page_attempt == 1:
+                        title_match = re.search(r'<title[^>]*>([^<]*)</title>', page_html, re.I)
+                        print(f"[EMPTY PAGE DIAGNOSTIC] page {page_num}: html_length={len(page_html)} title={title_match.group(1) if title_match else None!r}")
+                        print(f"[EMPTY PAGE DIAGNOSTIC] contains 'awswaf'={('awswaf' in page_html)} contains 'captcha'={('captcha' in page_html.lower())} contains 'lot-number'={('lot-number' in page_html)} contains 'catalogueSearchOption'={('catalogueSearchOption' in page_html)} contains catalog_slug={(catalog_slug.lower() in page_html.lower())}")
+                        print(f"[EMPTY PAGE DIAGNOSTIC] first 300 chars: {page_html[:300]!r}")
                     await asyncio.sleep(1.5)
                 return got_real_page, new_on_this_page
 
