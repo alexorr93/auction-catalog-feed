@@ -1116,6 +1116,7 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
                                 _record(r_new)
                         pending_empty = []
                     _record(new_on_this_page)
+                    print(f"Page {page_num} for {catalog_url_full}: running total {len(lots)} lots")
                     page_num += 1
                     continue
                 # This page came back empty after all retries.
