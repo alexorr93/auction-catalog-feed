@@ -957,6 +957,12 @@ async def _run_bidspotter_scan_for_business(supabase_client, business_id: str):
     print(f"BidSpotter scan for {business_id}: {status_row}")
     return status_row
 
+class _NoLotsPublishedYet(Exception):
+    """Fast verdict: real full-size catalog page with no search form and no
+    lot cards -- the auctioneer hasn't published lots yet, nothing to pull.
+    Used to short-circuit retries in 30s instead of ~4 minutes."""
+    pass
+
 async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: str, known_total: int = None) -> dict:
     """ONE Bright Data browser session per catalog (reverted from
     session-per-page): does 'In this auction' search-submit ONCE, then
@@ -1049,14 +1055,6 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
             # resolves even though our force=True click works on it fine.
             await page.wait_for_selector("#catalogueSearchOption", timeout=30000, state="attached")
         except Exception:
-            # CONFIRMED via live diagnostic (Bryan MERX, Schneider multi-
-            # location): some catalogs render a REAL, fully-loaded page
-            # (~373KB, real title) that simply has NO search form at all --
-            # the element isn't slow or hidden, it's absent from the HTML.
-            # If real lot cards are already present, proceed WITHOUT the
-            # search-submit instead of failing; downstream empty-page +
-            # completeness logic stays as the honest safety net if
-            # pagination doesn't work on this variant.
             try:
                 cur_html = await page.content()
                 real_lot_cards = cur_html.count('class="lot-number"')
@@ -1064,7 +1062,34 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
                     print(f"[FORM-LESS VARIANT] {page.url}: no search form in HTML but {real_lot_cards} real lot cards present -- proceeding without search-submit")
                     return browser, page
                 title_match = re.search(r'<title[^>]*>([^<]*)</title>', cur_html, re.I)
-                print(f"[SEARCH-FORM MISSING DIAGNOSTIC] url={page.url} html_length={len(cur_html)} title={title_match.group(1) if title_match else None!r} real-lot-cards={real_lot_cards}")
+                title = title_match.group(1) if title_match else ""
+                # FAST NON-US CLASSIFICATION from the title when microdata
+                # failed: live-confirmed leak case was bsccr10074 whose
+                # title literally says "(Toronto, ON)" while schema.org
+                # location came back empty, so the non-US skip no-op'd and
+                # burned full retries. Canadian province abbreviations in a
+                # "(City, XX)" pattern, or explicit country words.
+                nonus = re.search(r'\(\s*[^)]*,\s*(ON|BC|QC|AB|MB|SK|NS|NB|NL|PE)\s*\)|\b(Canada|Canadian|United Kingdom|Ontario|Quebec|British Columbia|Alberta)\b', title)
+                if nonus:
+                    print(f"[TITLE NON-US] {page.url}: title indicates non-US ({nonus.group(0)!r}) -- classifying as non-US, no retries. title={title!r}")
+                    country = f"non-US (from title: {nonus.group(0)})"
+                    return browser, page
+                # FAST SHELL CLASSIFICATION: a real, full-size page (not the
+                # tiny WAF stub) with NO search form AND NO lot cards is the
+                # live-confirmed "no lots published yet" variant (new
+                # catalogs where the auctioneer hasn't uploaded lots) --
+                # there is genuinely nothing to pull. Verdict in 30s instead
+                # of ~4 minutes of pointless retries per cycle.
+                if len(cur_html) > 100000 and real_lot_cards == 0 and "catalogueSearchOption" not in cur_html:
+                    print(f"[NO LOTS PUBLISHED YET] {page.url}: full page ({len(cur_html)}b) with no form and no lot cards -- nothing to pull yet, will recheck next cycle. title={title!r}")
+                    try:
+                        await browser.close()
+                    except Exception:
+                        pass
+                    raise _NoLotsPublishedYet()
+                print(f"[SEARCH-FORM MISSING DIAGNOSTIC] url={page.url} html_length={len(cur_html)} title={title!r} real-lot-cards={real_lot_cards}")
+            except _NoLotsPublishedYet:
+                raise
             except Exception as de:
                 print(f"[SEARCH-FORM MISSING DIAGNOSTIC] could not read page content either: {type(de).__name__}: {de}")
             raise
@@ -1110,6 +1135,17 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
                     browser, page = await _open_fresh_session_and_search(pw)
                     last_open_error = None
                     break
+                except _NoLotsPublishedYet:
+                    # Fast verdict, no retries: full real page, no form, no
+                    # lot cards = auctioneer hasn't published lots yet.
+                    # Nothing to pull; catalog stays queued and gets
+                    # rechecked next cycle in 30s, not 4 minutes.
+                    if browser is not None:
+                        try:
+                            await browser.close()
+                        except Exception:
+                            pass
+                    return {"lots": [], "state": state, "zip_code": zip_code, "country": country, "complete": False, "no_lots_published": True}
                 except Exception as e:
                     last_open_error = e
                     print(f"Initial session open/search-submit attempt {open_attempt}/3 failed for {catalog_url_full}: {type(e).__name__}: {e}")
@@ -1270,6 +1306,11 @@ async def _pull_lots_for_queued_catalogs(supabase_client, business_id: str) -> d
                     # nonzero lot count was treated as a full success.
                     print(f"Lot pull attempt {retry_num}/{max_attempts} for {catalog_url}: INCOMPLETE ({len(lots)} lots before failure), retrying from scratch")
                     continue
+                if fetch_result.get("no_lots_published"):
+                    # Real page, no lots exist yet -- a second full attempt
+                    # cannot change that. Stays queued for next cycle.
+                    print(f"Lot pull for {catalog_url}: no lots published yet, not retrying this cycle")
+                    break
                 if fetch_result.get("country") and fetch_result["country"].lower() not in ("united states", "usa", "us"):
                     # Confirmed non-US -- retrying won't change the country,
                     # stop wasting time/requests on this catalog.
