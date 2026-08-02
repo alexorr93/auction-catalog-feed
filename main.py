@@ -1043,7 +1043,11 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
             zip_code = _itemprop_from(root_html, "postalCode") or None
             country = _itemprop_from(root_html, "addressCountry") or None
         try:
-            await page.wait_for_selector("#catalogueSearchOption", timeout=30000, state="visible")
+            # state="attached", NOT "visible": confirmed via live log that
+            # on some pages this element exists as a HIDDEN radio input
+            # (the label is the visible UI) -- waiting for visibility never
+            # resolves even though our force=True click works on it fine.
+            await page.wait_for_selector("#catalogueSearchOption", timeout=30000, state="attached")
         except Exception:
             # CONFIRMED via live diagnostic (Bryan MERX, Schneider multi-
             # location): some catalogs render a REAL, fully-loaded page
