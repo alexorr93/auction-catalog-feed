@@ -1042,7 +1042,21 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
             state = _itemprop_from(root_html, "addressRegion") or None
             zip_code = _itemprop_from(root_html, "postalCode") or None
             country = _itemprop_from(root_html, "addressCountry") or None
-        await page.wait_for_selector("#catalogueSearchOption", timeout=30000, state="visible")
+        try:
+            await page.wait_for_selector("#catalogueSearchOption", timeout=30000, state="visible")
+        except Exception:
+            # Look, don't guess: dump what the page ACTUALLY contains when
+            # the search form never appears -- same diagnostic move that
+            # cracked the last systemic failure (WAF challenge stub).
+            try:
+                cur_html = await page.content()
+                title_match = re.search(r'<title[^>]*>([^<]*)</title>', cur_html, re.I)
+                print(f"[SEARCH-FORM MISSING DIAGNOSTIC] url={page.url} html_length={len(cur_html)} title={title_match.group(1) if title_match else None!r}")
+                print(f"[SEARCH-FORM MISSING DIAGNOSTIC] awswaf={'awswaf' in cur_html} captcha={'captcha' in cur_html.lower()} challenge={'challenge' in cur_html.lower()} searchOption-in-html={'catalogueSearchOption' in cur_html} auction-closed={'auction closed' in cur_html.lower()}")
+                print(f"[SEARCH-FORM MISSING DIAGNOSTIC] first 300 chars: {cur_html[:300]!r}")
+            except Exception as de:
+                print(f"[SEARCH-FORM MISSING DIAGNOSTIC] could not read page content either: {type(de).__name__}: {de}")
+            raise
         await page.click("#catalogueSearchOption", timeout=15000, force=True)
         await page.click("#searchSubmit", timeout=15000, force=True)
         await page.wait_for_load_state("domcontentloaded", timeout=90000)
