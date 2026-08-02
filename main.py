@@ -977,10 +977,15 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
     from urllib.parse import quote
     wss_url = os.environ.get("BRIGHT_DATA_BROWSER_WSS")
     if not wss_url:
-        return {"lots": [], "state": None, "zip_code": None}
+        return {"lots": [], "state": None, "zip_code": None, "complete": False}
     lots = []
     state = None
     zip_code = None
+    # complete=True only if pagination reached the genuine end of results.
+    # Any mid-pull failure (unreachable page, browser crash) flips this to
+    # False so the caller KNOWS the lot list may be partial instead of
+    # silently treating whatever was collected as the full catalog.
+    complete = True
     lot_pattern = re.compile(
         r'href="(/en-us/auction-catalogues/([a-z0-9]+)/catalogue-id-([a-z0-9\-]+)/lot-[a-z0-9\-]+)"[^>]*data-click-type="title"[^>]*>\s*<span class="lot-number">(\d+)</span><span class="lot-title">([^<]+)</span>',
         re.I
@@ -1025,7 +1030,7 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
             if country and country.lower() not in ("united states", "usa", "us"):
                 print(f"Skipping non-US catalog ({country}): {catalog_url_full}")
                 await browser.close()
-                return {"lots": [], "state": None, "zip_code": None, "country": country}
+                return {"lots": [], "state": None, "zip_code": None, "country": country, "complete": True}
             # always register before submit) -- retry until it's actually
             # checked, not just attempted once.
             checked = False
@@ -1040,7 +1045,7 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
                 await page.wait_for_timeout(1000)
             if not checked:
                 await browser.close()
-                return {"lots": [], "state": state, "zip_code": zip_code, "country": country}
+                return {"lots": [], "state": state, "zip_code": zip_code, "country": country, "complete": False}
 
             await page.click("#searchSubmit", timeout=5000)
             await page.wait_for_load_state("load", timeout=30000)
@@ -1065,13 +1070,19 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
                 next_url = f"{catalog_url_full}?searchTerm=&whereToSearch={where_to_search}&page={page_num}"
                 new_on_this_page = []
                 got_real_page = False
-                for page_attempt in range(1, 5):
+                # 2 attempts, not 4: every catalog hits this at its REAL end of
+                # results, so 4 retries meant ~30s of guaranteed waste per catalog.
+                # 2 still catches a one-off soft-block page.
+                for page_attempt in range(1, 3):
                     try:
-                        await page.goto(next_url, timeout=30000, wait_until="load")
+                        # domcontentloaded instead of full "load": the lot cards are in
+                        # the HTML at DOM-ready; waiting for every proxied asset to
+                        # finish loading was the cause of the recurring 30s timeouts.
+                        await page.goto(next_url, timeout=30000, wait_until="domcontentloaded")
                         await page.wait_for_timeout(2000)
                         page_html = await page.content()
                     except Exception as e:
-                        print(f"Page {page_num} attempt {page_attempt}/4 failed for {catalog_url_full}: {type(e).__name__}: {e}")
+                        print(f"Page {page_num} attempt {page_attempt}/2 failed for {catalog_url_full}: {type(e).__name__}: {e}")
                         await page.wait_for_timeout(1500)
                         continue
                     got_real_page = True
@@ -1083,10 +1094,11 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
                     # end-of-results, OR a soft-block/captcha page returned
                     # successfully (no exception) with no real content.
                     # Retry the SAME page before trusting it as the real end.
-                    print(f"Page {page_num} attempt {page_attempt}/4 for {catalog_url_full}: fetched OK but 0 new lots, retrying in case of a soft block")
+                    print(f"Page {page_num} attempt {page_attempt}/2 for {catalog_url_full}: fetched OK but 0 new lots, retrying in case of a soft block")
                     await page.wait_for_timeout(1500)
                 if not got_real_page:
-                    print(f"Pagination stopped at page {page_num} for {catalog_url_full}: page unreachable after 4 attempts")
+                    print(f"Pagination stopped at page {page_num} for {catalog_url_full}: page unreachable after retries -- PULL IS INCOMPLETE")
+                    complete = False
                     break
                 if not new_on_this_page:
                     # All 4 attempts on this page genuinely returned zero new
@@ -1098,8 +1110,9 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
 
             await browser.close()
     except Exception as e:
-        print(f"Browser lot fetch failed for {catalog_url_full}: {type(e).__name__}: {e}")
-    return {"lots": lots, "state": state, "zip_code": zip_code, "country": country}
+        print(f"Browser lot fetch failed for {catalog_url_full}: {type(e).__name__}: {e} -- PULL IS INCOMPLETE ({len(lots)} lots collected before failure)")
+        complete = False
+    return {"lots": lots, "state": state, "zip_code": zip_code, "country": country, "complete": complete}
 
 
 async def _pull_lots_for_queued_catalogs(supabase_client, business_id: str) -> dict:
@@ -1159,8 +1172,14 @@ async def _pull_lots_for_queued_catalogs(supabase_client, business_id: str) -> d
                     _fetch_catalog_lots_via_browser(real_url, catalog_slug), timeout=600.0
                 )
                 lots = fetch_result["lots"]
-                if lots:
+                if lots and fetch_result.get("complete", False):
                     break
+                if lots and not fetch_result.get("complete", False):
+                    # Got SOME lots but the pull died before the real end --
+                    # this was the silent partial-data bug: previously any
+                    # nonzero lot count was treated as a full success.
+                    print(f"Lot pull attempt {retry_num}/{max_attempts} for {catalog_url}: INCOMPLETE ({len(lots)} lots before failure), retrying from scratch")
+                    continue
                 if fetch_result.get("country") and fetch_result["country"].lower() not in ("united states", "usa", "us"):
                     # Confirmed non-US -- retrying won't change the country,
                     # stop wasting time/requests on this catalog.
@@ -1172,7 +1191,9 @@ async def _pull_lots_for_queued_catalogs(supabase_client, business_id: str) -> d
             except Exception as e:
                 print(f"Lot pull attempt {retry_num}/{max_attempts} for {catalog_url} failed: {type(e).__name__}: {e}")
         if lots:
-            succeeded += 1
+            pull_complete = fetch_result.get("complete", False)
+            if pull_complete:
+                succeeded += 1
             rows_to_upsert = [
                 {"business_id": business_id, "catalog_url": catalog_url, "lot_number": lot["lot_number"],
                  "description": lot["description"], "last_seen_at": datetime.now(timezone.utc).isoformat(),
@@ -1186,13 +1207,18 @@ async def _pull_lots_for_queued_catalogs(supabase_client, business_id: str) -> d
                     rows_to_upsert, on_conflict="business_id,catalog_url,lot_number"
                 ).execute()
                 total_lots_written += len(rows_to_upsert)
-                # A successful automated pull is treated the same as the VA
-                # having handled this catalog manually -- clears it from the
-                # front-facing queue. Without this, the queue never empties
-                # even when the automation is working perfectly.
-                supabase_client.table("catalog_updates_queue").update(
-                    {"resolved": True}
-                ).eq("business_id", business_id).eq("catalog_url", catalog_url).execute()
+                if pull_complete:
+                    # A COMPLETE automated pull is treated the same as the VA
+                    # having handled this catalog manually -- clears it from
+                    # the front-facing queue. A partial pull deliberately does
+                    # NOT resolve: its lots are saved (upsert -- a later full
+                    # pull just fills in the rest), but the catalog stays in
+                    # the queue so the next 12h cycle finishes the job.
+                    supabase_client.table("catalog_updates_queue").update(
+                        {"resolved": True}
+                    ).eq("business_id", business_id).eq("catalog_url", catalog_url).execute()
+                else:
+                    print(f"Wrote {len(rows_to_upsert)} PARTIAL lots for {catalog_url} -- left in queue for the next cycle")
             except Exception as e:
                 print(f"Failed to write lots for {catalog_url}: {e}")
         try:
