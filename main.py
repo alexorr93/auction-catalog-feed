@@ -975,9 +975,20 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
     filter and detecting a flaky click (checked state) before submitting."""
     from playwright.async_api import async_playwright
     from urllib.parse import quote
+    import uuid
     wss_url = os.environ.get("BRIGHT_DATA_BROWSER_WSS")
     if not wss_url:
         return {"lots": [], "state": None, "zip_code": None, "complete": False}
+    # One Bright Data session ID per CATALOG (not per page, not one for the
+    # whole app). Proxy.useSession (a Bright Data CDP extension) pins every
+    # fresh browser connection below to the SAME underlying proxy peer/IP --
+    # this is their documented middle ground between one long-lived browser
+    # connection (degrades mid-catalog, confirmed earlier tonight) and a
+    # truly new connection per page (may trip the zone's concurrent-session
+    # limit, which matches tonight's Client connect timeout/ETIMEDOUT
+    # errors). Each page still gets its own Playwright browser/page object
+    # (avoids the content-race issues), but they all share one proxy peer.
+    session_id = f"catalog-{catalog_slug}-{uuid.uuid4().hex[:8]}"
     lots = []
     state = None
     zip_code = None
@@ -1007,6 +1018,15 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
         browser = await pw.chromium.connect_over_cdp(wss_url, timeout=120000)
         try:
             page = await browser.new_page()
+            # Pin this connection to the catalog's shared proxy peer before
+            # navigating -- Bright Data CDP extension, must be called before
+            # goto(). If this fails for any reason, fall back to no pinning
+            # rather than aborting the whole fetch over it.
+            try:
+                cdp_client = await page.context.new_cdp_session(page)
+                await cdp_client.send("Proxy.useSession", {"sessionId": session_id})
+            except Exception as e:
+                print(f"Proxy.useSession failed (continuing without pinning): {type(e).__name__}: {e}")
             # Bright Data's own guidance: navigation timeout must be >=60s
             # (they recommend 120s) -- their unlocking (proxy rotation,
             # fingerprinting, CAPTCHA solving) runs DURING this navigation
