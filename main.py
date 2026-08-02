@@ -987,7 +987,7 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
     # silently treating whatever was collected as the full catalog.
     complete = True
     lot_pattern = re.compile(
-        r'href="(/en-us/auction-catalogues/([a-z0-9]+)/catalogue-id-([a-z0-9\-]+)/lot-[a-z0-9\-]+)"[^>]*data-click-type="title"[^>]*>\s*<span class="lot-number">(\d+)</span><span class="lot-title">([^<]+)</span>',
+        r'href="(/en-us/auction-catalogues/([a-z0-9]+)/catalogue-id-([a-z0-9\-]+)/lot-[a-z0-9\-]+)"[^>]*data-click-type="title"[^>]*>\s*<span class="lot-number">([^<]+)</span><span class="lot-title">([^<]+)</span>',
         re.I
     )
 
@@ -1075,11 +1075,13 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
                 # 2 still catches a one-off soft-block page.
                 for page_attempt in range(1, 3):
                     try:
-                        # domcontentloaded instead of full "load": the lot cards are in
-                        # the HTML at DOM-ready; waiting for every proxied asset to
-                        # finish loading was the cause of the recurring 30s timeouts.
-                        await page.goto(next_url, timeout=30000, wait_until="domcontentloaded")
-                        await page.wait_for_timeout(2000)
+                        # domcontentloaded instead of full "load"; on the LAST
+                        # attempt fall back to "commit" (returns as soon as the
+                        # response starts) -- some archived catalogs hang even
+                        # DOMContentLoaded, but their HTML still arrives.
+                        wait_mode = "domcontentloaded" if page_attempt < 2 else "commit"
+                        await page.goto(next_url, timeout=30000, wait_until=wait_mode)
+                        await page.wait_for_timeout(2000 if wait_mode == "domcontentloaded" else 5000)
                         page_html = await page.content()
                     except Exception as e:
                         print(f"Page {page_num} attempt {page_attempt}/2 failed for {catalog_url_full}: {type(e).__name__}: {e}")
