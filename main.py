@@ -1058,7 +1058,6 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
             # any mixed-in results, which was the radio click's only job.
             # The flaky click was the other half of the 0-lot runs.
             seen_lot_numbers = set()
-            pages_since_new = 0
             MAX_PAGES = 60  # hard ceiling
             for page_num in range(1, MAX_PAGES + 1):
                 next_url = _page_url(page_num)
@@ -1077,25 +1076,22 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
                     new_on_this_page = [l for l in page_lots if l[0] not in seen_lot_numbers]
                     if new_on_this_page:
                         break
-                    if page_num == 1 or pages_since_new == 0:
-                        # First page, or first empty page right after real
-                        # results: could be a soft block -- retry fresh.
-                        print(f"Page {page_num} attempt {page_attempt}/3 for {catalog_url_full}: fetched OK but 0 new lots, retrying with a fresh session")
-                        await asyncio.sleep(1.5)
-                    else:
-                        break
+                    # Every page ALWAYS gets all 3 fresh-session attempts before
+                    # 0 lots is trusted as real end -- no shortcuts based on
+                    # page position. A single unlucky page was previously
+                    # enough to falsely end the whole pull early.
+                    print(f"Page {page_num} attempt {page_attempt}/3 for {catalog_url_full}: fetched OK but 0 new lots, retrying with a fresh session")
+                    await asyncio.sleep(1.5)
                 if not got_real_page:
                     print(f"Pagination stopped at page {page_num} for {catalog_url_full}: page unreachable after 3 fresh-session attempts -- PULL IS INCOMPLETE")
                     complete = False
                     break
                 if not new_on_this_page:
-                    pages_since_new += 1
                     if page_num == 1:
-                        # Page 1 empty after all retries: nothing to pull (or
-                        # blocked hard) -- incomplete unless truly no lots.
+                        # Page 1 empty after all 3 retries: nothing to pull
+                        # (or blocked hard) -- incomplete, not "0 lots total".
                         complete = False
                     break
-                pages_since_new = 0
                 for lot_num, lot_title in new_on_this_page:
                     seen_lot_numbers.add(lot_num)
                     lots.append({"lot_number": lot_num, "description": lot_title})
@@ -1334,7 +1330,9 @@ async def _debug_single_catalog_test() -> None:
 
 @app.on_event("startup")
 async def _start_bidspotter_scan_loop():
-    if os.environ.get("TEST_CATALOG_SLUG") or os.environ.get("TEST_CATALOG_URLS"):
+    if os.environ.get("TEST_FIND_LOT_COUNT"):
+        asyncio.create_task(_debug_find_lot_count_display())
+    elif os.environ.get("TEST_CATALOG_SLUG") or os.environ.get("TEST_CATALOG_URLS"):
         # Isolated single-catalog mode -- daily loop stays OFF so there is
         # exactly ONE Bright Data browser session, no competition.
         asyncio.create_task(_debug_single_catalog_test())
