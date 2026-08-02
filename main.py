@@ -1261,10 +1261,38 @@ async def _debug_find_lot_count_display() -> None:
         print(f"=== LOT COUNT DISPLAY DEBUG FAILED: {type(e).__name__}: {e} ===")
     print("=== END LOT COUNT DISPLAY DEBUG ===")
 
+async def _debug_single_catalog_test() -> None:
+    """TEMP. Runs ONE catalog, alone, with the daily loop disabled -- no
+    competing Bright Data browser session, which is what corrupted the last
+    isolated test (211/395 while the full batch ran alongside it). Set
+    TEST_CATALOG_SLUG + TEST_CATALOG_URL to pick the target."""
+    slug = os.environ.get("TEST_CATALOG_SLUG")
+    url = os.environ.get("TEST_CATALOG_URL")
+    if not (slug and url):
+        print("=== SINGLE CATALOG TEST: TEST_CATALOG_SLUG/URL not set, skipping ===")
+        return
+    print(f"=== SINGLE CATALOG TEST (isolated, nothing else running): {url} ===")
+    try:
+        result = await asyncio.wait_for(
+            _fetch_catalog_lots_via_browser(url, slug), timeout=900.0
+        )
+        lots = result.get("lots", [])
+        nums = sorted(int(l["lot_number"]) for l in lots if l["lot_number"].isdigit())
+        print(f"=== SINGLE CATALOG TEST RESULT: {len(lots)} lots | range {nums[0] if nums else '-'}-{nums[-1] if nums else '-'} | state={result.get('state')} zip={result.get('zip_code')} country={result.get('country')} ===")
+    except asyncio.TimeoutError:
+        print("=== SINGLE CATALOG TEST: timed out at 900s ===")
+    except Exception as e:
+        print(f"=== SINGLE CATALOG TEST FAILED: {type(e).__name__}: {e} ===")
+    print("=== END SINGLE CATALOG TEST ===")
+
 @app.on_event("startup")
 async def _start_bidspotter_scan_loop():
-    asyncio.create_task(_debug_find_lot_count_display())
-    asyncio.create_task(_daily_bidspotter_scan_loop())
+    if os.environ.get("TEST_CATALOG_SLUG"):
+        # Isolated single-catalog mode -- daily loop stays OFF so there is
+        # exactly ONE Bright Data browser session, no competition.
+        asyncio.create_task(_debug_single_catalog_test())
+    else:
+        asyncio.create_task(_daily_bidspotter_scan_loop())
 
 @app.api_route("/api/updates/trigger-scan", methods=["GET", "POST"])
 async def api_trigger_scan():
