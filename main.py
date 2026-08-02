@@ -1259,6 +1259,10 @@ def _scan_for_count(html: str, label: str) -> None:
     # number -- this is what fired above, need the real key name it belongs to.
     for m in list(re.finditer(r'.{60}[Ii]tems?.{20}', html))[:15]:
         print(f"[{label}] ITEMS-CONTEXT: ...{m.group(0)!r}...")
+    # Go straight at the literal number that fired the N-Items match earlier
+    # (858) -- the generic "Items" dump above was swamped by unrelated CSS.
+    for m in list(re.finditer(r'.{50}858.{50}', html))[:10]:
+        print(f"[{label}] 858-CONTEXT: ...{m.group(0)!r}...")
 
 async def _debug_find_lot_count_display() -> None:
     """TEMP, runs immediately at startup. The user can see a real total lot
