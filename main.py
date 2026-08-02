@@ -1292,6 +1292,37 @@ async def _debug_single_catalog_test() -> None:
     competing Bright Data browser session, which is what corrupted the last
     isolated test (211/395 while the full batch ran alongside it). Set
     TEST_CATALOG_SLUG + TEST_CATALOG_URL to pick the target."""
+    # Multi-catalog mode: TEST_CATALOG_URLS = comma-separated full catalog
+    # URLs, slug derived from each. Runs them one after another (still only
+    # ONE Bright Data session at a time), reporting lots + completeness for
+    # each -- built to verify LONG catalogs pull fully, without running the
+    # whole Job 1 scan or the entire queue.
+    urls_env = os.environ.get("TEST_CATALOG_URLS")
+    if urls_env:
+        targets = []
+        for u in urls_env.split(","):
+            u = u.strip().rstrip("/")
+            m = re.search(r'catalogue-id-([a-z0-9\-]+)$', u, re.I)
+            if m:
+                targets.append((u, m.group(1)))
+            else:
+                print(f"=== CATALOG TEST: could not parse slug from {u}, skipping ===")
+        print(f"=== CATALOG TEST: {len(targets)} catalogs, sequential ===")
+        for u, s in targets:
+            print(f"=== CATALOG TEST START: {u} ===")
+            try:
+                result = await asyncio.wait_for(
+                    _fetch_catalog_lots_via_browser(u, s), timeout=900.0
+                )
+                lots = result.get("lots", [])
+                nums = sorted(int(l["lot_number"]) for l in lots if l["lot_number"].isdigit())
+                print(f"=== CATALOG TEST RESULT: {len(lots)} lots | range {nums[0] if nums else '-'}-{nums[-1] if nums else '-'} | complete={result.get('complete')} | state={result.get('state')} zip={result.get('zip_code')} country={result.get('country')} | {u} ===")
+            except asyncio.TimeoutError:
+                print(f"=== CATALOG TEST: timed out at 900s | {u} ===")
+            except Exception as e:
+                print(f"=== CATALOG TEST FAILED: {type(e).__name__}: {e} | {u} ===")
+        print("=== END CATALOG TESTS ===")
+        return
     slug = os.environ.get("TEST_CATALOG_SLUG")
     url = os.environ.get("TEST_CATALOG_URL")
     if not (slug and url):
@@ -1313,7 +1344,7 @@ async def _debug_single_catalog_test() -> None:
 
 @app.on_event("startup")
 async def _start_bidspotter_scan_loop():
-    if os.environ.get("TEST_CATALOG_SLUG"):
+    if os.environ.get("TEST_CATALOG_SLUG") or os.environ.get("TEST_CATALOG_URLS"):
         # Isolated single-catalog mode -- daily loop stays OFF so there is
         # exactly ONE Bright Data browser session, no competition.
         asyncio.create_task(_debug_single_catalog_test())
