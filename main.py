@@ -1164,6 +1164,13 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
                         print(f"[EMPTY PAGE DIAGNOSTIC] page {page_num}: html_length={len(page_html)} title={title_match.group(1) if title_match else None!r}")
                         print(f"[EMPTY PAGE DIAGNOSTIC] contains 'awswaf'={('awswaf' in page_html)} contains 'captcha'={('captcha' in page_html.lower())} contains 'lot-number'={('lot-number' in page_html)} contains 'catalogueSearchOption'={('catalogueSearchOption' in page_html)} contains catalog_slug={(catalog_slug.lower() in page_html.lower())}")
                         print(f"[EMPTY PAGE DIAGNOSTIC] first 300 chars: {page_html[:300]!r}")
+                        # lot-number IS present but our regex matched zero --
+                        # dump the raw markup around the first occurrence to
+                        # see what actually differs from what the regex
+                        # expects, instead of guessing at another pattern.
+                        ln_idx = page_html.find("lot-number")
+                        if ln_idx != -1:
+                            print(f"[EMPTY PAGE DIAGNOSTIC] raw markup around first lot-number: {page_html[max(0,ln_idx-400):ln_idx+200]!r}")
                     await asyncio.sleep(1.5)
                 return got_real_page, new_on_this_page
 
