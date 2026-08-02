@@ -1024,6 +1024,20 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
             # entirely instead of trying to time around the race.
             response = await page.goto(target_url, timeout=120000, wait_until="domcontentloaded")
             if response is not None:
+                # Bright Data returns real machine-readable error info in
+                # these headers on proxy-level problems (rate limit, IP
+                # block, account/KYC issue, etc.) -- check every response,
+                # not just failures, since a "successful" 200 with 0 lots
+                # could still be a soft block reported this way.
+                try:
+                    hdrs = response.headers
+                    brd_err_code = hdrs.get("x-brd-err-code")
+                    brd_err_msg = hdrs.get("x-brd-err-msg")
+                    proxy_status = hdrs.get("proxy-status")
+                    if brd_err_code or brd_err_msg or proxy_status:
+                        print(f"[BRIGHTDATA ERROR HEADERS] status={response.status} code={brd_err_code!r} msg={brd_err_msg!r} proxy-status={proxy_status!r} url={target_url}")
+                except Exception:
+                    pass
                 # Read the body IMMEDIATELY, not after a wait -- confirmed
                 # via live testing that the previous 1.5s delay here caused
                 # Bright Data's remote browser to evict the response buffer
