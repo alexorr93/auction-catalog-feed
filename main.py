@@ -1077,7 +1077,27 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
 
     try:
         async with async_playwright() as pw:
-            browser, page = await _open_fresh_session_and_search(pw)
+            browser = None
+            page = None
+            last_open_error = None
+            for open_attempt in range(1, 4):
+                try:
+                    browser, page = await _open_fresh_session_and_search(pw)
+                    last_open_error = None
+                    break
+                except Exception as e:
+                    last_open_error = e
+                    print(f"Initial session open/search-submit attempt {open_attempt}/3 failed for {catalog_url_full}: {type(e).__name__}: {e}")
+                    if browser is not None:
+                        try:
+                            await browser.close()
+                        except Exception:
+                            pass
+                        browser = None
+            if last_open_error is not None:
+                print(f"Could not open a session for {catalog_url_full} after 3 attempts -- PULL IS INCOMPLETE")
+                return {"lots": [], "state": None, "zip_code": None, "country": None, "complete": False}
+
             if country and country.lower() not in ("united states", "usa", "us"):
                 print(f"Skipping non-US catalog ({country}): {catalog_url_full}")
                 try:
