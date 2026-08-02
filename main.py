@@ -1014,7 +1014,13 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
             initial_html = await page.content()
 
             def _itemprop(name: str) -> str:
-                m = re.search(rf'<span itemprop="{name}"[^>]*>([^<]*)</span>', initial_html)
+                # BidSpotter varies: <span itemprop="x">val</span> on some
+                # pages, <meta itemprop="x" content="val"> on others, and
+                # attribute order isn't consistent. Empty country here was
+                # how UK catalogs slipped past the non-US skip.
+                m = re.search(rf'<[^>]*itemprop="{name}"[^>]*\scontent="([^"]*)"', initial_html)
+                if not m:
+                    m = re.search(rf'<[^>]*itemprop="{name}"[^>]*>([^<]*)<', initial_html)
                 val = (m.group(1).strip() if m else "")
                 return val if val and val != "." else ""
 
