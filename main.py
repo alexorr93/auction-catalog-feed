@@ -1520,6 +1520,41 @@ async def _debug_capture_network() -> None:
             else:
                 print("=== NETWORK CAPTURE: no auction GUID found in captured URLs, cannot probe ===")
 
+            # All 5 guessed endpoint names failed -- read the ACTUAL Angular
+            # JS source that renders the search results (these exact files
+            # were captured above) and grep for the real endpoint URL it
+            # calls, instead of guessing more names.
+            js_files = [
+                "https://www.bidspotter.com/js/controls/search?v=0INMo08eeB72t5JMHu8K8UxJoTZYESW1BUFC4pXK1SY1",
+                "https://www.bidspotter.com/js/lot/auctioncataloguedetails?v=FBUR22a_mlT2kObYC6FaCuNfyxNMWO4bIptGgS9RSs41",
+                "https://www.bidspotter.com/js/controls/searchbox?v=1fgPenCdjBFuZ0NRdz0dhS7voK16PpPCyk0O2H6374I1",
+                "https://www.bidspotter.com/js/controls/searchassist?v=U1rG3LQbQ1QAoRYxbC594TLlSVIlq66PVHI5VQP1yTs1",
+            ]
+            for js_url in js_files:
+                print(f"=== NETWORK CAPTURE: fetching JS source {js_url} ===")
+                try:
+                    js_text = await page.evaluate(
+                        """async (url) => {
+                            const r = await fetch(url, {credentials: 'include'});
+                            return await r.text();
+                        }""",
+                        js_url
+                    )
+                    # Look for API-looking paths in the source: anything
+                    # under /en-us/ that isn't an obvious static asset, plus
+                    # explicit fetch/ajax/get/post calls with a URL string.
+                    found_paths = set(re.findall(r'["\'](/en-us/[a-zA-Z0-9_\-/]+)["\']', js_text))
+                    ajax_calls = re.findall(r'(?:url|action)\s*[:=]\s*["\']([^"\']{5,80})["\']', js_text)
+                    print(f"[JS SOURCE {js_url}] length={len(js_text)} chars")
+                    if found_paths:
+                        print(f"[JS SOURCE PATHS] {sorted(found_paths)[:30]}")
+                    if ajax_calls:
+                        print(f"[JS SOURCE URL/ACTION FIELDS] {ajax_calls[:30]}")
+                    if not found_paths and not ajax_calls:
+                        print(f"[JS SOURCE SNIPPET] {js_text[:400]!r}")
+                except Exception as e:
+                    print(f"[JS SOURCE FAILED] {js_url}: {type(e).__name__}: {e}")
+
             await browser.close()
 
         print(f"=== NETWORK CAPTURE: {len(captured)} TOTAL candidate responses ===")
