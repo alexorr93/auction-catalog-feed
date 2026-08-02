@@ -1040,6 +1040,7 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
             # tonight's recurring "fetched OK but 0 lots" failures.
             try:
                 await page.goto(catalog_url_full, timeout=120000, wait_until="domcontentloaded")
+                await page.wait_for_selector("#catalogueSearchOption", timeout=30000, state="visible")
                 await page.click("#catalogueSearchOption", timeout=5000)
                 await page.click("#searchSubmit", timeout=5000)
                 await page.wait_for_load_state("domcontentloaded", timeout=30000)
