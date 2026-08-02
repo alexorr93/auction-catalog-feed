@@ -1425,9 +1425,79 @@ async def _debug_single_catalog_test() -> None:
         print(f"=== SINGLE CATALOG TEST FAILED: {type(e).__name__}: {e} ===")
     print("=== END SINGLE CATALOG TEST ===")
 
+async def _debug_capture_network() -> None:
+    """TEMP, runs at startup. Loads a real catalog page + does the search-
+    submit flow the real pull does, but instead of reading the final HTML,
+    listens to every network response the PAGE ITSELF makes while doing it.
+    If BidSpotter's own Angular frontend fetches lot data from a JSON API
+    under the hood (rather than the page being server-rendered), this finds
+    the real URL -- which would let us hit that API directly instead of
+    browser-scraping rendered HTML, sidestepping tonight's entire class of
+    timeout/session problems. Set TEST_CAPTURE_NETWORK=1."""
+    from playwright.async_api import async_playwright
+    from urllib.parse import quote
+    wss_url = os.environ.get("BRIGHT_DATA_BROWSER_WSS")
+    if not wss_url:
+        print("=== NETWORK CAPTURE: BRIGHT_DATA_BROWSER_WSS not set, skipping ===")
+        return
+    catalog_url = "https://www.bidspotter.com/en-us/auction-catalogues/bsctabauc/catalogue-id-tab-au10058"
+    captured = []
+
+    def _on_response(response):
+        try:
+            ct = response.headers.get("content-type", "")
+            url = response.url
+            if "json" in ct.lower() or re.search(r'/api/|/lots?/|search', url, re.I):
+                captured.append((response.status, ct, url))
+        except Exception:
+            pass
+
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.connect_over_cdp(wss_url, timeout=120000)
+            page = await browser.new_page()
+            page.on("response", _on_response)
+
+            print(f"=== NETWORK CAPTURE: loading {catalog_url} ===")
+            await page.goto(catalog_url, timeout=120000, wait_until="load")
+            await page.wait_for_timeout(3000)
+            print(f"=== NETWORK CAPTURE: {len(captured)} candidate responses after initial load ===")
+
+            print("=== NETWORK CAPTURE: doing search-submit (In this auction) ===")
+            try:
+                await page.click("#catalogueSearchOption", timeout=5000)
+                await page.click("#searchSubmit", timeout=5000)
+                await page.wait_for_load_state("load", timeout=30000)
+                await page.wait_for_timeout(3000)
+            except Exception as e:
+                print(f"=== NETWORK CAPTURE: search-submit failed: {type(e).__name__}: {e} ===")
+            print(f"=== NETWORK CAPTURE: {len(captured)} candidate responses after search-submit ===")
+
+            print("=== NETWORK CAPTURE: navigating to page=2 ===")
+            try:
+                path_part = catalog_url.replace("https://www.bidspotter.com", "")
+                where_to_search = quote(path_part, safe="")
+                page2_url = f"{catalog_url}?searchTerm=&whereToSearch={where_to_search}&page=2"
+                await page.goto(page2_url, timeout=120000, wait_until="load")
+                await page.wait_for_timeout(3000)
+            except Exception as e:
+                print(f"=== NETWORK CAPTURE: page=2 nav failed: {type(e).__name__}: {e} ===")
+            print(f"=== NETWORK CAPTURE: {len(captured)} candidate responses after page=2 ===")
+
+            await browser.close()
+
+        print(f"=== NETWORK CAPTURE: {len(captured)} TOTAL candidate responses ===")
+        for status, ct, url in captured[:40]:
+            print(f"[CAPTURED] {status} | {ct} | {url}")
+    except Exception as e:
+        print(f"=== NETWORK CAPTURE FAILED: {type(e).__name__}: {e} ===")
+    print("=== END NETWORK CAPTURE ===")
+
 @app.on_event("startup")
 async def _start_bidspotter_scan_loop():
-    if os.environ.get("TEST_FIND_LOT_COUNT"):
+    if os.environ.get("TEST_CAPTURE_NETWORK"):
+        asyncio.create_task(_debug_capture_network())
+    elif os.environ.get("TEST_FIND_LOT_COUNT"):
         asyncio.create_task(_debug_find_lot_count_display())
     elif os.environ.get("TEST_CATALOG_SLUG") or os.environ.get("TEST_CATALOG_URLS"):
         # Isolated single-catalog mode -- daily loop stays OFF so there is
