@@ -1055,7 +1055,7 @@ async def _fetch_catalog_lots_via_browser(catalog_url_full: str, catalog_slug: s
                     # and just dispatches the click directly.
                     await page.click("#catalogueSearchOption", timeout=15000, force=True)
                     await page.click("#searchSubmit", timeout=15000, force=True)
-                    await page.wait_for_load_state("domcontentloaded", timeout=30000)
+                    await page.wait_for_load_state("domcontentloaded", timeout=90000)
                 except Exception as e:
                     print(f"Search-submit context setup failed for {target_url}: {type(e).__name__}: {e} (continuing anyway -- extraction will correctly find 0 lots if this didn't work)")
 
