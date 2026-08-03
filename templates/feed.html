@@ -32,6 +32,9 @@ a:hover { color: #93c5fd; }
 .upload-btn:hover { border-color: var(--accent); }
 .spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.7s linear infinite; vertical-align: -2px; margin-right: 6px; }
 @keyframes spin { to { transform: rotate(360deg); } }
+tr.row-viewed { background: rgba(248,113,113,0.35) !important; border-left: 4px solid #f87171; }
+tr.row-viewed td { border-bottom-color: rgba(248,113,113,0.4); }
+.viewed-badge { display: inline-block; background: #f87171; color: #1a0505; font-weight: 800; font-size: 10px; letter-spacing: .04em; padding: 2px 7px; border-radius: 5px; margin-left: 8px; vertical-align: middle; }
 </style>
 </head>
 <body>
@@ -522,17 +525,16 @@ async function loadUpdatesToMake() {
       const isBlank = !!it.blank_marked_at;
       const isViewed = viewedCatalogUrls.has(it.catalog_url);
       const bidspotterUrl = reconstructBidspotterUrl(it.catalog_url);
-      const styleParts = [];
-      if (isBlank) styleParts.push('opacity:0.55;');
-      if (isViewed) styleParts.push('background:rgba(248,113,113,0.15);');
-      const rowStyle = styleParts.length ? ` style="${styleParts.join('')}"` : '';
+      const rowClass = isViewed ? ' class="row-viewed"' : '';
+      const rowStyle = isBlank ? ' style="opacity:0.55;"' : '';
+      const viewedBadge = isViewed ? ` <span class="viewed-badge">👁️ VIEWING</span>` : '';
       const statusCell = isBlank
         ? `<span class="muted">🚫 Marked blank ${new Date(it.blank_marked_at).toLocaleDateString()}</span>`
         : `<span style="color:var(--accent);font-weight:700;">📋 Needs review</span>`;
-      html += `<tr${rowStyle}>
-        <td>${escapeHtml(it.title || it.catalog_url)}</td>
+      html += `<tr${rowClass}${rowStyle} id="row-${escapeHtml(it.id)}">
+        <td>${escapeHtml(it.title || it.catalog_url)}${viewedBadge}</td>
         <td>${statusCell}</td>
-        <td>${bidspotterUrl ? `<a href="${bidspotterUrl}" target="_blank" rel="noopener noreferrer" onclick="markRowViewed('${it.catalog_url.replace(/'/g, "\\'")}', this)">View on BidSpotter</a>` : ''}</td>
+        <td>${bidspotterUrl ? `<a href="${bidspotterUrl}" target="_blank" rel="noopener noreferrer" onclick="markRowViewed('${it.catalog_url.replace(/'/g, "\\'")}', '${it.id}')">View on BidSpotter</a>` : ''}</td>
         <td style="white-space:nowrap;">
           <button class="btn" onclick="uploadForRow('${it.catalog_url.replace(/'/g, "\\'")}', this)">📄 Upload PDF</button>
           ${isBlank ? '' : `<button class="btn" style="margin-left:6px;" onclick="markBlank('${it.id}', this)">🚫 Mark Blank</button>`}
@@ -546,13 +548,23 @@ async function loadUpdatesToMake() {
   }
 }
 
-function markRowViewed(catalogUrl, linkEl) {
+function markRowViewed(catalogUrl, queueId) {
   // Link opens in a new tab (target="_blank"), so this tab never
-  // navigates away -- safe to update the row's own color immediately
-  // instead of waiting for the next poll cycle to pick up viewedCatalogUrls.
+  // navigates away -- safe to update the row immediately instead of
+  // waiting for the next poll cycle to pick up viewedCatalogUrls.
   viewedCatalogUrls.add(catalogUrl);
-  const row = linkEl.closest('tr');
-  if (row) row.style.background = 'rgba(248,113,113,0.15)';
+  const row = document.getElementById(`row-${queueId}`);
+  if (row && !row.classList.contains('row-viewed')) {
+    row.classList.add('row-viewed');
+    const titleCell = row.querySelector('td');
+    if (titleCell && !titleCell.querySelector('.viewed-badge')) {
+      const badge = document.createElement('span');
+      badge.className = 'viewed-badge';
+      badge.textContent = '👁️ VIEWING';
+      titleCell.appendChild(document.createTextNode(' '));
+      titleCell.appendChild(badge);
+    }
+  }
 }
 
 async function markBlank(queueId, btnEl) {
