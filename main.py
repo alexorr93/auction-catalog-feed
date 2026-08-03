@@ -809,19 +809,36 @@ def _parse_bidspotter_listing_page_from_dom(html: str) -> list:
                         end_date = m.group(1).strip()
                         break
             if category_count == 0 and "cannot load data" in card_text.lower():
-                # REAL FIX (from actual diagnostic evidence, not a guess):
-                # confirmed live for Pace Industries - AR - Day 2 -- the
-                # widest card text ends in "...Cannot load data Metalworking
-                # Coming soon...". "Cannot load data" is BidSpotter's OWN
-                # placeholder for a widget that failed to render client-side
-                # -- it is NOT the same thing as a widget that rendered and
-                # genuinely found zero categories. Treating it as confirmed-
-                # zero was silently writing real, upcoming auctions as
-                # blank. Fail open here the same way an outright fetch
-                # failure already does elsewhere in this file, instead of
-                # confirming blank off an inconclusive/unrendered widget.
-                print(f"Job 1: {catalog_url} shows 'Cannot load data' (widget failed to render, not a real zero) -- failing open instead of confirming blank")
-                category_count = 1
+                if "coming soon" in card_text.lower():
+                    # REAL FIX: "Coming soon" is BidSpotter's own plain-text
+                    # confirmation that nothing is posted yet -- this is NOT
+                    # the same ambiguous case as a widget that failed to
+                    # render with no other signal. Confirmed live by direct
+                    # user check: bscmayn10437 (Pace Industries - AR - Day
+                    # 2) really is blank on the actual site right now, but
+                    # the previous version of this fail-open logic forced it
+                    # to category_count=1 anyway because "Cannot load data"
+                    # was present, treating a genuine "not posted yet" as a
+                    # rendering glitch. Trust the explicit "Coming soon"
+                    # signal and leave category_count at 0 (confirmed
+                    # blank) instead of failing open here.
+                    print(f"Job 1: {catalog_url} shows 'Cannot load data' + 'Coming soon' -- BidSpotter's own confirmation nothing is posted yet, trusting the 0")
+                else:
+                    # REAL FIX (from actual diagnostic evidence, not a guess):
+                    # confirmed live for Pace Industries - AR - Day 2 -- the
+                    # widest card text ends in "...Cannot load data Metalworking
+                    # Coming soon...". "Cannot load data" is BidSpotter's OWN
+                    # placeholder for a widget that failed to render client-side
+                    # -- it is NOT the same thing as a widget that rendered and
+                    # genuinely found zero categories. Treating it as confirmed-
+                    # zero was silently writing real, upcoming auctions as
+                    # blank. Fail open here the same way an outright fetch
+                    # failure already does elsewhere in this file, instead of
+                    # confirming blank off an inconclusive/unrendered widget --
+                    # but ONLY when there's no "Coming soon" telling us
+                    # otherwise (see above).
+                    print(f"Job 1: {catalog_url} shows 'Cannot load data' with no 'Coming soon' signal (widget failed to render, genuinely ambiguous) -- failing open instead of confirming blank")
+                    category_count = 1
         if catalog_url not in best_by_url:
             best_by_url[catalog_url] = {"full_url": full_url, "title": title, "end_date": end_date, "category_count": category_count}
             order.append(catalog_url)
