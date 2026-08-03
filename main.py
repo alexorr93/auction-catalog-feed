@@ -762,30 +762,10 @@ def _parse_bidspotter_listing_page_from_dom(html: str) -> list:
             # An earlier anchor for this same catalog had no text (the
             # image-wrapper) -- this later one does, so use it.
             best_by_url[catalog_url]["title"] = title
-
-    # Category-tag count per catalog -- same proven signal Job 2 already
-    # uses (search-filter?CategoryCode= links), just read here for free off
-    # the SAME page load instead of a separate per-catalog fetch. A card
-    # with genuinely zero lots shows none of these; a card with real lots
-    # shows one per category with items in it. Matched by the catalogue-id
-    # token embedded in both the card's title link and its category links
-    # (e.g. .../catalogue-id-eama-g11747/search-filter?CategoryCode=CAR).
-    category_count_by_id = {}
-    for m in re.finditer(r'catalogue-id-([a-z0-9\-]+)/search-filter\?[^"]*CategoryCode=', html, re.I):
-        cid = m.group(1).lower()
-        category_count_by_id[cid] = category_count_by_id.get(cid, 0) + 1
-    id_re = re.compile(r'catalogue-id-([a-z0-9\-]+)', re.I)
-
-    listings = []
-    for u in order:
-        if not best_by_url[u]["title"]:
-            continue  # still require SOME real title before including it
-        full_url = best_by_url[u]["full_url"]
-        id_m = id_re.search(full_url)
-        cid = id_m.group(1).lower() if id_m else None
-        category_count = category_count_by_id.get(cid, 0) if cid else 0
-        listings.append({"catalog_url": u, "title": best_by_url[u]["title"], "full_url": full_url,
-                          "category_count": category_count})
+    listings = [
+        {"catalog_url": u, "title": best_by_url[u]["title"], "full_url": best_by_url[u]["full_url"]}
+        for u in order if best_by_url[u]["title"]  # still require SOME real title before including it
+    ]
     return listings
 
 def _update_live_activity(supabase_client, business_id: str, text: str) -> None:
@@ -954,7 +934,7 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
     now_iso = datetime.now(timezone.utc).isoformat()
     snapshot_rows = [
         {"business_id": business_id, "catalog_url": v["catalog_url"], "title": v["title"],
-         "end_date": v.get("end_date"), "scanned_at": now_iso, "last_category_count": v.get("category_count", 0)}
+         "end_date": v.get("end_date"), "scanned_at": now_iso}
         for v in all_listings.values()
     ]
     for i in range(0, len(snapshot_rows), 500):
@@ -989,28 +969,47 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
 
     new_count = 0
     skipped_no_lots_yet = 0
-    for catalog_url, item in all_listings.items():
-        if catalog_url in known_urls:
-            continue
-        # Real fix for the "queue is full of blanks" problem: BidSpotter
-        # itself hasn't posted any lots for this catalog yet (category_count
-        # == 0, read straight off this same page load -- see
-        # _parse_bidspotter_listing_page_from_dom). There is nothing for a
-        # VA or the automation to pull yet no matter what. Skip queuing it
-        # now; it's still snapshotted above, so the very next Job 1 run
-        # picks it up automatically once BidSpotter shows real content.
-        if not item.get("category_count"):
-            skipped_no_lots_yet += 1
-            continue
-        try:
-            supabase_client.table("catalog_updates_queue").upsert({
-                "business_id": business_id, "catalog_url": catalog_url, "title": item["title"],
-                "end_date": item.get("end_date"), "kind": "new", "resolved": False,
-                "category_count": item.get("category_count"),
-            }, on_conflict="business_id,catalog_url").execute()
-            new_count += 1
-        except Exception as e:
-            print(f"BidSpotter scan: failed to queue new catalog {catalog_url}: {e}")
+    candidates = [(catalog_url, item) for catalog_url, item in all_listings.items() if catalog_url not in known_urls]
+    async with httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "Mozilla/5.0"}) as verify_client:
+        for i, (catalog_url, item) in enumerate(candidates, 1):
+            _update_live_activity(supabase_client, business_id, f"Job 1: verifying new catalog {i}/{len(candidates)} actually has lots")
+            real_url = _reconstruct_full_url(catalog_url)
+            category_count = 0
+            if real_url:
+                # REAL FIX: an earlier version of this tried to read category
+                # tags straight off the bulk listing page Job 1 already
+                # loads -- looked right in a one-off check, but confirmed
+                # live it ALWAYS reads 0 in production (that widget loads
+                # via a separate lazy AJAX call per card, not present in the
+                # page by the time Job 1 reads it -- same "Cannot load data"
+                # placeholder visible on the live site). Reverted to the one
+                # mechanism actually proven reliable (Job 2 already uses it
+                # daily): fetch the catalog's OWN individual page, where the
+                # same category tags are real static content, not lazy-
+                # loaded. Costs one extra fetch per NEW catalog only (not
+                # the full listing), which is a small number most runs.
+                try:
+                    resp = await _brightdata_get(verify_client, real_url)
+                    if resp.status_code == 200:
+                        category_count = len(re.findall(r'search-filter\?CategoryCode=', resp.text))
+                except Exception as e:
+                    print(f"Job 1: verify fetch failed for {catalog_url} (queuing anyway rather than losing it): {type(e).__name__}: {e}")
+                    category_count = 1  # fail open -- don't silently drop a real new catalog over a flaky verify fetch
+            else:
+                category_count = 1  # couldn't reconstruct the URL to verify -- fail open, same reasoning as above
+
+            if category_count == 0:
+                skipped_no_lots_yet += 1
+                continue
+            try:
+                supabase_client.table("catalog_updates_queue").upsert({
+                    "business_id": business_id, "catalog_url": catalog_url, "title": item["title"],
+                    "end_date": item.get("end_date"), "kind": "new", "resolved": False,
+                    "category_count": category_count,
+                }, on_conflict="business_id,catalog_url").execute()
+                new_count += 1
+            except Exception as e:
+                print(f"BidSpotter scan: failed to queue new catalog {catalog_url}: {e}")
     return {"ok": True, "error": None, "pages": pages_fetched, "listings": len(all_listings),
             "new_flagged": new_count, "skipped_no_lots_yet": skipped_no_lots_yet}
 
