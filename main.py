@@ -758,20 +758,14 @@ def _parse_bidspotter_listing_page_from_dom(html: str) -> list:
         r'((?:Ends\s+(?:today|from)\s+)?[A-Z][a-z]{2}\s+\d{1,2},\s*\d{4}'
         r'(?:\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)\s*[A-Za-z]{2,3})?)'
     )
-    # REAL FIX (much bigger one): this parser used to return ONLY
-    # catalog_url/title/full_url/end_date, forcing a SEPARATE per-catalog
-    # verify fetch later just to count category tags (the "does this
-    # catalog have real lots yet" signal) -- a second fetch to BidSpotter's
-    # WAF-protected individual pages, which is exactly what's been causing
-    # today's false-blank misclassifications (blocked/placeholder
-    # responses, category widgets not always present on the individual
-    # page). Confirmed live by direct visual proof: the category tags WITH
-    # their real counts (e.g. "Food & Beverage Equipment (70)") are sitting
-    # right here on THIS bulk listing page already, inside each catalog's
-    # own card, as the exact same search-filter?CategoryCode= links this
-    # codebase already trusts as the "has real content" signal elsewhere.
-    # No second fetch needed at all -- extract it directly from the same
-    # successful fetch that's already being used for discovery.
+    # REAL FIX: matches the exact visible text pattern confirmed directly
+    # in a live screenshot -- each category tag renders as "Label (123)"
+    # (e.g. "Food & Beverage Equipment (70)", "Processing (36)"). Reading
+    # the rendered text this way is more reliable than guessing at the
+    # underlying href/markup, which may use different casing or structure
+    # than assumed (the previous href-based attempt read 0 for cards that
+    # visibly show real counts).
+    category_tag_pattern = re.compile(r'[A-Z][A-Za-z&,\'\.\- ]{1,40}?\s\((\d{1,5})\)')
     soup = BeautifulSoup(html, "html.parser")
     best_by_url = {}  # catalog_url -> {"full_url":..., "title": "" or real text, "end_date": ..., "category_count": int}
     order = []
@@ -786,6 +780,7 @@ def _parse_bidspotter_listing_page_from_dom(html: str) -> list:
         title = a.get_text(strip=True)
         end_date = None
         category_count = 0
+        category_count_found = False
         if title:
             node = a
             for _ in range(6):  # small hop count -- stay within this one card, not a whole page/section
@@ -794,11 +789,20 @@ def _parse_bidspotter_listing_page_from_dom(html: str) -> list:
                     break
                 card_text = node.get_text(" ", strip=True)
                 if title in card_text:
+                    # REAL BUG FIXED HERE: capture category tags at the
+                    # FIRST (tightest) matching ancestor only, but keep
+                    # climbing for the date if not found yet -- these two
+                    # signals don't necessarily live at the same DOM depth,
+                    # and stopping the climb the instant title matched
+                    # (regardless of whether a date was found) silently
+                    # broke date capture from ~100% down to ~1%.
+                    if not category_count_found:
+                        category_count = sum(int(n) for n in category_tag_pattern.findall(card_text))
+                        category_count_found = True
                     m = date_pattern.search(card_text)
                     if m:
                         end_date = m.group(1).strip()
-                    category_count = len(node.find_all("a", href=lambda h: h and "search-filter" in h and "CategoryCode=" in h))
-                    break
+                        break
         if catalog_url not in best_by_url:
             best_by_url[catalog_url] = {"full_url": full_url, "title": title, "end_date": end_date, "category_count": category_count}
             order.append(catalog_url)
