@@ -1686,17 +1686,29 @@ async def _daily_bidspotter_scan_loop():
     """Runs once at startup (after a short delay so the app is fully up
     first), then once every 12 hours after that, for every business_id that
     has ever used this app. No manual trigger needed for normal operation --
-    /api/updates/trigger-scan exists purely for on-demand debugging."""
+    /api/updates/trigger-scan exists purely for on-demand debugging.
+
+    PAUSE_SCAN=1 skips this entirely -- added during the Supabase Disk IO
+    Budget incident so the background jobs can be fully silenced (zero
+    further database load) while the budget recovers, without needing a
+    code change/redeploy each time. Checked every cycle, not just once at
+    startup, so flipping it off takes effect on the very next 12h tick too."""
     await asyncio.sleep(30)
     while True:
-        try:
-            supabase_client, _ = _require_config()
-            biz_rows = supabase_client.table("auction_pdf_uploads").select("business_id").limit(1000).execute().data or []
-            business_ids = {r["business_id"] for r in biz_rows}
-            for business_id in business_ids:
-                await _run_bidspotter_scan_for_business(supabase_client, business_id)
-        except Exception as e:
-            print(f"BidSpotter daily scan loop failed: {e}")
+        if os.environ.get("PAUSE_SCAN") == "1":
+            print("PAUSE_SCAN=1 -- skipping this cycle entirely (no DB/BidSpotter activity)")
+        else:
+            try:
+                supabase_client, _ = _require_config()
+                biz_rows = supabase_client.table("auction_pdf_uploads").select("business_id").limit(1000).execute().data or []
+                business_ids = {r["business_id"] for r in biz_rows}
+                for business_id in business_ids:
+                    if os.environ.get("PAUSE_SCAN") == "1":
+                        print("PAUSE_SCAN=1 -- stopping mid-cycle before the next business_id")
+                        break
+                    await _run_bidspotter_scan_for_business(supabase_client, business_id)
+            except Exception as e:
+                print(f"BidSpotter daily scan loop failed: {e}")
         await asyncio.sleep(12 * 60 * 60)
 
 def _scan_for_count(html: str, label: str) -> None:
