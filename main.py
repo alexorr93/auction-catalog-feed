@@ -990,7 +990,21 @@ async def _recheck_blank_catalogs(supabase_client, business_id: str) -> dict:
     for r in rows:
         latest_status[r["catalog_url"]] = r  # later rows overwrite earlier -- ends up holding the latest per catalog_url
 
-    blank_catalogs = [r for r in latest_status.values() if r["status"] == "empty" and r["catalog_url"] in us_catalog_urls]
+    # Same disconnect fixed elsewhere tonight: skip anything the AUTOMATED
+    # pull already has real data for. Without this, a catalog Job 3 already
+    # resolved gets needlessly re-fetched from BidSpotter and re-queued as
+    # "reactivated" here too, wasting a request and cluttering the queue
+    # with something already done.
+    already_automated = set()
+    try:
+        auto_rows = _fetch_all_paginated(lambda: supabase_client.table("bidspotter_auto_catalog_lots").select("catalog_url").eq("business_id", business_id))
+        already_automated = {r["catalog_url"] for r in auto_rows}
+    except Exception as e:
+        print(f"BidSpotter recheck: failed to fetch automated staging table (non-fatal, continuing without this filter): {e}")
+
+    blank_catalogs = [r for r in latest_status.values()
+                       if r["status"] == "empty" and r["catalog_url"] in us_catalog_urls
+                       and r["catalog_url"] not in already_automated]
     reactivated_count = 0
     growing_count = 0
     checked = 0
@@ -1006,7 +1020,7 @@ async def _recheck_blank_catalogs(supabase_client, business_id: str) -> dict:
     except Exception as e:
         print(f"BidSpotter recheck: failed to fetch small-catalog list: {e}")
         small_catalog_rows = []
-    small_catalog_urls = {r["catalog_url"] for r in small_catalog_rows if r["catalog_url"] in us_catalog_urls}
+    small_catalog_urls = {r["catalog_url"] for r in small_catalog_rows if r["catalog_url"] in us_catalog_urls and r["catalog_url"] not in already_automated}
 
     prior_counts = {}
     if small_catalog_urls:
@@ -2382,6 +2396,18 @@ async def api_needs_update():
                                           .eq("business_id", business_id))
     has_real_lots = {c["catalog_url"] for c in catalog_rows if (c.get("lot_count") or 0) > 0}
     end_date_by_catalog = {c["catalog_url"]: c.get("end_date") for c in catalog_rows}
+
+    # REAL BUG FIXED HERE, same class as Job 1's known_urls bug: this only
+    # ever checked auction_catalogs (built from manual VA uploads) -- it had
+    # zero awareness that the AUTOMATED pull might have already landed real
+    # lots for the same catalog in bidspotter_auto_catalog_lots. A catalog
+    # the automation successfully pulled would sit on this "needs update"
+    # list forever, since nothing here ever looked at the other table.
+    try:
+        auto_rows = _fetch_all_paginated(lambda: supabase_client.table("bidspotter_auto_catalog_lots").select("catalog_url").eq("business_id", business_id))
+        has_real_lots |= {r["catalog_url"] for r in auto_rows}
+    except Exception as e:
+        print(f"api_needs_update: failed to check automated staging table (non-fatal): {e}")
 
     needs_update = [u for u in latest_by_catalog.values()
                      if u.get("status") == "empty" and u.get("catalog_url") not in has_real_lots]
