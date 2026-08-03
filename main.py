@@ -990,9 +990,22 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
         # excluded from known_urls below only via the resolved flag (stays
         # False), so a future Job 1 run naturally re-checks and upgrades it
         # the moment BidSpotter actually posts real lots.
+        # REAL BUG FIXED HERE: this used to re-check EVERY unresolved row on
+        # every single Job 1 run, including ones already confirmed to have
+        # real lots hours earlier. One bad/blocked fetch (BidSpotter's WAF
+        # challenge, or Bright Data getting rate-limited from checking the
+        # same catalog repeatedly across back-to-back runs) was then enough
+        # to wrongly flip a confirmed-good catalog to blank with no second
+        # opinion -- confirmed live: "Pace Industries - AR - Day 2" is a
+        # real upcoming Oct 2026 auction and got marked blank by exactly
+        # this. Only re-check rows that are still unconfirmed (kind is
+        # 'blank', to see if real content has since appeared) -- a row
+        # already confirmed 'new' (has real lots) is trusted and left
+        # alone here; Job 2/3's normal ongoing lot-pull is what tracks
+        # whether an active catalog later goes stale, not this check.
         backlog_removed = 0
         try:
-            backlog_rows = await loop.run_in_executor(None, lambda: _fetch_all_paginated(lambda: supabase_client.table("catalog_updates_queue").select("id,catalog_url").eq("business_id", business_id).eq("resolved", False)))
+            backlog_rows = await loop.run_in_executor(None, lambda: _fetch_all_paginated(lambda: supabase_client.table("catalog_updates_queue").select("id,catalog_url").eq("business_id", business_id).eq("resolved", False).eq("kind", "blank")))
         except Exception as e:
             print(f"Job 1 backlog cleanup: failed to fetch existing queue rows: {e}")
             backlog_rows = []
@@ -1012,13 +1025,20 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
                 print(f"Job 1 backlog cleanup: verify fetch failed for {catalog_url} (leaving it, not removing on a flaky check): {type(e).__name__}: {e}")
                 continue
             if category_count == 0:
-                try:
-                    await loop.run_in_executor(None, lambda row_id=row["id"]: supabase_client.table("catalog_updates_queue").update({
-                        "kind": "blank", "category_count": 0,
-                    }).eq("id", row_id).execute())
-                    backlog_removed += 1
-                except Exception as e:
-                    print(f"Job 1 backlog cleanup: failed to mark confirmed-blank row {catalog_url}: {e}")
+                continue  # already kind='blank' -- nothing to change, still confirmed blank
+            # REAL BUG FIXED HERE: this loop only ever handled the
+            # category_count==0 case -- there was no path to upgrade a
+            # catalog back to kind='new' once BidSpotter actually posted
+            # real lots for it. A catalog confirmed blank would stay
+            # invisible to the VA forever, even after content appeared.
+            try:
+                await loop.run_in_executor(None, lambda row_id=row["id"], catalog_url=catalog_url, category_count=category_count: supabase_client.table("catalog_updates_queue").update({
+                    "kind": "new", "category_count": category_count,
+                }).eq("id", row_id).execute())
+                new_count += 1
+                print(f"Job 1 backlog cleanup: {catalog_url} now has real lots (category_count={category_count}) -- upgraded back to Updates to Make")
+            except Exception as e:
+                print(f"Job 1 backlog cleanup: failed to upgrade newly-active row {catalog_url}: {e}")
 
         for i, (catalog_url, item) in enumerate(candidates, 1):
             # REAL FIX: every one of these Supabase calls is the SYNC client,
