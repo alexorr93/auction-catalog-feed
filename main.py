@@ -2547,7 +2547,7 @@ async def upload_pdf(request: Request):
         _invalidate_cache(f"updates-to-make:{business_id}")
 
     _pdf_processing_queue.put_nowait(_run_and_backfill)
-    return {"ok": True, "queued": True, "filename": file.filename}
+    return {"ok": True, "queued": True, "filename": file.filename, "log_id": record.get("log_id")}
 
 
 def _process_zip_batch(supabase_client, business_id: str, pdf_entries: list) -> None:
@@ -2676,6 +2676,20 @@ def api_pdf_uploads():
                                      .eq("business_id", business_id).order("uploaded_at", desc=True))
     uploads = _cached(f"pdf-uploads:{business_id}", _READ_CACHE_TTL, _compute)
     return {"uploads": uploads}
+
+
+@app.get("/api/pdf-uploads/{log_id}/status")
+def api_pdf_upload_status(log_id: str):
+    """Deliberately NOT cached (unlike the list endpoint above) -- this
+    backs the live per-upload progress indicator, so it needs to reflect
+    the real current state on every poll, not a 30s-stale cached one.
+    Tiny single-row lookup, cheap enough to poll every couple seconds."""
+    supabase_client, business_id = _require_config()
+    row = (supabase_client.table("auction_pdf_uploads").select("status,parsed_lot_count,error_message,filename")
+           .eq("id", log_id).eq("business_id", business_id).limit(1).execute().data or [None])[0]
+    if not row:
+        raise HTTPException(404, "upload not found")
+    return row
 
 
 @app.get("/api/needs-update")

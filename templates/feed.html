@@ -30,6 +30,8 @@ a:hover { color: #93c5fd; }
 .tab-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
 .upload-btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--border); background: var(--card); color: var(--text); font-size: 13px; font-weight: 600; cursor: pointer; transition: border-color 0.15s; }
 .upload-btn:hover { border-color: var(--accent); }
+.spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.7s linear infinite; vertical-align: -2px; margin-right: 6px; }
+@keyframes spin { to { transform: rotate(360deg); } }
 </style>
 </head>
 <body>
@@ -402,13 +404,53 @@ async function uploadPdfFile(file, catalogUrl) {
     const r = await fetch('/api/upload-pdf', {method: 'POST', body: fd});
     const data = await r.json();
     if (!r.ok) throw new Error(data.detail || 'Upload failed');
-    line.textContent = `⏳ ${file.name} — queued, processing in the background now (watch the Upload Log below)`;
+    // REAL FIX: this used to set one static "queued" message and never
+    // touch it again -- the actual Gemini parsing step (the slow part,
+    // often 1-2 minutes) gave the VA zero feedback the whole time, so it
+    // looked like nothing was happening and they couldn't tell when it
+    // was actually safe to move on. Now polls this SPECIFIC upload's own
+    // row every 2.5s and updates the line live until it reaches a real
+    // terminal state.
+    if (data.log_id) {
+      pollUploadStatus(data.log_id, file.name, line);
+    } else {
+      line.innerHTML = `${file.name} — queued, processing in the background now`;
+    }
     startAutoRefresh();
   } catch(e) {
     line.textContent = `❌ ${file.name} — ${e.message}`;
   } finally {
     await loadAll();
   }
+}
+
+async function pollUploadStatus(logId, filename, lineEl) {
+  const TERMINAL = new Set(['success', 'partial', 'empty', 'error']);
+  for (let attempt = 0; attempt < 240; attempt++) {  // ~10 min ceiling -- never poll forever on a genuinely stuck job
+    let row;
+    try {
+      const r = await fetch(`/api/pdf-uploads/${logId}/status`);
+      if (!r.ok) break;
+      row = await r.json();
+    } catch(e) {
+      break;  // network hiccup on a status poll isn't worth alarming over -- just stop, the Upload Log below still has the real answer
+    }
+    if (TERMINAL.has(row.status)) {
+      const icons = {success: '✅', partial: '⚠️', empty: '🚫', error: '❌'};
+      const labels = {
+        success: `done — ${row.parsed_lot_count || 0} lot(s) saved`,
+        partial: `partial — ${row.parsed_lot_count || 0} lot(s) saved, some pages failed`,
+        empty: `done — no lots found in this PDF`,
+        error: `failed — ${row.error_message ? row.error_message.slice(0, 150) : 'unknown error'}`,
+      };
+      lineEl.innerHTML = `${icons[row.status]} ${filename} — ${labels[row.status]}`;
+      await loadAll();
+      return;
+    }
+    lineEl.innerHTML = `<span class="spinner"></span>${filename} — still processing (reading PDF, matching against BidSpotter)...`;
+    await new Promise(res => setTimeout(res, 2500));
+  }
+  lineEl.innerHTML = `${filename} — taking longer than expected, check the Upload Log below for the real status`;
 }
 
 async function loadPdfUploadLog() {
