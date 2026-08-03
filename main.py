@@ -1086,7 +1086,31 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
 
     new_count = 0
     skipped_no_lots_yet = 0
-    candidates = [(catalog_url, item) for catalog_url, item in all_listings.items() if catalog_url not in known_urls]
+    # REAL BUG FIXED HERE: candidates only ever came from all_listings --
+    # THIS run's fresh listing-page scan. A catalog seen in some PAST run
+    # (recorded in bidspotter_scan_snapshot) but not showing up on THIS
+    # run's specific page range (pagination/sort drift, or simply not
+    # re-fetched) would never become a candidate again, yet was also never
+    # uploaded/auto-pulled/queued -- permanently invisible in either
+    # bucket with zero indication anything was wrong. Confirmed live: 163
+    # such catalogs existed. Now also pulls anything from the full
+    # historical snapshot that still isn't accounted for anywhere, so
+    # nothing seen once ever falls through the cracks again.
+    all_candidate_items = dict(all_listings)
+    try:
+        orphan_check_urls = set(all_candidate_items.keys()) | known_urls
+        snapshot_rows_all = await loop.run_in_executor(None, lambda: _fetch_all_paginated(lambda: supabase_client.table("bidspotter_scan_snapshot").select("catalog_url,title,end_date").eq("business_id", business_id)))
+        orphaned = 0
+        for r in snapshot_rows_all:
+            if r["catalog_url"] not in orphan_check_urls:
+                all_candidate_items[r["catalog_url"]] = {"title": r.get("title"), "end_date": r.get("end_date")}
+                orphan_check_urls.add(r["catalog_url"])
+                orphaned += 1
+        if orphaned:
+            print(f"Job 1: found {orphaned} catalogs seen before but never classified (fell off a past run's page range) -- adding them as candidates now")
+    except Exception as e:
+        print(f"Job 1: failed to pull historical snapshot for orphan catalogs (non-fatal, continuing with this run's fresh listing only): {e}")
+    candidates = [(catalog_url, item) for catalog_url, item in all_candidate_items.items() if catalog_url not in known_urls]
     async with httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "Mozilla/5.0"}) as verify_client:
         # BACKLOG CLEANUP FIRST: everything queued BEFORE this verify step
         # existed (or from the brief bad deploy that skipped verification
