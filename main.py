@@ -1127,6 +1127,20 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
                         if category_count == 0 and title_text and title_text not in resp.text.lower():
                             print(f"Job 1: verify fetch for {catalog_url} returned 0 categories but page doesn't mention its own title -- likely a blocked/placeholder page, not trusting the 0")
                             category_count = 1  # fail open, same reasoning as a failed fetch below
+                    else:
+                        # REAL BUG FIXED HERE: a non-200 (WAF block, rate
+                        # limit, transient 5xx) fell straight through with
+                        # category_count still at its initialized 0 -- no
+                        # exception was raised, so this silently got written
+                        # as confirmed-blank with zero retry and zero sanity
+                        # check, unlike the exception branch right below
+                        # which already fails open. Confirmed live: a real
+                        # 70-lot Harry Davis catalog got marked blank by
+                        # exactly this. A non-200 means we simply couldn't
+                        # check -- fail open like every other inconclusive
+                        # case here, don't confirm blank off it.
+                        print(f"Job 1: verify fetch for {catalog_url} returned HTTP {resp.status_code} (not a real check), not trusting a blank result -- failing open")
+                        category_count = 1
                 except Exception as e:
                     print(f"Job 1: verify fetch failed for {catalog_url} (queuing anyway rather than losing it): {type(e).__name__}: {e}")
                     category_count = 1  # fail open -- don't silently drop a real new catalog over a flaky verify fetch
