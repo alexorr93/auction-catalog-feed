@@ -979,12 +979,17 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
         # most of it genuinely blank. Deliberately runs before the brand-new
         # candidates below -- these are the ones actually blocking the VA
         # right now, so they get checked first instead of waiting behind a
-        # fresh batch of new candidates. Confirmed-blank rows are DELETED
-        # (not resolved=True -- resolved permanently excludes a catalog_url
-        # from ever being re-queued via known_urls above, which would hide
-        # it forever even after BidSpotter later posts real lots; deleting
-        # lets a future Job 1 run naturally rediscover and re-verify it
-        # fresh).
+        # fresh batch of new candidates.
+        #
+        # REAL FIX: confirmed-blank rows used to be DELETED outright -- that
+        # was wrong. Deleting means no record of what was checked or why it
+        # was removed, and the person has no way to verify or spot-check the
+        # work. Now they're UPDATED in place to kind='blank' and stay
+        # visible (in their own "Confirmed Blank" section, not the
+        # actionable Updates-to-Make list) instead of disappearing. Still
+        # excluded from known_urls below only via the resolved flag (stays
+        # False), so a future Job 1 run naturally re-checks and upgrades it
+        # the moment BidSpotter actually posts real lots.
         backlog_removed = 0
         try:
             backlog_rows = await loop.run_in_executor(None, lambda: _fetch_all_paginated(lambda: supabase_client.table("catalog_updates_queue").select("id,catalog_url").eq("business_id", business_id).eq("resolved", False)))
@@ -1001,17 +1006,19 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
             try:
                 resp = await _brightdata_get(verify_client, real_url)
                 if resp.status_code != 200:
-                    continue  # can't confirm either way -- leave it, don't remove on a failed check
+                    continue  # can't confirm either way -- leave it, don't touch it on a failed check
                 category_count = len(re.findall(r'search-filter\?CategoryCode=', resp.text))
             except Exception as e:
                 print(f"Job 1 backlog cleanup: verify fetch failed for {catalog_url} (leaving it, not removing on a flaky check): {type(e).__name__}: {e}")
                 continue
             if category_count == 0:
                 try:
-                    await loop.run_in_executor(None, lambda row_id=row["id"]: supabase_client.table("catalog_updates_queue").delete().eq("id", row_id).execute())
+                    await loop.run_in_executor(None, lambda row_id=row["id"]: supabase_client.table("catalog_updates_queue").update({
+                        "kind": "blank", "category_count": 0,
+                    }).eq("id", row_id).execute())
                     backlog_removed += 1
                 except Exception as e:
-                    print(f"Job 1 backlog cleanup: failed to delete confirmed-blank row {catalog_url}: {e}")
+                    print(f"Job 1 backlog cleanup: failed to mark confirmed-blank row {catalog_url}: {e}")
 
         for i, (catalog_url, item) in enumerate(candidates, 1):
             # REAL FIX: every one of these Supabase calls is the SYNC client,
@@ -1049,6 +1056,16 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
 
             if category_count == 0:
                 skipped_no_lots_yet += 1
+                try:
+                    def _upsert_blank(catalog_url=catalog_url, item=item):
+                        supabase_client.table("catalog_updates_queue").upsert({
+                            "business_id": business_id, "catalog_url": catalog_url, "title": item["title"],
+                            "end_date": item.get("end_date"), "kind": "blank", "resolved": False,
+                            "category_count": 0,
+                        }, on_conflict="business_id,catalog_url").execute()
+                    await loop.run_in_executor(None, _upsert_blank)
+                except Exception as e:
+                    print(f"BidSpotter scan: failed to record blank catalog {catalog_url}: {e}")
                 continue
             try:
                 def _upsert(catalog_url=catalog_url, item=item, category_count=category_count):
@@ -1266,6 +1283,7 @@ async def _run_bidspotter_scan_for_business(supabase_client, business_id: str):
     _invalidate_cache(f"bright-lots:{business_id}")
     _invalidate_cache(f"needs-update:{business_id}")
     _invalidate_cache(f"updates-to-make:{business_id}")
+    _invalidate_cache(f"confirmed-blank:{business_id}")
     return status_row
 
 class _NoLotsPublishedYet(Exception):
@@ -2148,14 +2166,35 @@ _READ_CACHE_TTL = 30  # seconds -- data only changes on upload/background-job wr
 @app.get("/api/updates-to-make")
 def api_updates_to_make():
     """Powers the 'Updates to Make' box -- unresolved new catalogs and
-    reactivated (was-blank, now-has-content) catalogs, newest flagged first."""
+    reactivated (was-blank, now-has-content) catalogs, newest flagged first.
+    Excludes kind='blank' -- those are confirmed to have zero lots on
+    BidSpotter right now, so there's nothing actionable for a VA to do yet;
+    they show in /api/confirmed-blank instead so they stay visible rather
+    than just disappearing."""
     supabase_client, business_id = _require_config()
     def _compute():
         return (supabase_client.table("catalog_updates_queue").select("*")
-                .eq("business_id", business_id).eq("resolved", False)
+                .eq("business_id", business_id).eq("resolved", False).neq("kind", "blank")
                 .order("first_flagged_at", desc=True).execute().data or [])
     rows = _cached(f"updates-to-make:{business_id}", _READ_CACHE_TTL, _compute)
     return {"updates": rows}
+
+
+@app.get("/api/confirmed-blank")
+def api_confirmed_blank():
+    """Catalogs Job 1 has directly verified have zero lots posted on
+    BidSpotter right now (kind='blank') -- kept visible here instead of
+    being silently deleted, so there's a real record of what was checked.
+    Not actionable for a VA (nothing to upload yet), but transparent. Will
+    naturally move to Updates-to-Make on its own the next time Job 1 or 2
+    re-checks it and finds real content."""
+    supabase_client, business_id = _require_config()
+    def _compute():
+        return (supabase_client.table("catalog_updates_queue").select("*")
+                .eq("business_id", business_id).eq("resolved", False).eq("kind", "blank")
+                .order("first_flagged_at", desc=True).execute().data or [])
+    rows = _cached(f"confirmed-blank:{business_id}", _READ_CACHE_TTL, _compute)
+    return {"blank": rows}
 
 
 @app.get("/api/catalogs")
