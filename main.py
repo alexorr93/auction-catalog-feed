@@ -1053,7 +1053,7 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
         # whether an active catalog later goes stale, not this check.
         backlog_removed = 0
         try:
-            backlog_rows = await loop.run_in_executor(None, lambda: _fetch_all_paginated(lambda: supabase_client.table("catalog_updates_queue").select("id,catalog_url").eq("business_id", business_id).eq("resolved", False).eq("kind", "blank")))
+            backlog_rows = await loop.run_in_executor(None, lambda: _fetch_all_paginated(lambda: supabase_client.table("catalog_updates_queue").select("id,catalog_url,title").eq("business_id", business_id).eq("resolved", False).eq("kind", "blank")))
         except Exception as e:
             print(f"Job 1 backlog cleanup: failed to fetch existing queue rows: {e}")
             backlog_rows = []
@@ -1069,10 +1069,21 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
                 if resp.status_code != 200:
                     continue  # can't confirm either way -- leave it, don't touch it on a failed check
                 category_count = len(re.findall(r'search-filter\?CategoryCode=', resp.text))
+                # REAL FIX: category filter tags may simply not render on
+                # every real, populated catalog page (suspected root cause
+                # of "ALUMINUM EXTRUSION & FABRICATION" still reading blank
+                # even after the WAF/title-match fix) -- a direct count of
+                # actual /lot-<id> links on the page is a much harder
+                # signal to fake and doesn't depend on a filter widget
+                # existing at all. Either signal finding real content wins.
+                lot_link_count = len(re.findall(r'/lot-[a-f0-9-]{8}', resp.text, re.IGNORECASE))
+                if category_count == 0 and lot_link_count == 0:
+                    title_text = (row.get("title") or "").strip().lower()
+                    print(f"Job 1 backlog cleanup DIAGNOSTIC: {catalog_url} still reads blank -- page_len={len(resp.text)}, title_matched={title_text and title_text in resp.text.lower()}")
             except Exception as e:
                 print(f"Job 1 backlog cleanup: verify fetch failed for {catalog_url} (leaving it, not removing on a flaky check): {type(e).__name__}: {e}")
                 continue
-            if category_count == 0:
+            if category_count == 0 and lot_link_count == 0:
                 continue  # already kind='blank' -- nothing to change, still confirmed blank
             # REAL BUG FIXED HERE: this loop only ever handled the
             # category_count==0 case -- there was no path to upgrade a
@@ -1127,6 +1138,21 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
                         if category_count == 0 and title_text and title_text not in resp.text.lower():
                             print(f"Job 1: verify fetch for {catalog_url} returned 0 categories but page doesn't mention its own title -- likely a blocked/placeholder page, not trusting the 0")
                             category_count = 1  # fail open, same reasoning as a failed fetch below
+                        elif category_count == 0:
+                            # REAL FIX: category filter tags may simply not
+                            # render on every real, populated catalog page --
+                            # confirmed live: "ALUMINUM EXTRUSION &
+                            # FABRICATION" still read blank after the
+                            # title-match fix. A direct count of actual
+                            # /lot-<id> links is a harder signal to fake and
+                            # doesn't depend on a filter widget existing.
+                            lot_link_count = len(re.findall(r'/lot-[a-f0-9-]{8}', resp.text, re.IGNORECASE))
+                            if lot_link_count > 0:
+                                print(f"Job 1: {catalog_url} has 0 category tags but {lot_link_count} real lot links -- trusting the lot links, not the category count")
+                                category_count = lot_link_count
+                            else:
+                                any_categorycode = len(re.findall(r'categorycode', resp.text, re.IGNORECASE))
+                                print(f"Job 1 DIAGNOSTIC: {catalog_url} trusted as blank -- page_len={len(resp.text)}, title_matched=True, lot_link_matches=0, any_categorycode_ci={any_categorycode}")
                     else:
                         # REAL BUG FIXED HERE: a non-200 (WAF block, rate
                         # limit, transient 5xx) fell straight through with
