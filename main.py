@@ -924,6 +924,26 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
     for r in known_rows:
         known_urls.add(r["catalog_url"])
 
+    # REAL BUG FIXED HERE: Job 1 previously only checked auction_pdf_uploads
+    # (the VA's manual upload history) to decide what's already handled --
+    # it had zero awareness of the automated lot-pull or any manual queue
+    # cleanup. That meant every catalog the automation successfully pulled
+    # (or that got manually resolved after confirming non-US, etc.) got
+    # RE-FLAGGED as "new" the very next time Job 1 ran, undoing that work
+    # every single cycle. Now also excludes: (1) anything already resolved
+    # in catalog_updates_queue, (2) anything with real rows already in
+    # bidspotter_auto_catalog_lots (the automated staging table) -- belt
+    # and suspenders in case a resolve was ever missed.
+    resolved_rows = _fetch_all_paginated(lambda: supabase_client.table("catalog_updates_queue").select("catalog_url").eq("business_id", business_id).eq("resolved", True))
+    for r in resolved_rows:
+        known_urls.add(r["catalog_url"])
+    try:
+        staged_rows = _fetch_all_paginated(lambda: supabase_client.table("bidspotter_auto_catalog_lots").select("catalog_url").eq("business_id", business_id))
+        for r in staged_rows:
+            known_urls.add(r["catalog_url"])
+    except Exception as e:
+        print(f"BidSpotter scan: failed to fetch staged catalog_urls (non-fatal, continuing): {e}")
+
     new_count = 0
     for catalog_url, item in all_listings.items():
         if catalog_url in known_urls:
