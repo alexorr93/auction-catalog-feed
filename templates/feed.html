@@ -370,7 +370,7 @@ function startAutoRefresh() {
   if (autoRefreshTimer) return;
   autoRefreshTimer = setInterval(async () => {
     await loadAll();
-  }, 8000);
+  }, 20000);
 }
 
 async function uploadPdfFile(file, catalogUrl) {

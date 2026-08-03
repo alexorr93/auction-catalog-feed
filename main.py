@@ -937,13 +937,15 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
          "end_date": v.get("end_date"), "scanned_at": now_iso}
         for v in all_listings.values()
     ]
+    loop = asyncio.get_event_loop()
     for i in range(0, len(snapshot_rows), 500):
-        supabase_client.table("bidspotter_scan_snapshot").upsert(
-            snapshot_rows[i:i+500], on_conflict="business_id,catalog_url"
-        ).execute()
+        chunk = snapshot_rows[i:i+500]
+        await loop.run_in_executor(None, lambda chunk=chunk: supabase_client.table("bidspotter_scan_snapshot").upsert(
+            chunk, on_conflict="business_id,catalog_url"
+        ).execute())
 
     known_urls = set()
-    known_rows = _fetch_all_paginated(lambda: supabase_client.table("auction_pdf_uploads").select("catalog_url").eq("business_id", business_id))
+    known_rows = await loop.run_in_executor(None, lambda: _fetch_all_paginated(lambda: supabase_client.table("auction_pdf_uploads").select("catalog_url").eq("business_id", business_id)))
     for r in known_rows:
         known_urls.add(r["catalog_url"])
 
@@ -957,11 +959,11 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
     # in catalog_updates_queue, (2) anything with real rows already in
     # bidspotter_auto_catalog_lots (the automated staging table) -- belt
     # and suspenders in case a resolve was ever missed.
-    resolved_rows = _fetch_all_paginated(lambda: supabase_client.table("catalog_updates_queue").select("catalog_url").eq("business_id", business_id).eq("resolved", True))
+    resolved_rows = await loop.run_in_executor(None, lambda: _fetch_all_paginated(lambda: supabase_client.table("catalog_updates_queue").select("catalog_url").eq("business_id", business_id).eq("resolved", True)))
     for r in resolved_rows:
         known_urls.add(r["catalog_url"])
     try:
-        staged_rows = _fetch_all_paginated(lambda: supabase_client.table("bidspotter_auto_catalog_lots").select("catalog_url").eq("business_id", business_id))
+        staged_rows = await loop.run_in_executor(None, lambda: _fetch_all_paginated(lambda: supabase_client.table("bidspotter_auto_catalog_lots").select("catalog_url").eq("business_id", business_id)))
         for r in staged_rows:
             known_urls.add(r["catalog_url"])
     except Exception as e:
@@ -972,16 +974,23 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
     candidates = [(catalog_url, item) for catalog_url, item in all_listings.items() if catalog_url not in known_urls]
     async with httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "Mozilla/5.0"}) as verify_client:
         for i, (catalog_url, item) in enumerate(candidates, 1):
-            _update_live_activity(supabase_client, business_id, f"Job 1: verifying new catalog {i}/{len(candidates)} actually has lots")
+            # REAL FIX: every one of these Supabase calls is the SYNC client,
+            # called directly inside this async function -- exactly the same
+            # event-loop-blocking bug already fixed for the HTTP routes, just
+            # relocated here. With ~120 calls across this loop it froze the
+            # whole server again during every Job 1 run. run_in_executor
+            # moves each one off the event loop onto a real thread.
+            if i % 5 == 0 or i == 1:
+                await loop.run_in_executor(None, lambda i=i: _update_live_activity(supabase_client, business_id, f"Job 1: verifying new catalog {i}/{len(candidates)} actually has lots"))
             real_url = _reconstruct_full_url(catalog_url)
             category_count = 0
             if real_url:
-                # REAL FIX: an earlier version of this tried to read category
-                # tags straight off the bulk listing page Job 1 already
-                # loads -- looked right in a one-off check, but confirmed
-                # live it ALWAYS reads 0 in production (that widget loads
-                # via a separate lazy AJAX call per card, not present in the
-                # page by the time Job 1 reads it -- same "Cannot load data"
+                # An earlier version of this tried to read category tags
+                # straight off the bulk listing page Job 1 already loads --
+                # looked right in a one-off check, but confirmed live it
+                # ALWAYS reads 0 in production (that widget loads via a
+                # separate lazy AJAX call per card, not present in the page
+                # by the time Job 1 reads it -- same "Cannot load data"
                 # placeholder visible on the live site). Reverted to the one
                 # mechanism actually proven reliable (Job 2 already uses it
                 # daily): fetch the catalog's OWN individual page, where the
@@ -1002,11 +1011,13 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
                 skipped_no_lots_yet += 1
                 continue
             try:
-                supabase_client.table("catalog_updates_queue").upsert({
-                    "business_id": business_id, "catalog_url": catalog_url, "title": item["title"],
-                    "end_date": item.get("end_date"), "kind": "new", "resolved": False,
-                    "category_count": category_count,
-                }, on_conflict="business_id,catalog_url").execute()
+                def _upsert(catalog_url=catalog_url, item=item, category_count=category_count):
+                    supabase_client.table("catalog_updates_queue").upsert({
+                        "business_id": business_id, "catalog_url": catalog_url, "title": item["title"],
+                        "end_date": item.get("end_date"), "kind": "new", "resolved": False,
+                        "category_count": category_count,
+                    }, on_conflict="business_id,catalog_url").execute()
+                await loop.run_in_executor(None, _upsert)
                 new_count += 1
             except Exception as e:
                 print(f"BidSpotter scan: failed to queue new catalog {catalog_url}: {e}")
@@ -1022,13 +1033,14 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
         # Job 1 run naturally rediscover and re-verify it fresh).
         backlog_removed = 0
         try:
-            backlog_rows = _fetch_all_paginated(lambda: supabase_client.table("catalog_updates_queue").select("id,catalog_url").eq("business_id", business_id).eq("resolved", False))
+            backlog_rows = await loop.run_in_executor(None, lambda: _fetch_all_paginated(lambda: supabase_client.table("catalog_updates_queue").select("id,catalog_url").eq("business_id", business_id).eq("resolved", False)))
         except Exception as e:
             print(f"Job 1 backlog cleanup: failed to fetch existing queue rows: {e}")
             backlog_rows = []
         for i, row in enumerate(backlog_rows, 1):
             catalog_url = row["catalog_url"]
-            _update_live_activity(supabase_client, business_id, f"Job 1: cleaning old queue backlog {i}/{len(backlog_rows)}")
+            if i % 5 == 0 or i == 1:
+                await loop.run_in_executor(None, lambda i=i: _update_live_activity(supabase_client, business_id, f"Job 1: cleaning old queue backlog {i}/{len(backlog_rows)}"))
             real_url = _reconstruct_full_url(catalog_url)
             if not real_url:
                 continue
@@ -1042,7 +1054,7 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
                 continue
             if category_count == 0:
                 try:
-                    supabase_client.table("catalog_updates_queue").delete().eq("id", row["id"]).execute()
+                    await loop.run_in_executor(None, lambda row_id=row["id"]: supabase_client.table("catalog_updates_queue").delete().eq("id", row_id).execute())
                     backlog_removed += 1
                 except Exception as e:
                     print(f"Job 1 backlog cleanup: failed to delete confirmed-blank row {catalog_url}: {e}")
