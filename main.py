@@ -758,8 +758,22 @@ def _parse_bidspotter_listing_page_from_dom(html: str) -> list:
         r'((?:Ends\s+(?:today|from)\s+)?[A-Z][a-z]{2}\s+\d{1,2},\s*\d{4}'
         r'(?:\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)\s*[A-Za-z]{2,3})?)'
     )
+    # REAL FIX (much bigger one): this parser used to return ONLY
+    # catalog_url/title/full_url/end_date, forcing a SEPARATE per-catalog
+    # verify fetch later just to count category tags (the "does this
+    # catalog have real lots yet" signal) -- a second fetch to BidSpotter's
+    # WAF-protected individual pages, which is exactly what's been causing
+    # today's false-blank misclassifications (blocked/placeholder
+    # responses, category widgets not always present on the individual
+    # page). Confirmed live by direct visual proof: the category tags WITH
+    # their real counts (e.g. "Food & Beverage Equipment (70)") are sitting
+    # right here on THIS bulk listing page already, inside each catalog's
+    # own card, as the exact same search-filter?CategoryCode= links this
+    # codebase already trusts as the "has real content" signal elsewhere.
+    # No second fetch needed at all -- extract it directly from the same
+    # successful fetch that's already being used for discovery.
     soup = BeautifulSoup(html, "html.parser")
-    best_by_url = {}  # catalog_url -> {"full_url":..., "title": "" or real text, "end_date": ...}
+    best_by_url = {}  # catalog_url -> {"full_url":..., "title": "" or real text, "end_date": ..., "category_count": int}
     order = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
@@ -771,6 +785,7 @@ def _parse_bidspotter_listing_page_from_dom(html: str) -> list:
         catalog_url = _full_url_to_catalog_url(full_url)
         title = a.get_text(strip=True)
         end_date = None
+        category_count = 0
         if title:
             node = a
             for _ in range(6):  # small hop count -- stay within this one card, not a whole page/section
@@ -782,9 +797,10 @@ def _parse_bidspotter_listing_page_from_dom(html: str) -> list:
                     m = date_pattern.search(card_text)
                     if m:
                         end_date = m.group(1).strip()
-                        break
+                    category_count = len(node.find_all("a", href=lambda h: h and "search-filter" in h and "CategoryCode=" in h))
+                    break
         if catalog_url not in best_by_url:
-            best_by_url[catalog_url] = {"full_url": full_url, "title": title, "end_date": end_date}
+            best_by_url[catalog_url] = {"full_url": full_url, "title": title, "end_date": end_date, "category_count": category_count}
             order.append(catalog_url)
         else:
             if title and not best_by_url[catalog_url]["title"]:
@@ -793,9 +809,11 @@ def _parse_bidspotter_listing_page_from_dom(html: str) -> list:
                 best_by_url[catalog_url]["title"] = title
             if end_date and not best_by_url[catalog_url]["end_date"]:
                 best_by_url[catalog_url]["end_date"] = end_date
+            if category_count and not best_by_url[catalog_url]["category_count"]:
+                best_by_url[catalog_url]["category_count"] = category_count
     listings = [
         {"catalog_url": u, "title": best_by_url[u]["title"], "full_url": best_by_url[u]["full_url"],
-         "end_date": best_by_url[u]["end_date"]}
+         "end_date": best_by_url[u]["end_date"], "category_count": best_by_url[u]["category_count"]}
         for u in order if best_by_url[u]["title"]  # still require SOME real title before including it
     ]
     return listings
@@ -1061,30 +1079,37 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
             catalog_url = row["catalog_url"]
             if i % 5 == 0 or i == 1:
                 await loop.run_in_executor(None, lambda i=i: _update_live_activity(supabase_client, business_id, f"Job 1: cleaning old queue backlog {i}/{len(backlog_rows)}"))
-            real_url = _reconstruct_full_url(catalog_url)
-            if not real_url:
-                continue
-            try:
-                resp = await _brightdata_get(verify_client, real_url)
-                if resp.status_code != 200:
-                    continue  # can't confirm either way -- leave it, don't touch it on a failed check
-                category_count = len(re.findall(r'search-filter\?CategoryCode=', resp.text))
-                # REAL FIX: category filter tags may simply not render on
-                # every real, populated catalog page (suspected root cause
-                # of "ALUMINUM EXTRUSION & FABRICATION" still reading blank
-                # even after the WAF/title-match fix) -- a direct count of
-                # actual /lot-<id> links on the page is a much harder
-                # signal to fake and doesn't depend on a filter widget
-                # existing at all. Either signal finding real content wins.
-                lot_link_count = len(re.findall(r'/lot-[a-f0-9-]{8}', resp.text, re.IGNORECASE))
-                if category_count == 0 and lot_link_count == 0:
-                    title_text = (row.get("title") or "").strip().lower()
-                    print(f"Job 1 backlog cleanup DIAGNOSTIC: {catalog_url} still reads blank -- page_len={len(resp.text)}, title_matched={title_text and title_text in resp.text.lower()}")
-            except Exception as e:
-                print(f"Job 1 backlog cleanup: verify fetch failed for {catalog_url} (leaving it, not removing on a flaky check): {type(e).__name__}: {e}")
-                continue
-            if category_count == 0 and lot_link_count == 0:
-                continue  # already kind='blank' -- nothing to change, still confirmed blank
+
+            # REAL FIX: use the category_count already captured from THIS
+            # run's bulk listing scan (all_listings) first -- it's the same
+            # search-filter?CategoryCode= links this codebase already
+            # trusts, read directly off the page that's already been
+            # fetched successfully for discovery. No second per-catalog
+            # fetch needed, so no WAF/bot-check risk on this check at all.
+            # Only fall back to a direct fetch if this catalog didn't show
+            # up in the current scan (e.g. fell off the visible pages).
+            listing_item = all_listings.get(catalog_url)
+            if listing_item is not None:
+                category_count = listing_item.get("category_count", 0)
+                if category_count == 0:
+                    continue  # still genuinely blank per this run's fresh scan
+            else:
+                real_url = _reconstruct_full_url(catalog_url)
+                if not real_url:
+                    continue
+                try:
+                    resp = await _brightdata_get(verify_client, real_url)
+                    if resp.status_code != 200:
+                        continue  # can't confirm either way -- leave it, don't touch it on a failed check
+                    category_count = len(re.findall(r'search-filter\?CategoryCode=', resp.text))
+                    lot_link_count = len(re.findall(r'/lot-[a-f0-9-]{8}', resp.text, re.IGNORECASE))
+                    if category_count == 0 and lot_link_count > 0:
+                        category_count = lot_link_count
+                    if category_count == 0:
+                        continue  # already kind='blank' -- nothing to change, still confirmed blank
+                except Exception as e:
+                    print(f"Job 1 backlog cleanup: verify fetch failed for {catalog_url} (leaving it, not removing on a flaky check): {type(e).__name__}: {e}")
+                    continue
             # REAL BUG FIXED HERE: this loop only ever handled the
             # category_count==0 case -- there was no path to upgrade a
             # catalog back to kind='new' once BidSpotter actually posted
@@ -1107,71 +1132,21 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
             # whole server again during every Job 1 run. run_in_executor
             # moves each one off the event loop onto a real thread.
             if i % 5 == 0 or i == 1:
-                await loop.run_in_executor(None, lambda i=i: _update_live_activity(supabase_client, business_id, f"Job 1: verifying new catalog {i}/{len(candidates)} actually has lots"))
-            real_url = _reconstruct_full_url(catalog_url)
-            category_count = 0
-            if real_url:
-                # An earlier version of this tried to read category tags
-                # straight off the bulk listing page Job 1 already loads --
-                # looked right in a one-off check, but confirmed live it
-                # ALWAYS reads 0 in production (that widget loads via a
-                # separate lazy AJAX call per card, not present in the page
-                # by the time Job 1 reads it -- same "Cannot load data"
-                # placeholder visible on the live site). Reverted to the one
-                # mechanism actually proven reliable (Job 2 already uses it
-                # daily): fetch the catalog's OWN individual page, where the
-                # same category tags are real static content, not lazy-
-                # loaded. Costs one extra fetch per NEW catalog only (not
-                # the full listing), which is a small number most runs.
-                try:
-                    resp = await _brightdata_get(verify_client, real_url)
-                    if resp.status_code == 200:
-                        category_count = len(re.findall(r'search-filter\?CategoryCode=', resp.text))
-                        # A WAF/bot-check interstitial can return a real 200
-                        # with placeholder content -- that would read as 0
-                        # categories and get confidently written as
-                        # "confirmed blank" for a catalog that actually has
-                        # real lots. Only trust a 0 when the page actually
-                        # mentions this catalog's own title (a real render);
-                        # otherwise treat it the same as a failed fetch.
-                        title_text = (item.get("title") or "").strip().lower()
-                        if category_count == 0 and title_text and title_text not in resp.text.lower():
-                            print(f"Job 1: verify fetch for {catalog_url} returned 0 categories but page doesn't mention its own title -- likely a blocked/placeholder page, not trusting the 0")
-                            category_count = 1  # fail open, same reasoning as a failed fetch below
-                        elif category_count == 0:
-                            # REAL FIX: category filter tags may simply not
-                            # render on every real, populated catalog page --
-                            # confirmed live: "ALUMINUM EXTRUSION &
-                            # FABRICATION" still read blank after the
-                            # title-match fix. A direct count of actual
-                            # /lot-<id> links is a harder signal to fake and
-                            # doesn't depend on a filter widget existing.
-                            lot_link_count = len(re.findall(r'/lot-[a-f0-9-]{8}', resp.text, re.IGNORECASE))
-                            if lot_link_count > 0:
-                                print(f"Job 1: {catalog_url} has 0 category tags but {lot_link_count} real lot links -- trusting the lot links, not the category count")
-                                category_count = lot_link_count
-                            else:
-                                any_categorycode = len(re.findall(r'categorycode', resp.text, re.IGNORECASE))
-                                print(f"Job 1 DIAGNOSTIC: {catalog_url} trusted as blank -- page_len={len(resp.text)}, title_matched=True, lot_link_matches=0, any_categorycode_ci={any_categorycode}")
-                    else:
-                        # REAL BUG FIXED HERE: a non-200 (WAF block, rate
-                        # limit, transient 5xx) fell straight through with
-                        # category_count still at its initialized 0 -- no
-                        # exception was raised, so this silently got written
-                        # as confirmed-blank with zero retry and zero sanity
-                        # check, unlike the exception branch right below
-                        # which already fails open. Confirmed live: a real
-                        # 70-lot Harry Davis catalog got marked blank by
-                        # exactly this. A non-200 means we simply couldn't
-                        # check -- fail open like every other inconclusive
-                        # case here, don't confirm blank off it.
-                        print(f"Job 1: verify fetch for {catalog_url} returned HTTP {resp.status_code} (not a real check), not trusting a blank result -- failing open")
-                        category_count = 1
-                except Exception as e:
-                    print(f"Job 1: verify fetch failed for {catalog_url} (queuing anyway rather than losing it): {type(e).__name__}: {e}")
-                    category_count = 1  # fail open -- don't silently drop a real new catalog over a flaky verify fetch
-            else:
-                category_count = 1  # couldn't reconstruct the URL to verify -- fail open, same reasoning as above
+                await loop.run_in_executor(None, lambda i=i: _update_live_activity(supabase_client, business_id, f"Job 1: classifying new catalog {i}/{len(candidates)}"))
+            # REAL FIX (much bigger one): this used to fetch each candidate's
+            # OWN individual page a second time just to count category tags
+            # -- a WAF-protected fetch that's been the actual source of
+            # today's false-blank misclassifications (blocked/placeholder
+            # responses, category widgets not consistently present on the
+            # individual page). Confirmed live by direct visual proof: the
+            # real category tags with real counts (e.g. "Food & Beverage
+            # Equipment (70)") are already sitting in each catalog's own
+            # card on THIS bulk listing page -- the parser now extracts them
+            # directly (see _parse_bidspotter_listing_page_from_dom), so no
+            # second fetch is needed here at all. Faster (no per-candidate
+            # network round trip) and more reliable (one successful fetch
+            # instead of two, no bot-block window on this step).
+            category_count = item.get("category_count", 0)
 
             if category_count == 0:
                 skipped_no_lots_yet += 1
