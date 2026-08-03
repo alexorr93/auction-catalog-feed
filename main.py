@@ -489,7 +489,13 @@ async def index(request: Request):
             f"<h2>⚠️ Configuration error</h2><p>{error}</p></body></html>",
             status_code=500,
         )
-    return templates.TemplateResponse("feed.html", {"request": request})
+    # REAL FIX: no cache header was ever set here, so a browser could keep
+    # serving a stale cached copy of this page's JS after a real deploy --
+    # confirmed tonight as the actual cause of a fix looking broken on a
+    # related app until a hard refresh. no-store means every load always
+    # gets whatever's actually live right now.
+    return templates.TemplateResponse("feed.html", {"request": request},
+                                       headers={"Cache-Control": "no-store"})
 
 
 @app.get("/health")

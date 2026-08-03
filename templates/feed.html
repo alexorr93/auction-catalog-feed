@@ -34,13 +34,14 @@ a:hover { color: #93c5fd; }
 @keyframes spin { to { transform: rotate(360deg); } }
 tr.row-viewed { background: rgba(248,113,113,0.35) !important; border-left: 4px solid #f87171; }
 tr.row-viewed td { border-bottom-color: rgba(248,113,113,0.4); }
-tr.row-uploading { background: rgba(96,165,250,0.28) !important; border-left: 4px solid #60a5fa; }
+tr.row-uploading { background: rgba(74,222,128,0.28) !important; border-left: 4px solid #4ade80; animation: pulse-row 1.2s ease-in-out infinite; }
+@keyframes pulse-row { 0%, 100% { background-color: rgba(74,222,128,0.28); } 50% { background-color: rgba(74,222,128,0.45); } }
 tr.row-success { background: rgba(74,222,128,0.3) !important; border-left: 4px solid #4ade80; }
 tr.row-error { background: rgba(239,68,68,0.3) !important; border-left: 4px solid #ef4444; }
 tr.row-blanking { background: rgba(148,163,184,0.25) !important; border-left: 4px solid #94a3b8; }
 .viewed-badge { display: inline-block; background: #f87171; color: #1a0505; font-weight: 800; font-size: 10px; letter-spacing: .04em; padding: 2px 7px; border-radius: 5px; margin-left: 8px; vertical-align: middle; }
 .row-status-badge { display: inline-block; font-weight: 800; font-size: 10px; letter-spacing: .04em; padding: 2px 7px; border-radius: 5px; margin-left: 8px; vertical-align: middle; }
-.row-status-badge.uploading { background: #60a5fa; color: #04101f; }
+.row-status-badge.uploading { background: #4ade80; color: #052e12; }
 .row-status-badge.success { background: #4ade80; color: #052e12; }
 .row-status-badge.error { background: #ef4444; color: #2b0505; }
 </style>
@@ -457,7 +458,7 @@ function setRowState(rowEl, state, label) {
   if (label) {
     const badge = document.createElement('span');
     badge.className = state === 'viewed' ? 'viewed-badge' : `row-status-badge ${state}`;
-    badge.innerHTML = state === 'uploading' ? `<span class="spinner" style="border-top-color:#04101f;border-color:rgba(4,16,31,0.3);"></span>${label}` : label;
+    badge.innerHTML = state === 'uploading' ? `<span class="spinner" style="border-top-color:#052e12;border-color:rgba(5,46,18,0.3);"></span>${label}` : label;
     titleCell.appendChild(document.createTextNode(' '));
     titleCell.appendChild(badge);
   }
