@@ -780,7 +780,6 @@ def _parse_bidspotter_listing_page_from_dom(html: str) -> list:
         title = a.get_text(strip=True)
         end_date = None
         category_count = 0
-        category_count_found = False
         if title:
             node = a
             for _ in range(6):  # small hop count -- stay within this one card, not a whole page/section
@@ -789,20 +788,32 @@ def _parse_bidspotter_listing_page_from_dom(html: str) -> list:
                     break
                 card_text = node.get_text(" ", strip=True)
                 if title in card_text:
-                    # REAL BUG FIXED HERE: capture category tags at the
-                    # FIRST (tightest) matching ancestor only, but keep
-                    # climbing for the date if not found yet -- these two
-                    # signals don't necessarily live at the same DOM depth,
-                    # and stopping the climb the instant title matched
-                    # (regardless of whether a date was found) silently
-                    # broke date capture from ~100% down to ~1%.
-                    if not category_count_found:
-                        category_count = sum(int(n) for n in category_tag_pattern.findall(card_text))
-                        category_count_found = True
+                    # REAL BUG FIXED HERE: category_count used to lock in at
+                    # the FIRST (tightest) matching ancestor only -- but the
+                    # category tag pills may live in a WIDER container than
+                    # where the title first matches (siblings below the
+                    # title, not nested inside the same tight wrapper).
+                    # Locking in early froze category_count at 0 permanently
+                    # for exactly that shape of card, even though continuing
+                    # to climb (like we already do for date) would find the
+                    # real tags. Now recomputed at every level while
+                    # climbing -- climbing higher only ever includes MORE of
+                    # the card's text, so the count can only grow or stay
+                    # the same, never get worse.
+                    new_count = sum(int(n) for n in category_tag_pattern.findall(card_text))
+                    if new_count > category_count:
+                        category_count = new_count
                     m = date_pattern.search(card_text)
                     if m:
                         end_date = m.group(1).strip()
                         break
+            if category_count == 0 and any(k in catalog_url for k in ("bschar10412", "bscmayn10437", "united4-10205")):
+                # TARGETED DIAGNOSTIC: these 3 catalogs have been confirmed
+                # wrong (real content, marked blank) across multiple fix
+                # attempts today. If this is still 0, print exactly what
+                # text Job 1 saw at the widest climbed ancestor so the next
+                # look is at real evidence, not another guess.
+                print(f"Job 1 DIAGNOSTIC still-zero for {catalog_url}: widest_card_text={card_text[:500]!r}")
         if catalog_url not in best_by_url:
             best_by_url[catalog_url] = {"full_url": full_url, "title": title, "end_date": end_date, "category_count": category_count}
             order.append(catalog_url)
