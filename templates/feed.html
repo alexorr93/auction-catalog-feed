@@ -48,6 +48,8 @@ a:hover { color: #93c5fd; }
     </div>
   </div>
 
+  <div id="target-upload-banner" style="display:none;background:#1e3a2f;border:1px solid var(--green);border-radius:8px;padding:8px 14px;margin-bottom:10px;font-size:13px;"></div>
+
   <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:22px;align-items:flex-start;">
     <div>
       <label class="upload-btn" for="pdf-file-input">📄 Upload PDF</label>
@@ -286,10 +288,33 @@ function handlePdfDrop(event) {
   if (files && files.length) handlePdfPick(files);
 }
 
+let targetUpload = null;  // {catalog_url, title} when uploading FOR a specific queue/blank row
+
+function startTargetedUpload(catalogUrl, title) {
+  targetUpload = {catalog_url: catalogUrl, title: title || ''};
+  const banner = document.getElementById('target-upload-banner');
+  if (banner) {
+    banner.style.display = 'block';
+    banner.innerHTML = `Uploading for: <strong>${escapeHtml(title || catalogUrl)}</strong> &nbsp;<a href="#" onclick="clearTargetUpload();return false;" style="color:var(--red);">cancel, upload generically instead</a>`;
+  }
+  document.getElementById('pdf-file-input').click();
+}
+
+function clearTargetUpload() {
+  targetUpload = null;
+  const banner = document.getElementById('target-upload-banner');
+  if (banner) banner.style.display = 'none';
+}
+
 function handlePdfPick(fileList) {
   const files = Array.from(fileList).filter(f => f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf'));
   if (!files.length) { alert('Please choose PDF file(s)'); return; }
-  for (const f of files) uploadPdfFile(f);
+  // A targeted upload (from a specific row) only makes sense for ONE file
+  // -- if somehow multiple got picked while targeted, only the first one
+  // gets the target; the rest fall back to filename-derived matching
+  // rather than all silently claiming the same catalog_url.
+  files.forEach((f, i) => uploadPdfFile(f, i === 0 ? targetUpload : null));
+  clearTargetUpload();
   document.getElementById('pdf-file-input').value = '';
 }
 
@@ -337,7 +362,7 @@ function startAutoRefresh() {
   }, 8000);
 }
 
-async function uploadPdfFile(file) {
+async function uploadPdfFile(file, target) {
   const statusEl = document.getElementById('pdf-upload-status');
   const line = document.createElement('div');
   line.className = 'status-msg';
@@ -346,7 +371,7 @@ async function uploadPdfFile(file) {
 
   const fd = new FormData();
   fd.append('file', file);
-  const title = document.getElementById('pdf-title-input').value.trim();
+  const title = document.getElementById('pdf-title-input').value.trim() || (target ? target.title : '');
   const auctioneer = document.getElementById('pdf-auctioneer-input').value.trim();
   const endDate = document.getElementById('pdf-enddate-input').value.trim();
   const state = document.getElementById('pdf-state-input').value.trim();
@@ -356,6 +381,11 @@ async function uploadPdfFile(file) {
   if (endDate) fd.append('end_date', endDate);
   if (state) fd.append('state', state);
   if (zip) fd.append('zip_code', zip);
+  // The real fix: tell the backend exactly which catalog this PDF is for
+  // instead of it guessing from the filename -- a filename rarely matches
+  // BidSpotter's mangled URL string, which is why uploads kept not
+  // clearing from the list even on a clean, uninterrupted upload.
+  if (target && target.catalog_url) fd.append('catalog_url', target.catalog_url);
 
   try {
     const r = await fetch('/api/upload-pdf', {method: 'POST', body: fd});
@@ -409,13 +439,15 @@ function renderNeedsUpdateTable() {
   });
 
   const th = (key, label) => `<th onclick="nuSetSort('${key}')" style="cursor:pointer;">${label}${nuSortKey===key ? (nuSortDir===1?' ▲':' ▼') : ''}</th>`;
-  let html = `<table><thead><tr>${th('filename','File')}${th('end_date','Auction Date')}${th('uploaded_at','First Uploaded Empty')}</tr></thead><tbody>`;
+  let html = `<table><thead><tr>${th('filename','File')}${th('end_date','Auction Date')}${th('uploaded_at','First Uploaded Empty')}<th></th></tr></thead><tbody>`;
   for (const u of sorted) {
     const urgent = isUrgent(u.end_date);
     const dateCell = u.end_date
       ? `<span style="${urgent ? 'color:var(--red);font-weight:700;' : ''}">${u.end_date}${urgent ? ' ⚠️' : ''}</span>`
       : '<span class="muted">—</span>';
-    html += `<tr><td>${titleAsLink(u.filename)}</td><td>${dateCell}</td><td class="muted">${u.uploaded_at ? new Date(u.uploaded_at).toLocaleString() : ''}</td></tr>`;
+    const safeUrl = escapeHtml(u.catalog_url || '').replace(/'/g, "\\'");
+    const safeTitle = escapeHtml(u.catalog_title || u.filename || u.catalog_url || '').replace(/'/g, "\\'");
+    html += `<tr><td>${titleAsLink(u.filename)}</td><td>${dateCell}</td><td class="muted">${u.uploaded_at ? new Date(u.uploaded_at).toLocaleString() : ''}</td><td>${u.catalog_url ? `<a href="#" onclick="startTargetedUpload('${safeUrl}','${safeTitle}');return false;">📄 Upload PDF</a>` : ''}</td></tr>`;
   }
   html += '</tbody></table>';
   el.innerHTML = html;
@@ -430,17 +462,20 @@ async function loadUpdatesToMake() {
     const items = data.updates || [];
     if (countEl) countEl.textContent = items.length;
     if (!items.length) { el.innerHTML = '<div class="empty">Nothing pending — all caught up.</div>'; return; }
-    let html = `<table><thead><tr><th>Title</th><th>Type</th><th>Flagged</th><th></th></tr></thead><tbody>`;
+    let html = `<table><thead><tr><th>Title</th><th>Type</th><th>Flagged</th><th></th><th></th></tr></thead><tbody>`;
     for (const it of items) {
       const badge = it.kind === 'new'
         ? `<span style="color:var(--accent);font-weight:700;">🆕 New</span>`
         : `<span style="color:var(--amber);font-weight:700;">🔁 Reactivated</span>`;
       const bidspotterUrl = reconstructBidspotterUrl(it.catalog_url);
+      const safeUrl = escapeHtml(it.catalog_url).replace(/'/g, "\\'");
+      const safeTitle = escapeHtml(it.title || it.catalog_url).replace(/'/g, "\\'");
       html += `<tr>
         <td>${escapeHtml(it.title || it.catalog_url)}</td>
         <td>${badge}</td>
         <td class="muted">${it.first_flagged_at ? new Date(it.first_flagged_at).toLocaleDateString() : ''}</td>
         <td>${bidspotterUrl ? `<a href="${bidspotterUrl}" target="_blank" rel="noopener noreferrer">View on BidSpotter</a>` : ''}</td>
+        <td><a href="#" onclick="startTargetedUpload('${safeUrl}','${safeTitle}');return false;">📄 Upload PDF</a></td>
       </tr>`;
     }
     html += '</tbody></table>';

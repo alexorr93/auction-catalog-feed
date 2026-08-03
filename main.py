@@ -2048,7 +2048,7 @@ async def api_bright_lots(catalog_url: str = None):
     return {"lots": rows}
 
 
-def _create_upload_record(supabase_client, business_id: str, filename: str, contents: bytes, title: str = "") -> dict:
+def _create_upload_record(supabase_client, business_id: str, filename: str, contents: bytes, title: str = "", explicit_catalog_url: str = "") -> dict:
     """Durable, SYNCHRONOUS step run immediately when a file is received --
     BEFORE it ever touches the in-memory processing queue. Real bug this
     fixes: uploads used to only get logged/stored once the queue worker
@@ -2058,11 +2058,22 @@ def _create_upload_record(supabase_client, business_id: str, filename: str, cont
     success response, and there was nothing anywhere to show the upload
     ever existed. Now the file is safely in storage and logged as
     'processing' the moment it's received; the queue only decides WHEN the
-    (recoverable) parsing work happens, not WHETHER the upload is durable."""
+    (recoverable) parsing work happens, not WHETHER the upload is durable.
+
+    explicit_catalog_url: a SECOND real bug fix. Without this, catalog_url
+    was always derived from the uploaded FILENAME -- which only resolves
+    the matching queue/blank-list entry if the file happens to be named
+    exactly like BidSpotter's mangled URL string. Any normal filename (the
+    auctioneer's own PDF name, anything human-readable) silently fails to
+    match, and the item never clears -- confirmed live, this is why
+    uploads kept not disappearing from the list. When the frontend knows
+    which catalog a PDF is for (uploading from a specific row in Updates
+    to Make / Needs Update), it now passes that real catalog_url through
+    directly instead of leaving it to a filename guess."""
     title = title.strip() or filename
     raw_name = filename.rsplit(".", 1)[0] if filename else str(uuid.uuid4())
     catalog_key = re.sub(r'[^A-Za-z0-9._-]', '_', raw_name)
-    catalog_url = catalog_key
+    catalog_url = explicit_catalog_url.strip() if explicit_catalog_url and explicit_catalog_url.strip() else catalog_key
 
     log_row = {
         "business_id": business_id, "filename": filename, "status": "processing",
@@ -2253,9 +2264,10 @@ async def upload_pdf(request: Request):
     end_date = (form.get("end_date") or "").strip()
     state = (form.get("state") or "").strip()
     zip_code = (form.get("zip_code") or "").strip()
+    explicit_catalog_url = (form.get("catalog_url") or "").strip()
 
     contents = await file.read()
-    record = _create_upload_record(supabase_client, business_id, file.filename, contents, title)
+    record = _create_upload_record(supabase_client, business_id, file.filename, contents, title, explicit_catalog_url)
 
     def _run_and_backfill():
         result = _process_one_pdf(supabase_client, business_id, file.filename, contents,
