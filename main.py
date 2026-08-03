@@ -730,13 +730,22 @@ def _parse_bidspotter_listing_page_from_dom(html: str) -> list:
     """ACTIVE parser for the rebuilt Job 1. html here is page.content()
     from a real, JS-rendered browser session -- the country filter has
     genuinely been applied by Angular by this point, same as what a human
-    sees in their own browser. Same anchor-extraction logic as the old
-    pre-JS-rewrite parser (kept above as _..._OLD_UNUSED for history), just
-    now actually receiving real post-render content instead of a raw
-    fetch's empty shell."""
+    sees in their own browser.
+
+    Real bug fixed here: each listing card has TWO anchors with the same
+    href -- an image-wrapper <a> (no text) and a title <a> (real text).
+    The dedup check used to run BEFORE the title check, so whichever
+    anchor BeautifulSoup happened to encounter first got permanently
+    marked 'seen' -- if that was the empty-text image-wrapper (confirmed
+    live: it comes first in the DOM), the real title anchor right after it
+    was skipped as a duplicate before its text was ever read. This dropped
+    EVERY single listing on the page (1,338 real anchors -> 0 extracted,
+    confirmed live), not a partial miss. Now: track the best title seen so
+    far PER catalog_url, so a later anchor with real text can fill in for
+    an earlier title-less one instead of being blocked by it."""
     soup = BeautifulSoup(html, "html.parser")
-    seen = set()
-    listings = []
+    best_by_url = {}  # catalog_url -> {"full_url":..., "title": "" or real text}
+    order = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if "/auction-catalogues/" not in href or "catalogue-id-" not in href:
@@ -745,12 +754,18 @@ def _parse_bidspotter_listing_page_from_dom(html: str) -> list:
             continue  # these are the per-category refine links inside each card, not the catalog itself
         full_url = href if href.startswith("http") else f"https://www.bidspotter.com{href}"
         catalog_url = _full_url_to_catalog_url(full_url)
-        if catalog_url in seen:
-            continue
-        seen.add(catalog_url)
         title = a.get_text(strip=True)
-        if title:  # the image-wrapper <a> has no text -- skip it, the title <a> duplicate will be caught
-            listings.append({"catalog_url": catalog_url, "title": title, "full_url": full_url})
+        if catalog_url not in best_by_url:
+            best_by_url[catalog_url] = {"full_url": full_url, "title": title}
+            order.append(catalog_url)
+        elif title and not best_by_url[catalog_url]["title"]:
+            # An earlier anchor for this same catalog had no text (the
+            # image-wrapper) -- this later one does, so use it.
+            best_by_url[catalog_url]["title"] = title
+    listings = [
+        {"catalog_url": u, "title": best_by_url[u]["title"], "full_url": best_by_url[u]["full_url"]}
+        for u in order if best_by_url[u]["title"]  # still require SOME real title before including it
+    ]
     return listings
 
 def _update_live_activity(supabase_client, business_id: str, text: str) -> None:
