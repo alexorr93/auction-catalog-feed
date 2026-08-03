@@ -109,6 +109,8 @@ function setView(view) {
   document.getElementById('lots-panel').style.display = view === 'lots' ? '' : 'none';
   document.getElementById('log-panel').style.display = view === 'log' ? '' : 'none';
   document.getElementById('bright-panel').style.display = view === 'bright' ? '' : 'none';
+  if (view === 'lots' && !lots.length) { loadLots().then(renderCurrentView); }
+  else if (view === 'bright' && !brightLots.length) { loadBrightLots().then(renderCurrentView); }
   renderCurrentView();
 }
 
@@ -146,7 +148,16 @@ function titleAsLink(title, displayText) {
 async function loadAll() {
   loadNeedsUpdateQueue(); // starts immediately and renders itself the moment it resolves -- not gated behind the heavier fetches below
   loadUpdatesToMake();
-  await Promise.all([loadCatalogs(), loadLots(), loadPdfUploadLog(), loadBrightLots()]);
+  const fetches = [loadCatalogs(), loadPdfUploadLog()];
+  // /api/lots and /api/bright-lots each page through tens of thousands of
+  // rows -- real bug this fixes: they were being fetched every single 8s
+  // refresh cycle regardless of which tab was even open, from every open
+  // browser tab, which was enough concurrent load to saturate the database
+  // connection pool and take the whole site down. Now only fetched when
+  // their own tab is the one actually being viewed.
+  if (currentView === 'lots') fetches.push(loadLots());
+  if (currentView === 'bright') fetches.push(loadBrightLots());
+  await Promise.all(fetches);
   renderCurrentView();
 }
 
