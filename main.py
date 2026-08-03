@@ -1258,6 +1258,11 @@ async def _run_bidspotter_scan_for_business(supabase_client, business_id: str):
     }
     supabase_client.table("bidspotter_scan_status").upsert(status_row, on_conflict="business_id").execute()
     print(f"BidSpotter scan for {business_id}: {status_row}")
+    _invalidate_cache(f"catalogs:{business_id}")
+    _invalidate_cache(f"lots:{business_id}")
+    _invalidate_cache(f"bright-lots:{business_id}")
+    _invalidate_cache(f"needs-update:{business_id}")
+    _invalidate_cache(f"updates-to-make:{business_id}")
     return status_row
 
 class _NoLotsPublishedYet(Exception):
@@ -2085,21 +2090,65 @@ async def api_backfill_locations():
 
     return status_row
 
+import threading
+_cache_lock = threading.Lock()
+_cache_store = {}  # key -> (value, expires_at_monotonic)
+
+def _cached(key: str, ttl_seconds: float, compute_fn):
+    """Simple shared TTL cache for the read endpoints below. REAL FIX for
+    the outage today: every single page load/poll (from every open tab,
+    every user) was hitting the database fresh and re-sorting/re-paginating
+    the same rows from scratch -- 'extract vs refresh' as it should be:
+    compute once, cache it, serve the cached copy to everyone until it's
+    actually stale, instead of recomputing on every single request. The
+    underlying data only changes when a VA uploads something or the
+    background jobs write new rows, not multiple times a second, so a
+    short TTL is more than fresh enough. A cache miss right after
+    expiry can race across threads and compute twice -- fine, still a
+    tiny fraction of the load this replaces."""
+    now = time.monotonic()
+    with _cache_lock:
+        entry = _cache_store.get(key)
+        if entry is not None and entry[1] > now:
+            return entry[0]
+    value = compute_fn()
+    with _cache_lock:
+        _cache_store[key] = (value, now + ttl_seconds)
+    return value
+
+def _invalidate_cache(prefix: str = None):
+    """Call after any write that should be reflected immediately (uploads,
+    Job 1/2/3 writes) instead of waiting out the TTL. prefix=None clears
+    everything."""
+    with _cache_lock:
+        if prefix is None:
+            _cache_store.clear()
+        else:
+            for k in [k for k in _cache_store if k.startswith(prefix)]:
+                del _cache_store[k]
+
+_READ_CACHE_TTL = 30  # seconds -- data only changes on upload/background-job writes, not multiple times a second
+
+
 @app.get("/api/updates-to-make")
 def api_updates_to_make():
     """Powers the 'Updates to Make' box -- unresolved new catalogs and
     reactivated (was-blank, now-has-content) catalogs, newest flagged first."""
     supabase_client, business_id = _require_config()
-    rows = (supabase_client.table("catalog_updates_queue").select("*")
-            .eq("business_id", business_id).eq("resolved", False)
-            .order("first_flagged_at", desc=True).execute().data or [])
+    def _compute():
+        return (supabase_client.table("catalog_updates_queue").select("*")
+                .eq("business_id", business_id).eq("resolved", False)
+                .order("first_flagged_at", desc=True).execute().data or [])
+    rows = _cached(f"updates-to-make:{business_id}", _READ_CACHE_TTL, _compute)
     return {"updates": rows}
 
 
 @app.get("/api/catalogs")
 def api_catalogs():
     supabase_client, business_id = _require_config()
-    rows = _fetch_all_paginated(lambda: supabase_client.table("auction_catalogs").select("*").eq("business_id", business_id))
+    def _compute():
+        return _fetch_all_paginated(lambda: supabase_client.table("auction_catalogs").select("*").eq("business_id", business_id))
+    rows = _cached(f"catalogs:{business_id}", _READ_CACHE_TTL, _compute)
     return {"catalogs": rows}
 
 
@@ -2111,7 +2160,7 @@ def api_lots(catalog_url: str = None):
         if catalog_url:
             q = q.eq("catalog_url", catalog_url)
         return q.order("last_seen_at", desc=True)
-    rows = _fetch_all_paginated(build_query)
+    rows = _cached(f"lots:{business_id}:{catalog_url or ''}", _READ_CACHE_TTL, lambda: _fetch_all_paginated(build_query))
     return {"lots": rows}
 
 @app.get("/api/bright-lots")
@@ -2125,7 +2174,7 @@ def api_bright_lots(catalog_url: str = None):
         if catalog_url:
             q = q.eq("catalog_url", catalog_url)
         return q.order("last_seen_at", desc=True)
-    rows = _fetch_all_paginated(build_query)
+    rows = _cached(f"bright-lots:{business_id}:{catalog_url or ''}", _READ_CACHE_TTL, lambda: _fetch_all_paginated(build_query))
     return {"lots": rows}
 
 
@@ -2356,6 +2405,10 @@ async def upload_pdf(request: Request):
         if result.get("needs_backfill") and result.get("raw_text"):
             _backfill_catalog_metadata(supabase_client, business_id, result["catalog_url"],
                                         result["raw_text"], file.filename, state, zip_code, end_date)
+        _invalidate_cache(f"catalogs:{business_id}")
+        _invalidate_cache(f"pdf-uploads:{business_id}")
+        _invalidate_cache(f"needs-update:{business_id}")
+        _invalidate_cache(f"updates-to-make:{business_id}")
 
     _pdf_processing_queue.put_nowait(_run_and_backfill)
     return {"ok": True, "queued": True, "filename": file.filename}
@@ -2482,54 +2535,61 @@ async def upload_zip(request: Request):
 @app.get("/api/pdf-uploads")
 def api_pdf_uploads():
     supabase_client, business_id = _require_config()
-    uploads = _fetch_all_paginated(lambda: supabase_client.table("auction_pdf_uploads").select("*")
+    def _compute():
+        return _fetch_all_paginated(lambda: supabase_client.table("auction_pdf_uploads").select("*")
                                      .eq("business_id", business_id).order("uploaded_at", desc=True))
+    uploads = _cached(f"pdf-uploads:{business_id}", _READ_CACHE_TTL, _compute)
     return {"uploads": uploads}
 
 
 @app.get("/api/needs-update")
 def api_needs_update():
     supabase_client, business_id = _require_config()
-    all_uploads = _fetch_all_paginated(lambda: supabase_client.table("auction_pdf_uploads").select("*")
-                                         .eq("business_id", business_id).order("uploaded_at", desc=True))
-    latest_by_catalog = {}
-    for u in all_uploads:
-        key = u.get("catalog_url")
-        if not key:
-            continue
-        existing = latest_by_catalog.get(key)
-        if not existing or (u.get("uploaded_at") or "") > (existing.get("uploaded_at") or ""):
-            latest_by_catalog[key] = u
+    def _compute():
+        all_uploads = _fetch_all_paginated(lambda: supabase_client.table("auction_pdf_uploads").select("*")
+                                             .eq("business_id", business_id).order("uploaded_at", desc=True))
+        latest_by_catalog = {}
+        for u in all_uploads:
+            key = u.get("catalog_url")
+            if not key:
+                continue
+            existing = latest_by_catalog.get(key)
+            if not existing or (u.get("uploaded_at") or "") > (existing.get("uploaded_at") or ""):
+                latest_by_catalog[key] = u
 
-    # Cross-check against the actual current data, not just the upload log --
-    # a catalog that now has real lots (even from an earlier upload attempt,
-    # before a later one came back empty by mistake, or before a parsing bug
-    # got fixed) should never show here, no matter what the log alone says.
-    # Real bug this fixes: a catalog could show as both empty AND appear in
-    # the regular Catalogs list at the same time, because the log and the
-    # actual data could disagree with each other.
-    catalog_rows = _fetch_all_paginated(lambda: supabase_client.table("auction_catalogs").select("catalog_url,lot_count,end_date")
-                                          .eq("business_id", business_id))
-    has_real_lots = {c["catalog_url"] for c in catalog_rows if (c.get("lot_count") or 0) > 0}
-    end_date_by_catalog = {c["catalog_url"]: c.get("end_date") for c in catalog_rows}
+        # Cross-check against the actual current data, not just the upload log --
+        # a catalog that now has real lots (even from an earlier upload attempt,
+        # before a later one came back empty by mistake, or before a parsing bug
+        # got fixed) should never show here, no matter what the log alone says.
+        # Real bug this fixes: a catalog could show as both empty AND appear in
+        # the regular Catalogs list at the same time, because the log and the
+        # actual data could disagree with each other.
+        catalog_rows = _fetch_all_paginated(lambda: supabase_client.table("auction_catalogs").select("catalog_url,lot_count,end_date")
+                                              .eq("business_id", business_id))
+        has_real_lots = {c["catalog_url"] for c in catalog_rows if (c.get("lot_count") or 0) > 0}
+        end_date_by_catalog = {c["catalog_url"]: c.get("end_date") for c in catalog_rows}
 
-    # REAL BUG FIXED HERE, same class as Job 1's known_urls bug: this only
-    # ever checked auction_catalogs (built from manual VA uploads) -- it had
-    # zero awareness that the AUTOMATED pull might have already landed real
-    # lots for the same catalog in bidspotter_auto_catalog_lots. A catalog
-    # the automation successfully pulled would sit on this "needs update"
-    # list forever, since nothing here ever looked at the other table.
-    try:
-        auto_rows = _fetch_all_paginated(lambda: supabase_client.table("bidspotter_auto_catalog_lots").select("catalog_url").eq("business_id", business_id))
-        has_real_lots |= {r["catalog_url"] for r in auto_rows}
-    except Exception as e:
-        print(f"api_needs_update: failed to check automated staging table (non-fatal): {e}")
+        # REAL BUG FIXED HERE, same class as Job 1's known_urls bug: this only
+        # ever checked auction_catalogs (built from manual VA uploads) -- it had
+        # zero awareness that the AUTOMATED pull might have already landed real
+        # lots for the same catalog in bidspotter_auto_catalog_lots. A catalog
+        # the automation successfully pulled would sit on this "needs update"
+        # list forever, since nothing here ever looked at the other table.
+        try:
+            auto_rows = _fetch_all_paginated(lambda: supabase_client.table("bidspotter_auto_catalog_lots").select("catalog_url").eq("business_id", business_id))
+            has_real_lots_local = has_real_lots | {r["catalog_url"] for r in auto_rows}
+        except Exception as e:
+            print(f"api_needs_update: failed to check automated staging table (non-fatal): {e}")
+            has_real_lots_local = has_real_lots
 
-    needs_update = [u for u in latest_by_catalog.values()
-                     if u.get("status") == "empty" and u.get("catalog_url") not in has_real_lots]
-    for u in needs_update:
-        u["end_date"] = u.get("end_date") or end_date_by_catalog.get(u.get("catalog_url"))
-    needs_update.sort(key=lambda u: u.get("uploaded_at") or "", reverse=True)
+        needs_update = [u for u in latest_by_catalog.values()
+                         if u.get("status") == "empty" and u.get("catalog_url") not in has_real_lots_local]
+        for u in needs_update:
+            u["end_date"] = u.get("end_date") or end_date_by_catalog.get(u.get("catalog_url"))
+        needs_update.sort(key=lambda u: u.get("uploaded_at") or "", reverse=True)
+        return needs_update
+
+    needs_update = _cached(f"needs-update:{business_id}", _READ_CACHE_TTL, _compute)
     return {"needs_update": needs_update}
 
 
