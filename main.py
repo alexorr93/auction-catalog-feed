@@ -864,7 +864,15 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
                             marker_info = f"catalogue-id- FOUND at offset {marker_idx}, context=\"{around}\""
                         else:
                             marker_info = "catalogue-id- NOT found anywhere in the rendered DOM"
-                        result["first_page_diagnostic"] = f"page1 bytes={len(html)} | {marker_info} | snippet=\"{snippet}\""
+                        # TARGETED: specifically look for real <a> tags with
+                        # catalogue-id- in their href, not just any
+                        # occurrence of that text anywhere on the page
+                        # (which could be inside a JSON blob instead).
+                        anchor_matches = re.findall(r'<a\b[^>]*href="[^"]*catalogue-id-[^"]*"[^>]*>', html)
+                        anchor_info = f"real <a href> tags with catalogue-id-: {len(anchor_matches)}"
+                        if anchor_matches:
+                            anchor_info += f" | first: {anchor_matches[0][:300]}"
+                        result["first_page_diagnostic"] = f"page1 bytes={len(html)} | {marker_info} | {anchor_info} | snippet=\"{snippet}\""
                     if not listings:
                         empty_pages_in_a_row += 1
                     else:
