@@ -789,25 +789,31 @@ def _parse_bidspotter_listing_page_from_dom(html: str) -> list:
                     break
                 card_text = node.get_text(" ", strip=True)
                 if title in card_text:
-                    # REAL BUG FIXED HERE: category_count used to lock in at
-                    # the FIRST (tightest) matching ancestor only -- but the
-                    # category tag pills may live in a WIDER container than
-                    # where the title first matches (siblings below the
-                    # title, not nested inside the same tight wrapper).
-                    # Locking in early froze category_count at 0 permanently
-                    # for exactly that shape of card, even though continuing
-                    # to climb (like we already do for date) would find the
-                    # real tags. Now recomputed at every level while
-                    # climbing -- climbing higher only ever includes MORE of
-                    # the card's text, so the count can only grow or stay
-                    # the same, never get worse.
+                    # REAL BUG FIXED HERE: this used to `break` the instant
+                    # a date was found, which could truncate the climb
+                    # before ever reaching a WIDER ancestor where the
+                    # category tags or the "Cannot load data"/"Coming soon"
+                    # placeholder actually live. Confirmed live: the two
+                    # anchors on the same card (image-wrapper + title link,
+                    # see the dedup note above) start climbing from
+                    # different depths, so one anchor found its date early
+                    # and stopped climbing right there, missing "Coming
+                    # soon" entirely and failing open to category_count=1 --
+                    # while the OTHER anchor for the exact same catalog
+                    # climbed far enough to see "Coming soon" and correctly
+                    # read 0. Whichever got processed first won, so the
+                    # wrong one stuck. Now always climbs the full 6 levels
+                    # regardless of whether a date was already found --
+                    # climbing higher only ever adds MORE text, never loses
+                    # any, so every check below always sees the widest
+                    # available view of the card.
                     new_count = sum(int(n) for n in category_tag_pattern.findall(card_text))
                     if new_count > category_count:
                         category_count = new_count
-                    m = date_pattern.search(card_text)
-                    if m:
-                        end_date = m.group(1).strip()
-                        break
+                    if end_date is None:  # keep the FIRST (tightest/most precise) date match, don't let a wider one overwrite it
+                        m = date_pattern.search(card_text)
+                        if m:
+                            end_date = m.group(1).strip()
             if category_count == 0 and "cannot load data" in card_text.lower():
                 if "coming soon" in card_text.lower():
                     # REAL FIX: "Coming soon" is BidSpotter's own plain-text
