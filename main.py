@@ -1150,7 +1150,17 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
                     resp = await _brightdata_get(verify_client, real_url)
                     if resp.status_code != 200:
                         continue  # can't confirm either way -- leave it, don't touch it on a failed check
-                    category_count = len(re.findall(r'search-filter\?CategoryCode=', resp.text))
+                    # Anchored to THIS catalog's own id -- same fix as the
+                    # bulk-listing parser above, same reasoning: an
+                    # unanchored count risks picking up an unrelated
+                    # sitewide "browse categories" widget elsewhere on the
+                    # page, not just this catalog's own tags.
+                    cid_m = re.search(r'catalogue-id-([a-z0-9\-]+)', real_url, re.I)
+                    cid = cid_m.group(1).lower() if cid_m else None
+                    if cid:
+                        category_count = len(re.findall(rf'catalogue-id-{re.escape(cid)}[^"\']*search-filter\?CategoryCode=', resp.text, re.IGNORECASE))
+                    else:
+                        category_count = len(re.findall(r'search-filter\?CategoryCode=', resp.text))
                     lot_link_count = len(re.findall(r'/lot-[a-f0-9-]{8}', resp.text, re.IGNORECASE))
                     if category_count == 0 and lot_link_count > 0:
                         category_count = lot_link_count
@@ -1319,8 +1329,12 @@ async def _recheck_blank_catalogs(supabase_client, business_id: str) -> dict:
                     first_error = f"{catalog_url}: {type(e).__name__}: {e}"
                 continue
 
-            category_matches = re.findall(r'search-filter\?CategoryCode=', text)
-            category_count = len(category_matches)
+            cid_m = re.search(r'catalogue-id-([a-z0-9\-]+)', real_url, re.I)
+            cid = cid_m.group(1).lower() if cid_m else None
+            if cid:
+                category_count = len(re.findall(rf'catalogue-id-{re.escape(cid)}[^"\']*search-filter\?CategoryCode=', text, re.IGNORECASE))
+            else:
+                category_count = len(re.findall(r'search-filter\?CategoryCode=', text))
             has_real_content = category_count > 0
             if has_real_content:
                 try:
@@ -1351,7 +1365,12 @@ async def _recheck_blank_catalogs(supabase_client, business_id: str) -> dict:
                     first_error = f"{catalog_url}: {type(e).__name__}: {e}"
                 continue
 
-            new_count = len(re.findall(r'search-filter\?CategoryCode=', text))
+            cid_m2 = re.search(r'catalogue-id-([a-z0-9\-]+)', real_url, re.I)
+            cid2 = cid_m2.group(1).lower() if cid_m2 else None
+            if cid2:
+                new_count = len(re.findall(rf'catalogue-id-{re.escape(cid2)}[^"\']*search-filter\?CategoryCode=', text, re.IGNORECASE))
+            else:
+                new_count = len(re.findall(r'search-filter\?CategoryCode=', text))
             prior_row = prior_counts.get(catalog_url)
             prior_count = prior_row.get("last_category_count") if prior_row else None
 
