@@ -780,6 +780,7 @@ def _parse_bidspotter_listing_page_from_dom(html: str) -> list:
         title = a.get_text(strip=True)
         end_date = None
         category_count = 0
+        card_text = ""  # reset per anchor -- a stale value from a previous anchor must never leak into this one's checks
         if title:
             node = a
             for _ in range(6):  # small hop count -- stay within this one card, not a whole page/section
@@ -807,13 +808,20 @@ def _parse_bidspotter_listing_page_from_dom(html: str) -> list:
                     if m:
                         end_date = m.group(1).strip()
                         break
-            if category_count == 0 and any(k in catalog_url for k in ("bschar10412", "bscmayn10437", "united4-10205")):
-                # TARGETED DIAGNOSTIC: these 3 catalogs have been confirmed
-                # wrong (real content, marked blank) across multiple fix
-                # attempts today. If this is still 0, print exactly what
-                # text Job 1 saw at the widest climbed ancestor so the next
-                # look is at real evidence, not another guess.
-                print(f"Job 1 DIAGNOSTIC still-zero for {catalog_url}: widest_card_text={card_text[:500]!r}")
+            if category_count == 0 and "cannot load data" in card_text.lower():
+                # REAL FIX (from actual diagnostic evidence, not a guess):
+                # confirmed live for Pace Industries - AR - Day 2 -- the
+                # widest card text ends in "...Cannot load data Metalworking
+                # Coming soon...". "Cannot load data" is BidSpotter's OWN
+                # placeholder for a widget that failed to render client-side
+                # -- it is NOT the same thing as a widget that rendered and
+                # genuinely found zero categories. Treating it as confirmed-
+                # zero was silently writing real, upcoming auctions as
+                # blank. Fail open here the same way an outright fetch
+                # failure already does elsewhere in this file, instead of
+                # confirming blank off an inconclusive/unrendered widget.
+                print(f"Job 1: {catalog_url} shows 'Cannot load data' (widget failed to render, not a real zero) -- failing open instead of confirming blank")
+                category_count = 1
         if catalog_url not in best_by_url:
             best_by_url[catalog_url] = {"full_url": full_url, "title": title, "end_date": end_date, "category_count": category_count}
             order.append(catalog_url)
