@@ -1080,184 +1080,75 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
     # response. Each unresolved row now has exactly one owner: the backlog
     # loop above. This loop only ever handles a catalog_url it has never
     # seen before.
+    already_queued_urls = set()
     already_queued = await loop.run_in_executor(None, lambda: _fetch_all_paginated(lambda: supabase_client.table("catalog_updates_queue").select("catalog_url").eq("business_id", business_id).eq("resolved", False)))
     for r in already_queued:
-        known_urls.add(r["catalog_url"])
+        already_queued_urls.add(r["catalog_url"])
 
-    new_count = 0
-    skipped_no_lots_yet = 0
     # REAL BUG FIXED HERE: candidates only ever came from all_listings --
     # THIS run's fresh listing-page scan. A catalog seen in some PAST run
     # (recorded in bidspotter_scan_snapshot) but not showing up on THIS
     # run's specific page range (pagination/sort drift, or simply not
     # re-fetched) would never become a candidate again, yet was also never
-    # uploaded/auto-pulled/queued -- permanently invisible in either
-    # bucket with zero indication anything was wrong. Confirmed live: 163
-    # such catalogs existed. Now also pulls anything from the full
-    # historical snapshot that still isn't accounted for anywhere, so
-    # nothing seen once ever falls through the cracks again.
+    # uploaded/auto-pulled/queued -- permanently invisible with zero
+    # indication anything was wrong. Confirmed live: 163 such catalogs
+    # existed. Now also pulls anything from the full historical snapshot
+    # that still isn't accounted for anywhere.
     all_candidate_items = dict(all_listings)
     try:
-        orphan_check_urls = set(all_candidate_items.keys()) | known_urls
+        orphan_check_urls = set(all_candidate_items.keys()) | known_urls | already_queued_urls
         snapshot_rows_all = await loop.run_in_executor(None, lambda: _fetch_all_paginated(lambda: supabase_client.table("bidspotter_scan_snapshot").select("catalog_url,title,end_date").eq("business_id", business_id)))
-        orphaned = 0
         for r in snapshot_rows_all:
             if r["catalog_url"] not in orphan_check_urls:
                 all_candidate_items[r["catalog_url"]] = {"title": r.get("title"), "end_date": r.get("end_date")}
                 orphan_check_urls.add(r["catalog_url"])
-                orphaned += 1
-        if orphaned:
-            print(f"Job 1: found {orphaned} catalogs seen before but never classified (fell off a past run's page range) -- adding them as candidates now")
     except Exception as e:
-        print(f"Job 1: failed to pull historical snapshot for orphan catalogs (non-fatal, continuing with this run's fresh listing only): {e}")
-    candidates = [(catalog_url, item) for catalog_url, item in all_candidate_items.items() if catalog_url not in known_urls]
-    async with httpx.AsyncClient(timeout=20.0, headers={"User-Agent": "Mozilla/5.0"}) as verify_client:
-        # BACKLOG CLEANUP FIRST: everything queued BEFORE this verify step
-        # existed (or from the brief bad deploy that skipped verification
-        # entirely) is still sitting in catalog_updates_queue unresolved,
-        # most of it genuinely blank. Deliberately runs before the brand-new
-        # candidates below -- these are the ones actually blocking the VA
-        # right now, so they get checked first instead of waiting behind a
-        # fresh batch of new candidates.
-        #
-        # REAL FIX: confirmed-blank rows used to be DELETED outright -- that
-        # was wrong. Deleting means no record of what was checked or why it
-        # was removed, and the person has no way to verify or spot-check the
-        # work. Now they're UPDATED in place to kind='blank' and stay
-        # visible (in their own "Confirmed Blank" section, not the
-        # actionable Updates-to-Make list) instead of disappearing. Still
-        # excluded from known_urls below only via the resolved flag (stays
-        # False), so a future Job 1 run naturally re-checks and upgrades it
-        # the moment BidSpotter actually posts real lots.
-        # REAL BUG FIXED HERE: this used to re-check EVERY unresolved row on
-        # every single Job 1 run, including ones already confirmed to have
-        # real lots hours earlier. One bad/blocked fetch (BidSpotter's WAF
-        # challenge, or Bright Data getting rate-limited from checking the
-        # same catalog repeatedly across back-to-back runs) was then enough
-        # to wrongly flip a confirmed-good catalog to blank with no second
-        # opinion -- confirmed live: "Pace Industries - AR - Day 2" is a
-        # real upcoming Oct 2026 auction and got marked blank by exactly
-        # this. Only re-check rows that are still unconfirmed (kind is
-        # 'blank', to see if real content has since appeared) -- a row
-        # already confirmed 'new' (has real lots) is trusted and left
-        # alone here; Job 2/3's normal ongoing lot-pull is what tracks
-        # whether an active catalog later goes stale, not this check.
-        backlog_removed = 0
+        print(f"Job 1: failed to pull historical snapshot for orphan catalogs (non-fatal, continuing): {e}")
+
+    # SIMPLIFIED DESIGN, per direct instruction: Job 1 no longer guesses
+    # blank vs not-blank at all. That automated per-catalog verification
+    # (Bright Data fetch + counting category tags) was the single biggest
+    # source of tonight's problems -- WAF challenges, wildly inflated
+    # counts from contaminated card boundaries, confirmed-good catalogs
+    # wrongly flipped back to blank by one bad response. The VA is now
+    # the sole source of truth: every catalog without real stored data
+    # anywhere shows up in ONE review list (no cap), and the VA either
+    # uploads the real catalog or clicks Mark Blank. Job 1's only job now
+    # is noticing brand-new catalogs -- it NEVER touches kind or
+    # blank_marked_at on a row already in the queue, so a VA's
+    # blank-marking is never silently overwritten by a re-scan. A blank
+    # row only ever leaves the queue when real data actually lands for it
+    # (upload or auto-pull), handled elsewhere by the existing
+    # resolved=True paths.
+    new_count = 0
+    refreshed_count = 0
+    for catalog_url, item in all_candidate_items.items():
+        if catalog_url in known_urls:
+            continue  # already has real stored data somewhere -- nothing to review
+        if catalog_url in already_queued_urls:
+            try:
+                def _refresh(catalog_url=catalog_url, item=item):
+                    supabase_client.table("catalog_updates_queue").update({
+                        "title": item.get("title"), "end_date": item.get("end_date"),
+                    }).eq("business_id", business_id).eq("catalog_url", catalog_url).execute()
+                await loop.run_in_executor(None, _refresh)
+                refreshed_count += 1
+            except Exception as e:
+                print(f"Job 1: failed to refresh existing queue row {catalog_url}: {e}")
+            continue
         try:
-            backlog_rows = await loop.run_in_executor(None, lambda: _fetch_all_paginated(lambda: supabase_client.table("catalog_updates_queue").select("id,catalog_url,title").eq("business_id", business_id).eq("resolved", False).eq("kind", "blank")))
+            def _insert(catalog_url=catalog_url, item=item):
+                supabase_client.table("catalog_updates_queue").insert({
+                    "business_id": business_id, "catalog_url": catalog_url, "title": item.get("title"),
+                    "end_date": item.get("end_date"), "resolved": False,
+                }).execute()
+            await loop.run_in_executor(None, _insert)
+            new_count += 1
         except Exception as e:
-            print(f"Job 1 backlog cleanup: failed to fetch existing queue rows: {e}")
-            backlog_rows = []
-        for i, row in enumerate(backlog_rows, 1):
-            catalog_url = row["catalog_url"]
-            if i % 5 == 0 or i == 1:
-                await loop.run_in_executor(None, lambda i=i: _update_live_activity(supabase_client, business_id, f"Job 1: cleaning old queue backlog {i}/{len(backlog_rows)}"))
-
-            # REAL FIX: use the category_count already captured from THIS
-            # run's bulk listing scan (all_listings) first -- it's the same
-            # search-filter?CategoryCode= links this codebase already
-            # trusts, read directly off the page that's already been
-            # fetched successfully for discovery. No second per-catalog
-            # fetch needed, so no WAF/bot-check risk on this check at all.
-            # Only fall back to a direct fetch if this catalog didn't show
-            # up in the current scan (e.g. fell off the visible pages).
-            listing_item = all_listings.get(catalog_url)
-            if listing_item is not None:
-                category_count = listing_item.get("category_count", 0)
-                if category_count == 0:
-                    continue  # still genuinely blank per this run's fresh scan
-            else:
-                real_url = _reconstruct_full_url(catalog_url)
-                if not real_url:
-                    continue
-                try:
-                    resp = await _brightdata_get(verify_client, real_url)
-                    if resp.status_code != 200:
-                        continue  # can't confirm either way -- leave it, don't touch it on a failed check
-                    # Anchored to THIS catalog's own id -- same fix as the
-                    # bulk-listing parser above, same reasoning: an
-                    # unanchored count risks picking up an unrelated
-                    # sitewide "browse categories" widget elsewhere on the
-                    # page, not just this catalog's own tags.
-                    cid_m = re.search(r'catalogue-id-([a-z0-9\-]+)', real_url, re.I)
-                    cid = cid_m.group(1).lower() if cid_m else None
-                    if cid:
-                        category_count = len(re.findall(rf'catalogue-id-{re.escape(cid)}[^"\']*search-filter\?CategoryCode=', resp.text, re.IGNORECASE))
-                    else:
-                        category_count = len(re.findall(r'search-filter\?CategoryCode=', resp.text))
-                    lot_link_count = len(re.findall(r'/lot-[a-f0-9-]{8}', resp.text, re.IGNORECASE))
-                    if category_count == 0 and lot_link_count > 0:
-                        category_count = lot_link_count
-                    if category_count == 0:
-                        continue  # already kind='blank' -- nothing to change, still confirmed blank
-                except Exception as e:
-                    print(f"Job 1 backlog cleanup: verify fetch failed for {catalog_url} (leaving it, not removing on a flaky check): {type(e).__name__}: {e}")
-                    continue
-            # REAL BUG FIXED HERE: this loop only ever handled the
-            # category_count==0 case -- there was no path to upgrade a
-            # catalog back to kind='new' once BidSpotter actually posted
-            # real lots for it. A catalog confirmed blank would stay
-            # invisible to the VA forever, even after content appeared.
-            try:
-                await loop.run_in_executor(None, lambda row_id=row["id"], catalog_url=catalog_url, category_count=category_count: supabase_client.table("catalog_updates_queue").update({
-                    "kind": "new", "category_count": category_count,
-                }).eq("id", row_id).execute())
-                new_count += 1
-                print(f"Job 1 backlog cleanup: {catalog_url} now has real lots (category_count={category_count}) -- upgraded back to Updates to Make")
-            except Exception as e:
-                print(f"Job 1 backlog cleanup: failed to upgrade newly-active row {catalog_url}: {e}")
-
-        for i, (catalog_url, item) in enumerate(candidates, 1):
-            # REAL FIX: every one of these Supabase calls is the SYNC client,
-            # called directly inside this async function -- exactly the same
-            # event-loop-blocking bug already fixed for the HTTP routes, just
-            # relocated here. With ~120 calls across this loop it froze the
-            # whole server again during every Job 1 run. run_in_executor
-            # moves each one off the event loop onto a real thread.
-            if i % 5 == 0 or i == 1:
-                await loop.run_in_executor(None, lambda i=i: _update_live_activity(supabase_client, business_id, f"Job 1: classifying new catalog {i}/{len(candidates)}"))
-            # REAL FIX (much bigger one): this used to fetch each candidate's
-            # OWN individual page a second time just to count category tags
-            # -- a WAF-protected fetch that's been the actual source of
-            # today's false-blank misclassifications (blocked/placeholder
-            # responses, category widgets not consistently present on the
-            # individual page). Confirmed live by direct visual proof: the
-            # real category tags with real counts (e.g. "Food & Beverage
-            # Equipment (70)") are already sitting in each catalog's own
-            # card on THIS bulk listing page -- the parser now extracts them
-            # directly (see _parse_bidspotter_listing_page_from_dom), so no
-            # second fetch is needed here at all. Faster (no per-candidate
-            # network round trip) and more reliable (one successful fetch
-            # instead of two, no bot-block window on this step).
-            category_count = item.get("category_count", 0)
-
-            if category_count == 0:
-                skipped_no_lots_yet += 1
-                try:
-                    def _upsert_blank(catalog_url=catalog_url, item=item):
-                        supabase_client.table("catalog_updates_queue").upsert({
-                            "business_id": business_id, "catalog_url": catalog_url, "title": item["title"],
-                            "end_date": item.get("end_date"), "kind": "blank", "resolved": False,
-                            "category_count": 0,
-                        }, on_conflict="business_id,catalog_url").execute()
-                    await loop.run_in_executor(None, _upsert_blank)
-                except Exception as e:
-                    print(f"BidSpotter scan: failed to record blank catalog {catalog_url}: {e}")
-                continue
-            try:
-                def _upsert(catalog_url=catalog_url, item=item, category_count=category_count):
-                    supabase_client.table("catalog_updates_queue").upsert({
-                        "business_id": business_id, "catalog_url": catalog_url, "title": item["title"],
-                        "end_date": item.get("end_date"), "kind": "new", "resolved": False,
-                        "category_count": category_count,
-                    }, on_conflict="business_id,catalog_url").execute()
-                await loop.run_in_executor(None, _upsert)
-                new_count += 1
-            except Exception as e:
-                print(f"BidSpotter scan: failed to queue new catalog {catalog_url}: {e}")
+            print(f"Job 1: failed to insert new queue row {catalog_url}: {e}")
 
     return {"ok": True, "error": None, "pages": pages_fetched, "listings": len(all_listings),
-            "new_flagged": new_count, "skipped_no_lots_yet": skipped_no_lots_yet, "backlog_removed": backlog_removed}
+            "new_flagged": new_count, "refreshed": refreshed_count}
 
 async def _recheck_blank_catalogs(supabase_client, business_id: str) -> dict:
     """Job 2. For every catalog we already know about that's currently
@@ -1469,7 +1360,6 @@ async def _run_bidspotter_scan_for_business(supabase_client, business_id: str):
     _invalidate_cache(f"bright-lots:{business_id}")
     _invalidate_cache(f"needs-update:{business_id}")
     _invalidate_cache(f"updates-to-make:{business_id}")
-    _invalidate_cache(f"confirmed-blank:{business_id}")
     return status_row
 
 class _NoLotsPublishedYet(Exception):
@@ -2351,36 +2241,42 @@ _READ_CACHE_TTL = 30  # seconds -- data only changes on upload/background-job wr
 
 @app.get("/api/updates-to-make")
 def api_updates_to_make():
-    """Powers the 'Updates to Make' box -- unresolved new catalogs and
-    reactivated (was-blank, now-has-content) catalogs, newest flagged first.
-    Excludes kind='blank' -- those are confirmed to have zero lots on
-    BidSpotter right now, so there's nothing actionable for a VA to do yet;
-    they show in /api/confirmed-blank instead so they stay visible rather
-    than just disappearing."""
+    """Powers the single unified review queue. Per direct instruction: NO
+    automated blank/not-blank guessing anymore -- every catalog without
+    real stored data shows here, no cap, and the VA is the one who marks
+    each one blank or uploads the real thing. Sort order does the actual
+    work here: pending (never marked blank) rows first, oldest-flagged
+    first, so brand-new discoveries surface promptly; blank-marked rows
+    sink to the bottom, ordered by blank_marked_at ascending -- the
+    longest a catalog has sat blank without being re-checked, the closer
+    to the top of that bottom section it rises, so stale blanks
+    naturally resurface for a recheck over time without any fixed timer
+    or cap hiding them."""
     supabase_client, business_id = _require_config()
     def _compute():
-        return (supabase_client.table("catalog_updates_queue").select("*")
-                .eq("business_id", business_id).eq("resolved", False).neq("kind", "blank")
-                .order("first_flagged_at", desc=True).execute().data or [])
+        rows = (supabase_client.table("catalog_updates_queue").select("*")
+                .eq("business_id", business_id).eq("resolved", False)
+                .execute().data or [])
+        pending = sorted([r for r in rows if not r.get("blank_marked_at")], key=lambda r: r.get("first_flagged_at") or "")
+        blanks = sorted([r for r in rows if r.get("blank_marked_at")], key=lambda r: r.get("blank_marked_at") or "")
+        return pending + blanks
     rows = _cached(f"updates-to-make:{business_id}", _READ_CACHE_TTL, _compute)
     return {"updates": rows}
 
 
-@app.get("/api/confirmed-blank")
-def api_confirmed_blank():
-    """Catalogs Job 1 has directly verified have zero lots posted on
-    BidSpotter right now (kind='blank') -- kept visible here instead of
-    being silently deleted, so there's a real record of what was checked.
-    Not actionable for a VA (nothing to upload yet), but transparent. Will
-    naturally move to Updates-to-Make on its own the next time Job 1 or 2
-    re-checks it and finds real content."""
+@app.post("/api/updates/{queue_id}/mark-blank")
+def api_mark_blank(queue_id: str):
+    """The VA's manual call: nothing posted for this catalog yet. Sinks it
+    to the bottom of the same unified list (never hidden, never capped)
+    -- see api_updates_to_make for the sort logic. Uploading the real
+    catalog later (existing upload flow) is what actually clears a row;
+    this only records that it was checked and found empty right now."""
     supabase_client, business_id = _require_config()
-    def _compute():
-        return (supabase_client.table("catalog_updates_queue").select("*")
-                .eq("business_id", business_id).eq("resolved", False).eq("kind", "blank")
-                .order("first_flagged_at", desc=True).execute().data or [])
-    rows = _cached(f"confirmed-blank:{business_id}", _READ_CACHE_TTL, _compute)
-    return {"blank": rows}
+    supabase_client.table("catalog_updates_queue").update({
+        "kind": "blank", "blank_marked_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", queue_id).eq("business_id", business_id).execute()
+    _invalidate_cache(f"updates-to-make:{business_id}")
+    return {"ok": True}
 
 
 @app.get("/api/catalogs")
