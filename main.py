@@ -704,9 +704,36 @@ def _parse_bidspotter_listing_page(html: str) -> list:
     return listings
 
 def _parse_bidspotter_listing_page_OLD_UNUSED(html: str) -> list:
-    """Kept for reference only -- not called. Original anchor-tag based
-    parser, replaced because BidSpotter's <a href> catalog links only exist
-    post-JS-render, which a plain fetch never produces."""
+    """Kept for reference only -- not called directly by name, but its
+    logic is now the active parser below (_parse_bidspotter_listing_page_
+    from_dom) now that Job 1 loads real rendered pages via a browser."""
+    soup = BeautifulSoup(html, "html.parser")
+    seen = set()
+    listings = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "/auction-catalogues/" not in href or "catalogue-id-" not in href:
+            continue
+        if "search-filter" in href:
+            continue  # these are the per-category refine links inside each card, not the catalog itself
+        full_url = href if href.startswith("http") else f"https://www.bidspotter.com{href}"
+        catalog_url = _full_url_to_catalog_url(full_url)
+        if catalog_url in seen:
+            continue
+        seen.add(catalog_url)
+        title = a.get_text(strip=True)
+        if title:  # the image-wrapper <a> has no text -- skip it, the title <a> duplicate will be caught
+            listings.append({"catalog_url": catalog_url, "title": title, "full_url": full_url})
+    return listings
+
+def _parse_bidspotter_listing_page_from_dom(html: str) -> list:
+    """ACTIVE parser for the rebuilt Job 1. html here is page.content()
+    from a real, JS-rendered browser session -- the country filter has
+    genuinely been applied by Angular by this point, same as what a human
+    sees in their own browser. Same anchor-extraction logic as the old
+    pre-JS-rewrite parser (kept above as _..._OLD_UNUSED for history), just
+    now actually receiving real post-render content instead of a raw
+    fetch's empty shell."""
     soup = BeautifulSoup(html, "html.parser")
     seen = set()
     listings = []
@@ -740,68 +767,100 @@ def _update_live_activity(supabase_client, business_id: str, text: str) -> None:
         print(f"Failed to update live activity: {e}")
 
 async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> dict:
-    """Job 1. Pages through the full public listing, stores every catalog
-    seen into bidspotter_scan_snapshot (a durable record -- if BidSpotter
-    ever changes their page layout and parsing silently breaks, this table
-    going stale/empty is how that gets noticed instead of just quietly
-    missing catalogs forever), then flags anything not already in
-    auction_pdf_uploads as a new item in the updates queue. Returns a dict
-    describing what actually happened -- including the real error if the
-    first fetch fails, since that failure was previously completely
-    invisible (a background task, no request, nothing in reach to check)."""
+    """Job 1. Pages through the full US-filtered public listing, stores
+    every catalog seen into bidspotter_scan_snapshot (a durable record --
+    if BidSpotter ever changes their page layout and parsing silently
+    breaks, this table going stale/empty is how that gets noticed instead
+    of just quietly missing catalogs forever), then flags anything not
+    already in auction_pdf_uploads as a new item in the updates queue.
+
+    REBUILT to use a real Bright Data BROWSER session (Playwright,
+    connect_over_cdp) instead of the plain-HTTP Web Unlocker fetch this
+    used before. Root cause of Canadian catalogs (confirmed: Infinity
+    Asset Solutions) leaking into a "US-only" queue: the previous version
+    parsed schema.org JSON-LD embedded in the RAW, un-rendered HTML -- data
+    that exists on the page regardless of whether the countryName=United
+    States filter was ever actually applied. It was never proven that
+    embedded blob respects the filter at all, and live evidence (the user
+    directly compared BidSpotter's own filtered UI, which correctly shows
+    ZERO Infinity Asset Solutions results for a Canadian catalog, against
+    our snapshot, which had TEN of them) confirms it does not. This version
+    loads the real page, lets Angular actually apply the filter client-side
+    exactly as a human's browser would, and reads the real rendered DOM --
+    the same class of result the user's own screenshot showed, not a raw
+    data blob of unknown fidelity to the filter."""
+    from playwright.async_api import async_playwright
+    wss_url = os.environ.get("BRIGHT_DATA_BROWSER_WSS")
+    if not wss_url:
+        return {"ok": False, "error": "BRIGHT_DATA_BROWSER_WSS not set", "pages": 0, "listings": 0, "new_flagged": 0}
+
     all_listings = {}
     pages_fetched = 0
     first_page_error = None
-    first_page_diagnostic = None  # captured on page 1 only, used purely for debugging a 0-listings outcome
-    async with httpx.AsyncClient(timeout=30.0, headers={"User-Agent": "Mozilla/5.0"}) as client:
-        page = 1
-        empty_pages_in_a_row = 0
-        while page <= 60 and empty_pages_in_a_row < 2:  # hard ceiling -- never loop forever on an unexpected layout change
-            _update_live_activity(supabase_client, business_id, f"Job 1: fetching listing page {page}")
-            url = f"https://www.bidspotter.com/en-us/auction-catalogues/search-filter?countryName=United%20States&page={page}"
+    first_page_diagnostic = None
+
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.connect_over_cdp(wss_url, timeout=120000)
             try:
-                resp = await _brightdata_get(client, url)
-                resp.raise_for_status()
-            except Exception as e:
-                err = f"page {page} fetch failed: {type(e).__name__}: {e}"
-                print(f"BidSpotter scan: {err}")
-                if page == 1:
-                    first_page_error = err
-                break
-            pages_fetched += 1
-            # DEFINITIVE PROBE, not a fix: checking whether the raw response
-            # for this "US-filtered" URL contains a KNOWN-Canadian
-            # auctioneer's data at all. If it's present in the raw HTML,
-            # the filter genuinely doesn't restrict server output and
-            # expect_selector/JS-timing is the wrong theory entirely -- the
-            # embedded schema.org data is identical regardless of country.
-            if "infinity-asset-solutions" in resp.text.lower() or "bscinf" in resp.text.lower():
-                print(f"[COUNTRY FILTER PROBE] page {page}: raw response DOES contain infinity-asset-solutions/bscinf data even though URL says countryName=United%20States -- filter does not restrict server-side output")
-            listings = _parse_bidspotter_listing_page(resp.text)
-            if page == 1:
-                # Capture real evidence of what came back -- status, length, final
-                # URL, a snippet, AND whether the target content exists ANYWHERE
-                # in the full body (not just the visible start) -- distinguishes
-                # "never rendered at all" from "rendered but our parser/selector
-                # is looking in the wrong place".
-                snippet = re.sub(r'\s+', ' ', resp.text[:400]).strip()
-                marker_idx = resp.text.find("catalogue-id-")
-                if marker_idx >= 0:
-                    around = re.sub(r'\s+', ' ', resp.text[max(0, marker_idx-150):marker_idx+150]).strip()
-                    marker_info = f"catalogue-id- FOUND at offset {marker_idx}, context=\"{around}\""
-                else:
-                    marker_info = "catalogue-id- NOT found anywhere in the full response body"
-                first_page_diagnostic = (
-                    f"page1 status={resp.status_code} bytes={len(resp.text)} "
-                    f"final_url={str(resp.url)} | {marker_info} | snippet=\"{snippet}\""
-                )
-            if not listings:
-                empty_pages_in_a_row += 1
-            else:
+                page_obj = await browser.new_page()
+                page_num = 1
                 empty_pages_in_a_row = 0
-                for item in listings:
-                    all_listings[item["catalog_url"]] = item
-            page += 1
+                while page_num <= 60 and empty_pages_in_a_row < 2:  # hard ceiling -- never loop forever on an unexpected layout change
+                    _update_live_activity(supabase_client, business_id, f"Job 1: fetching listing page {page_num}")
+                    url = f"https://www.bidspotter.com/en-us/auction-catalogues/search-filter?countryName=United%20States&page={page_num}"
+                    try:
+                        await page_obj.goto(url, timeout=120000, wait_until="domcontentloaded")
+                        # Real proof the country-filtered results actually
+                        # rendered -- either a real catalog link shows up,
+                        # or the page settles on a genuine "no results"
+                        # state. Not a fixed sleep: waits for the actual
+                        # thing that matters, same principle proven
+                        # reliable in the lot-pull tonight.
+                        try:
+                            await page_obj.wait_for_function(
+                                "document.querySelectorAll('a[href*=\"catalogue-id-\"]').length > 0"
+                                " || document.body.innerText.toLowerCase().includes('no results')"
+                                " || document.body.innerText.toLowerCase().includes('0 auctions')",
+                                timeout=45000
+                            )
+                        except Exception:
+                            pass  # fall through -- still try to read whatever DOM state exists
+                        html = await page_obj.content()
+                    except Exception as e:
+                        err = f"page {page_num} fetch failed: {type(e).__name__}: {e}"
+                        print(f"BidSpotter scan: {err}")
+                        if page_num == 1:
+                            first_page_error = err
+                        break
+
+                    pages_fetched += 1
+                    listings = _parse_bidspotter_listing_page_from_dom(html)
+                    if page_num == 1:
+                        marker_idx = html.find("catalogue-id-")
+                        snippet = re.sub(r'\s+', ' ', html[:400]).strip()
+                        if marker_idx >= 0:
+                            around = re.sub(r'\s+', ' ', html[max(0, marker_idx-150):marker_idx+150]).strip()
+                            marker_info = f"catalogue-id- FOUND at offset {marker_idx}, context=\"{around}\""
+                        else:
+                            marker_info = "catalogue-id- NOT found anywhere in the rendered DOM"
+                        first_page_diagnostic = f"page1 bytes={len(html)} | {marker_info} | snippet=\"{snippet}\""
+                    if not listings:
+                        empty_pages_in_a_row += 1
+                    else:
+                        empty_pages_in_a_row = 0
+                        for item in listings:
+                            all_listings[item["catalog_url"]] = item
+                    page_num += 1
+            finally:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+    except Exception as e:
+        err = f"browser session failed: {type(e).__name__}: {e}"
+        print(f"BidSpotter scan: {err}")
+        return {"ok": False, "error": err, "pages": pages_fetched, "listings": 0, "new_flagged": 0}
 
     if first_page_error:
         return {"ok": False, "error": first_page_error, "pages": pages_fetched, "listings": 0, "new_flagged": 0}
