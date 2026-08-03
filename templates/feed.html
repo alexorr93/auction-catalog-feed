@@ -34,7 +34,15 @@ a:hover { color: #93c5fd; }
 @keyframes spin { to { transform: rotate(360deg); } }
 tr.row-viewed { background: rgba(248,113,113,0.35) !important; border-left: 4px solid #f87171; }
 tr.row-viewed td { border-bottom-color: rgba(248,113,113,0.4); }
+tr.row-uploading { background: rgba(96,165,250,0.28) !important; border-left: 4px solid #60a5fa; }
+tr.row-success { background: rgba(74,222,128,0.3) !important; border-left: 4px solid #4ade80; }
+tr.row-error { background: rgba(239,68,68,0.3) !important; border-left: 4px solid #ef4444; }
+tr.row-blanking { background: rgba(148,163,184,0.25) !important; border-left: 4px solid #94a3b8; }
 .viewed-badge { display: inline-block; background: #f87171; color: #1a0505; font-weight: 800; font-size: 10px; letter-spacing: .04em; padding: 2px 7px; border-radius: 5px; margin-left: 8px; vertical-align: middle; }
+.row-status-badge { display: inline-block; font-weight: 800; font-size: 10px; letter-spacing: .04em; padding: 2px 7px; border-radius: 5px; margin-left: 8px; vertical-align: middle; }
+.row-status-badge.uploading { background: #60a5fa; color: #04101f; }
+.row-status-badge.success { background: #4ade80; color: #052e12; }
+.row-status-badge.error { background: #ef4444; color: #2b0505; }
 </style>
 </head>
 <body>
@@ -301,6 +309,7 @@ function uploadForRow(catalogUrl, btnEl) {
   // specific queue/needs-update row's "Upload PDF" button uploads with
   // THAT row's real catalog_url attached, instead of the generic drop
   // zone at the top (which has no idea which catalog a file is for).
+  const rowEl = btnEl.closest('tr');
   const input = document.createElement('input');
   input.type = 'file';
   input.accept = 'application/pdf';
@@ -310,7 +319,7 @@ function uploadForRow(catalogUrl, btnEl) {
       const original = btnEl.textContent;
       btnEl.textContent = '⏳ Uploading...';
       btnEl.disabled = true;
-      uploadPdfFile(input.files[0], catalogUrl).finally(() => {
+      uploadPdfFile(input.files[0], catalogUrl, rowEl).finally(() => {
         btnEl.textContent = original;
         btnEl.disabled = false;
       });
@@ -379,12 +388,18 @@ function startAutoRefresh() {
   }, 20000);
 }
 
-async function uploadPdfFile(file, catalogUrl) {
+async function uploadPdfFile(file, catalogUrl, rowEl) {
   const statusEl = document.getElementById('pdf-upload-status');
   const line = document.createElement('div');
   line.className = 'status-msg';
   line.textContent = `⏳ Uploading and reading ${file.name}...`;
   statusEl.prepend(line);
+
+  // REAL FIX, per direct instruction: any action on a row should make
+  // THAT row react immediately, not just a status line up top the VA
+  // has to keep glancing away to check. File picked -> row goes blue
+  // right now, before the network request even starts.
+  if (rowEl) setRowState(rowEl, 'uploading', 'UPLOADING');
 
   const fd = new FormData();
   fd.append('file', file);
@@ -413,22 +428,42 @@ async function uploadPdfFile(file, catalogUrl) {
     // often 1-2 minutes) gave the VA zero feedback the whole time, so it
     // looked like nothing was happening and they couldn't tell when it
     // was actually safe to move on. Now polls this SPECIFIC upload's own
-    // row every 2.5s and updates the line live until it reaches a real
-    // terminal state.
+    // row every 2.5s and updates both the line AND the table row live
+    // until it reaches a real terminal state.
     if (data.log_id) {
-      pollUploadStatus(data.log_id, file.name, line);
+      pollUploadStatus(data.log_id, file.name, line, rowEl);
     } else {
       line.innerHTML = `${file.name} — queued, processing in the background now`;
     }
     startAutoRefresh();
   } catch(e) {
     line.textContent = `❌ ${file.name} — ${e.message}`;
+    if (rowEl) setRowState(rowEl, 'error', 'FAILED');
   } finally {
     await loadAll();
   }
 }
 
-async function pollUploadStatus(logId, filename, lineEl) {
+function setRowState(rowEl, state, label) {
+  // Shared helper so every action (upload, mark blank, view) reacts on
+  // the row the same consistent way -- clears any previous state class
+  // first so states never stack or fight each other visually.
+  rowEl.classList.remove('row-uploading', 'row-success', 'row-error', 'row-blanking', 'row-viewed');
+  if (state) rowEl.classList.add(`row-${state}`);
+  const titleCell = rowEl.querySelector('td');
+  if (!titleCell) return;
+  const existingBadge = titleCell.querySelector('.row-status-badge, .viewed-badge');
+  if (existingBadge) existingBadge.remove();
+  if (label) {
+    const badge = document.createElement('span');
+    badge.className = state === 'viewed' ? 'viewed-badge' : `row-status-badge ${state}`;
+    badge.innerHTML = state === 'uploading' ? `<span class="spinner" style="border-top-color:#04101f;border-color:rgba(4,16,31,0.3);"></span>${label}` : label;
+    titleCell.appendChild(document.createTextNode(' '));
+    titleCell.appendChild(badge);
+  }
+}
+
+async function pollUploadStatus(logId, filename, lineEl, rowEl) {
   const TERMINAL = new Set(['success', 'partial', 'empty', 'error']);
   for (let attempt = 0; attempt < 240; attempt++) {  // ~10 min ceiling -- never poll forever on a genuinely stuck job
     let row;
@@ -448,6 +483,11 @@ async function pollUploadStatus(logId, filename, lineEl) {
         error: `failed — ${row.error_message ? row.error_message.slice(0, 150) : 'unknown error'}`,
       };
       lineEl.innerHTML = `${icons[row.status]} ${filename} — ${labels[row.status]}`;
+      if (rowEl) {
+        const rowLabels = {success: 'DONE ✅', partial: 'PARTIAL ⚠️', empty: 'EMPTY 🚫', error: 'FAILED ❌'};
+        const rowState = (row.status === 'success' || row.status === 'partial') ? 'success' : 'error';
+        setRowState(rowEl, rowState, rowLabels[row.status]);
+      }
       await loadAll();
       return;
     }
@@ -555,27 +595,24 @@ function markRowViewed(catalogUrl, queueId) {
   viewedCatalogUrls.add(catalogUrl);
   const row = document.getElementById(`row-${queueId}`);
   if (row && !row.classList.contains('row-viewed')) {
-    row.classList.add('row-viewed');
-    const titleCell = row.querySelector('td');
-    if (titleCell && !titleCell.querySelector('.viewed-badge')) {
-      const badge = document.createElement('span');
-      badge.className = 'viewed-badge';
-      badge.textContent = '👁️ VIEWING';
-      titleCell.appendChild(document.createTextNode(' '));
-      titleCell.appendChild(badge);
-    }
+    setRowState(row, 'viewed', '👁️ VIEWING');
   }
 }
 
 async function markBlank(queueId, btnEl) {
-  const original = btnEl.textContent;
-  btnEl.textContent = '⏳...';
+  // REAL FIX, per direct instruction: react on the row immediately,
+  // don't make the VA wait for a full table reload just to see
+  // something happened. Optimistic update -- reverts if the request
+  // actually fails.
+  const row = btnEl.closest('tr');
+  if (row) setRowState(row, 'blanking', '⏳ MARKING BLANK');
   btnEl.disabled = true;
   try {
-    await fetch(`/api/updates/${queueId}/mark-blank`, {method: 'POST'});
+    const r = await fetch(`/api/updates/${queueId}/mark-blank`, {method: 'POST'});
+    if (!r.ok) throw new Error('request failed');
     await loadUpdatesToMake();
   } catch(e) {
-    btnEl.textContent = original;
+    if (row) setRowState(row, null, null);
     btnEl.disabled = false;
   }
 }
