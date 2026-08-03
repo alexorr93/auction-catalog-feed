@@ -2005,7 +2005,7 @@ async def api_backfill_locations():
     return status_row
 
 @app.get("/api/updates-to-make")
-async def api_updates_to_make():
+def api_updates_to_make():
     """Powers the 'Updates to Make' box -- unresolved new catalogs and
     reactivated (was-blank, now-has-content) catalogs, newest flagged first."""
     supabase_client, business_id = _require_config()
@@ -2016,14 +2016,14 @@ async def api_updates_to_make():
 
 
 @app.get("/api/catalogs")
-async def api_catalogs():
+def api_catalogs():
     supabase_client, business_id = _require_config()
     rows = _fetch_all_paginated(lambda: supabase_client.table("auction_catalogs").select("*").eq("business_id", business_id))
     return {"catalogs": rows}
 
 
 @app.get("/api/lots")
-async def api_lots(catalog_url: str = None):
+def api_lots(catalog_url: str = None):
     supabase_client, business_id = _require_config()
     def build_query():
         q = supabase_client.table("bidspotter_catalog_lots").select("*").eq("business_id", business_id)
@@ -2034,7 +2034,7 @@ async def api_lots(catalog_url: str = None):
     return {"lots": rows}
 
 @app.get("/api/bright-lots")
-async def api_bright_lots(catalog_url: str = None):
+def api_bright_lots(catalog_url: str = None):
     """Purely the automated Bright Data pull's own data -- a separate view
     so it can be compared directly against the VA's manually-uploaded
     bidspotter_catalog_lots data above, without the two ever mixing."""
@@ -2399,7 +2399,7 @@ async def upload_zip(request: Request):
 
 
 @app.get("/api/pdf-uploads")
-async def api_pdf_uploads():
+def api_pdf_uploads():
     supabase_client, business_id = _require_config()
     uploads = _fetch_all_paginated(lambda: supabase_client.table("auction_pdf_uploads").select("*")
                                      .eq("business_id", business_id).order("uploaded_at", desc=True))
@@ -2407,7 +2407,7 @@ async def api_pdf_uploads():
 
 
 @app.get("/api/needs-update")
-async def api_needs_update():
+def api_needs_update():
     supabase_client, business_id = _require_config()
     all_uploads = _fetch_all_paginated(lambda: supabase_client.table("auction_pdf_uploads").select("*")
                                          .eq("business_id", business_id).order("uploaded_at", desc=True))
