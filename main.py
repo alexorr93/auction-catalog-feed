@@ -783,30 +783,33 @@ def _parse_bidspotter_listing_page_from_dom(html: str) -> list:
         card_text = ""  # reset per anchor -- a stale value from a previous anchor must never leak into this one's checks
         if title:
             node = a
-            for _ in range(6):  # small hop count -- stay within this one card, not a whole page/section
+            for _ in range(6):  # small hop count -- a real structural check below stops us well before this if needed
                 node = node.parent
                 if node is None:
                     break
+                # REAL BUG FIXED HERE (2nd time on this exact spot today):
+                # first we broke the climb too early (missed "Coming soon"
+                # living higher up). Then we removed the break entirely and
+                # always climbed all 6 levels -- which fixed that, but
+                # confirmed live it went too far the OTHER way: at the
+                # widest levels the ancestor can contain SEVERAL sibling
+                # catalog cards, and summing every "Label (N)" match across
+                # all of them produced category_count=2747 for a single
+                # catalog. Neither a fixed early break nor a fixed full
+                # climb is right -- the real boundary is structural: stop
+                # the instant an ancestor contains MORE than one real
+                # catalog anchor, since that means we've climbed past this
+                # card into its siblings. Use the last level that still
+                # contained exactly one.
+                sibling_catalog_links = [
+                    x for x in node.find_all("a", href=True)
+                    if "/auction-catalogues/" in x["href"] and "catalogue-id-" in x["href"] and "search-filter" not in x["href"]
+                ]
+                distinct_hrefs = {x["href"] for x in sibling_catalog_links}
+                if len(distinct_hrefs) > 1:
+                    break  # crossed into sibling cards -- card_text from the PREVIOUS level (still set) is the real boundary
                 card_text = node.get_text(" ", strip=True)
                 if title in card_text:
-                    # REAL BUG FIXED HERE: this used to `break` the instant
-                    # a date was found, which could truncate the climb
-                    # before ever reaching a WIDER ancestor where the
-                    # category tags or the "Cannot load data"/"Coming soon"
-                    # placeholder actually live. Confirmed live: the two
-                    # anchors on the same card (image-wrapper + title link,
-                    # see the dedup note above) start climbing from
-                    # different depths, so one anchor found its date early
-                    # and stopped climbing right there, missing "Coming
-                    # soon" entirely and failing open to category_count=1 --
-                    # while the OTHER anchor for the exact same catalog
-                    # climbed far enough to see "Coming soon" and correctly
-                    # read 0. Whichever got processed first won, so the
-                    # wrong one stuck. Now always climbs the full 6 levels
-                    # regardless of whether a date was already found --
-                    # climbing higher only ever adds MORE text, never loses
-                    # any, so every check below always sees the widest
-                    # available view of the card.
                     new_count = sum(int(n) for n in category_tag_pattern.findall(card_text))
                     if new_count > category_count:
                         category_count = new_count
