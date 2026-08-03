@@ -1010,8 +1010,45 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
                 new_count += 1
             except Exception as e:
                 print(f"BidSpotter scan: failed to queue new catalog {catalog_url}: {e}")
+
+        # BACKLOG CLEANUP: everything queued BEFORE this verify step existed
+        # (or from the brief bad deploy that skipped verification entirely)
+        # is still sitting in catalog_updates_queue unresolved, most of it
+        # genuinely blank. Same verify check, applied once to the existing
+        # backlog: confirmed-blank rows are DELETED (not resolved=True --
+        # resolved permanently excludes a catalog_url from ever being
+        # re-queued via known_urls above, which would hide it forever even
+        # after BidSpotter later posts real lots; deleting lets a future
+        # Job 1 run naturally rediscover and re-verify it fresh).
+        backlog_removed = 0
+        try:
+            backlog_rows = _fetch_all_paginated(lambda: supabase_client.table("catalog_updates_queue").select("id,catalog_url").eq("business_id", business_id).eq("resolved", False))
+        except Exception as e:
+            print(f"Job 1 backlog cleanup: failed to fetch existing queue rows: {e}")
+            backlog_rows = []
+        for i, row in enumerate(backlog_rows, 1):
+            catalog_url = row["catalog_url"]
+            _update_live_activity(supabase_client, business_id, f"Job 1: cleaning old queue backlog {i}/{len(backlog_rows)}")
+            real_url = _reconstruct_full_url(catalog_url)
+            if not real_url:
+                continue
+            try:
+                resp = await _brightdata_get(verify_client, real_url)
+                if resp.status_code != 200:
+                    continue  # can't confirm either way -- leave it, don't remove on a failed check
+                category_count = len(re.findall(r'search-filter\?CategoryCode=', resp.text))
+            except Exception as e:
+                print(f"Job 1 backlog cleanup: verify fetch failed for {catalog_url} (leaving it, not removing on a flaky check): {type(e).__name__}: {e}")
+                continue
+            if category_count == 0:
+                try:
+                    supabase_client.table("catalog_updates_queue").delete().eq("id", row["id"]).execute()
+                    backlog_removed += 1
+                except Exception as e:
+                    print(f"Job 1 backlog cleanup: failed to delete confirmed-blank row {catalog_url}: {e}")
+
     return {"ok": True, "error": None, "pages": pages_fetched, "listings": len(all_listings),
-            "new_flagged": new_count, "skipped_no_lots_yet": skipped_no_lots_yet}
+            "new_flagged": new_count, "skipped_no_lots_yet": skipped_no_lots_yet, "backlog_removed": backlog_removed}
 
 async def _recheck_blank_catalogs(supabase_client, business_id: str) -> dict:
     """Job 2. For every catalog we already know about that's currently
