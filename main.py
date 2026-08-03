@@ -789,111 +789,116 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
     exactly as a human's browser would, and reads the real rendered DOM --
     the same class of result the user's own screenshot showed, not a raw
     data blob of unknown fidelity to the filter."""
-    from playwright.async_api import async_playwright
+    from playwright.sync_api import sync_playwright
     wss_url = os.environ.get("BRIGHT_DATA_BROWSER_WSS")
     if not wss_url:
         return {"ok": False, "error": "BRIGHT_DATA_BROWSER_WSS not set", "pages": 0, "listings": 0, "new_flagged": 0}
 
-    all_listings = {}
-    pages_fetched = 0
-    first_page_error = None
-    first_page_diagnostic = None
-
-    try:
-        async with async_playwright() as pw:
-            # CONFIRMED live tonight: a bare connect_over_cdp(timeout=120000)
-            # can hang silently past its own stated timeout -- Playwright's
-            # timeout= isn't reliably honored against a truly dead low-level
-            # socket, the same failure class already fixed elsewhere
-            # tonight (_brightdata_get, the lot-pull) with an explicit outer
-            # asyncio.wait_for + fresh-connection-per-attempt retry. Job 1's
-            # rebuild was missing that same protection -- adding it now.
+    def _sync_scan_work():
+        """Runs entirely SYNCHRONOUSLY in a real OS thread (via
+        run_in_executor below), using Playwright's SYNC api, not async.
+        CONFIRMED live tonight: wrapping the ASYNC connect_over_cdp call in
+        asyncio.wait_for did NOT stop a real hang -- watched it sit past its
+        own 90s timeout with zero effect, meaning the hang wasn't yielding
+        control back to the event loop for asyncio's cooperative
+        cancellation to ever take hold. This is a genuinely different fix,
+        not a bigger version of the same one: a real OS thread's blocked
+        call can simply be ABANDONED by the caller (matching the exact
+        pattern already proven in production for the zip-batch watchdog --
+        see _process_zip_batch) without needing the blocked code to
+        cooperate with cancellation at all."""
+        result = {"all_listings": {}, "pages_fetched": 0, "first_page_error": None, "first_page_diagnostic": None}
+        with sync_playwright() as pw:
             browser = None
             connect_error = None
             for connect_attempt in range(1, 4):
                 try:
-                    browser = await asyncio.wait_for(
-                        pw.chromium.connect_over_cdp(wss_url, timeout=60000), timeout=90.0
-                    )
+                    browser = pw.chromium.connect_over_cdp(wss_url, timeout=60000)
                     connect_error = None
                     break
                 except Exception as e:
                     connect_error = e
-                    print(f"BidSpotter scan: connect_over_cdp attempt {connect_attempt}/3 failed/hung: {type(e).__name__}: {e}")
+                    print(f"BidSpotter scan: connect_over_cdp attempt {connect_attempt}/3 failed: {type(e).__name__}: {e}")
             if connect_error is not None:
-                return {"ok": False, "error": f"could not open a browser session after 3 attempts: {connect_error}",
-                        "pages": 0, "listings": 0, "new_flagged": 0}
+                result["first_page_error"] = f"could not open a browser session after 3 attempts: {connect_error}"
+                return result
             try:
-                page_obj = await browser.new_page()
+                page_obj = browser.new_page()
                 page_num = 1
                 empty_pages_in_a_row = 0
-                # Outer hard ceiling on the whole paging operation (not just
-                # the connect step) -- 20 minutes covers up to 60 pages at a
-                # generous per-page pace with real margin, and guarantees
-                # this can't hang forever even if some LATER page's goto()
-                # hits the same silent-hang class of failure.
-                async def _page_loop():
-                    nonlocal page_num, empty_pages_in_a_row, pages_fetched, first_page_error, first_page_diagnostic, all_listings
-                    while page_num <= 60 and empty_pages_in_a_row < 2:  # hard ceiling -- never loop forever on an unexpected layout change
-                        _update_live_activity(supabase_client, business_id, f"Job 1: fetching listing page {page_num}")
-                        url = f"https://www.bidspotter.com/en-us/auction-catalogues/search-filter?countryName=United%20States&page={page_num}"
+                while page_num <= 60 and empty_pages_in_a_row < 2:  # hard ceiling -- never loop forever on an unexpected layout change
+                    _update_live_activity(supabase_client, business_id, f"Job 1: fetching listing page {page_num}")
+                    url = f"https://www.bidspotter.com/en-us/auction-catalogues/search-filter?countryName=United%20States&page={page_num}"
+                    try:
+                        page_obj.goto(url, timeout=90000, wait_until="domcontentloaded")
+                        # Real proof the country-filtered results actually
+                        # rendered -- either a real catalog link shows up,
+                        # or the page settles on a genuine "no results"
+                        # state. Not a fixed sleep: waits for the actual
+                        # thing that matters, same principle proven
+                        # reliable in the lot-pull tonight.
                         try:
-                            await page_obj.goto(url, timeout=90000, wait_until="domcontentloaded")
-                            # Real proof the country-filtered results actually
-                            # rendered -- either a real catalog link shows up,
-                            # or the page settles on a genuine "no results"
-                            # state. Not a fixed sleep: waits for the actual
-                            # thing that matters, same principle proven
-                            # reliable in the lot-pull tonight.
-                            try:
-                                await page_obj.wait_for_function(
-                                    "document.querySelectorAll('a[href*=\"catalogue-id-\"]').length > 0"
-                                    " || document.body.innerText.toLowerCase().includes('no results')"
-                                    " || document.body.innerText.toLowerCase().includes('0 auctions')",
-                                    timeout=30000
-                                )
-                            except Exception:
-                                pass  # fall through -- still try to read whatever DOM state exists
-                            html = await page_obj.content()
-                        except Exception as e:
-                            err = f"page {page_num} fetch failed: {type(e).__name__}: {e}"
-                            print(f"BidSpotter scan: {err}")
-                            if page_num == 1:
-                                first_page_error = err
-                            break
-
-                        pages_fetched += 1
-                        listings = _parse_bidspotter_listing_page_from_dom(html)
+                            page_obj.wait_for_function(
+                                "document.querySelectorAll('a[href*=\"catalogue-id-\"]').length > 0"
+                                " || document.body.innerText.toLowerCase().includes('no results')"
+                                " || document.body.innerText.toLowerCase().includes('0 auctions')",
+                                timeout=30000
+                            )
+                        except Exception:
+                            pass  # fall through -- still try to read whatever DOM state exists
+                        html = page_obj.content()
+                    except Exception as e:
+                        err = f"page {page_num} fetch failed: {type(e).__name__}: {e}"
+                        print(f"BidSpotter scan: {err}")
                         if page_num == 1:
-                            marker_idx = html.find("catalogue-id-")
-                            snippet = re.sub(r'\s+', ' ', html[:400]).strip()
-                            if marker_idx >= 0:
-                                around = re.sub(r'\s+', ' ', html[max(0, marker_idx-150):marker_idx+150]).strip()
-                                marker_info = f"catalogue-id- FOUND at offset {marker_idx}, context=\"{around}\""
-                            else:
-                                marker_info = "catalogue-id- NOT found anywhere in the rendered DOM"
-                            first_page_diagnostic = f"page1 bytes={len(html)} | {marker_info} | snippet=\"{snippet}\""
-                        if not listings:
-                            empty_pages_in_a_row += 1
-                        else:
-                            empty_pages_in_a_row = 0
-                            for item in listings:
-                                all_listings[item["catalog_url"]] = item
-                        page_num += 1
+                            result["first_page_error"] = err
+                        break
 
-                try:
-                    await asyncio.wait_for(_page_loop(), timeout=20 * 60.0)
-                except asyncio.TimeoutError:
-                    print(f"BidSpotter scan: hit the 20-minute hard ceiling on the whole paging operation at page {page_num} -- stopping with whatever was collected so far ({len(all_listings)} listings)")
+                    result["pages_fetched"] += 1
+                    listings = _parse_bidspotter_listing_page_from_dom(html)
+                    if page_num == 1:
+                        marker_idx = html.find("catalogue-id-")
+                        snippet = re.sub(r'\s+', ' ', html[:400]).strip()
+                        if marker_idx >= 0:
+                            around = re.sub(r'\s+', ' ', html[max(0, marker_idx-150):marker_idx+150]).strip()
+                            marker_info = f"catalogue-id- FOUND at offset {marker_idx}, context=\"{around}\""
+                        else:
+                            marker_info = "catalogue-id- NOT found anywhere in the rendered DOM"
+                        result["first_page_diagnostic"] = f"page1 bytes={len(html)} | {marker_info} | snippet=\"{snippet}\""
+                    if not listings:
+                        empty_pages_in_a_row += 1
+                    else:
+                        empty_pages_in_a_row = 0
+                        for item in listings:
+                            result["all_listings"][item["catalog_url"]] = item
+                    page_num += 1
             finally:
                 try:
-                    await browser.close()
+                    browser.close()
                 except Exception:
                     pass
+        return result
+
+    try:
+        loop = asyncio.get_event_loop()
+        # The real hard timeout: this future comes from a genuine OS thread
+        # (run_in_executor), so asyncio.wait_for's cancellation here just
+        # means "stop waiting" -- it does NOT depend on the thread's blocked
+        # code cooperating, unlike wrapping an async coroutine directly.
+        scan_result = await asyncio.wait_for(loop.run_in_executor(None, _sync_scan_work), timeout=25 * 60.0)
+    except asyncio.TimeoutError:
+        err = "hit the 25-minute hard ceiling waiting for the scan thread -- abandoning it and reporting failure (the thread itself may still be stuck in the background, harmlessly)"
+        print(f"BidSpotter scan: {err}")
+        return {"ok": False, "error": err, "pages": 0, "listings": 0, "new_flagged": 0}
     except Exception as e:
         err = f"browser session failed: {type(e).__name__}: {e}"
         print(f"BidSpotter scan: {err}")
-        return {"ok": False, "error": err, "pages": pages_fetched, "listings": 0, "new_flagged": 0}
+        return {"ok": False, "error": err, "pages": 0, "listings": 0, "new_flagged": 0}
+
+    all_listings = scan_result["all_listings"]
+    pages_fetched = scan_result["pages_fetched"]
+    first_page_error = scan_result["first_page_error"]
+    first_page_diagnostic = scan_result["first_page_diagnostic"]
 
     if first_page_error:
         return {"ok": False, "error": first_page_error, "pages": pages_fetched, "listings": 0, "new_flagged": 0}
