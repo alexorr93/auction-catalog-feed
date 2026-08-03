@@ -100,6 +100,7 @@ a:hover { color: #93c5fd; }
 <script>
 let catalogs = [], lots = [], uploads = [], brightLots = [];
 let currentView = 'catalogs';
+let viewedCatalogUrls = new Set();  // persists across re-renders within this page session -- so "View on BidSpotter" clicks stay marked through the 20s auto-refresh, not just until the next poll wipes the table
 
 function setView(view) {
   currentView = view;
@@ -519,15 +520,19 @@ async function loadUpdatesToMake() {
     let html = `<table><thead><tr><th>Title</th><th>Status</th><th></th><th></th></tr></thead><tbody>`;
     for (const it of items) {
       const isBlank = !!it.blank_marked_at;
+      const isViewed = viewedCatalogUrls.has(it.catalog_url);
       const bidspotterUrl = reconstructBidspotterUrl(it.catalog_url);
-      const rowStyle = isBlank ? ' style="opacity:0.55;"' : '';
+      const styleParts = [];
+      if (isBlank) styleParts.push('opacity:0.55;');
+      if (isViewed) styleParts.push('background:rgba(248,113,113,0.15);');
+      const rowStyle = styleParts.length ? ` style="${styleParts.join('')}"` : '';
       const statusCell = isBlank
         ? `<span class="muted">🚫 Marked blank ${new Date(it.blank_marked_at).toLocaleDateString()}</span>`
         : `<span style="color:var(--accent);font-weight:700;">📋 Needs review</span>`;
       html += `<tr${rowStyle}>
         <td>${escapeHtml(it.title || it.catalog_url)}</td>
         <td>${statusCell}</td>
-        <td>${bidspotterUrl ? `<a href="${bidspotterUrl}" target="_blank" rel="noopener noreferrer">View on BidSpotter</a>` : ''}</td>
+        <td>${bidspotterUrl ? `<a href="${bidspotterUrl}" target="_blank" rel="noopener noreferrer" onclick="markRowViewed('${it.catalog_url.replace(/'/g, "\\'")}', this)">View on BidSpotter</a>` : ''}</td>
         <td style="white-space:nowrap;">
           <button class="btn" onclick="uploadForRow('${it.catalog_url.replace(/'/g, "\\'")}', this)">📄 Upload PDF</button>
           ${isBlank ? '' : `<button class="btn" style="margin-left:6px;" onclick="markBlank('${it.id}', this)">🚫 Mark Blank</button>`}
@@ -539,6 +544,15 @@ async function loadUpdatesToMake() {
   } catch(e) {
     el.innerHTML = `<div class="empty">Failed to load: ${e.message}</div>`;
   }
+}
+
+function markRowViewed(catalogUrl, linkEl) {
+  // Link opens in a new tab (target="_blank"), so this tab never
+  // navigates away -- safe to update the row's own color immediately
+  // instead of waiting for the next poll cycle to pick up viewedCatalogUrls.
+  viewedCatalogUrls.add(catalogUrl);
+  const row = linkEl.closest('tr');
+  if (row) row.style.background = 'rgba(248,113,113,0.15)';
 }
 
 async function markBlank(queueId, btnEl) {
