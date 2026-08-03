@@ -122,7 +122,7 @@ function renderCurrentView() {
 }
 
 function escapeHtml(s) {
-  return (s || '').toString().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  return (s || '').toString().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
 function titleAsLink(title, displayText) {
