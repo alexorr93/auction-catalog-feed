@@ -432,17 +432,28 @@ async function uploadPdfFile(file, catalogUrl, rowEl) {
     // row every 2.5s and updates both the line AND the table row live
     // until it reaches a real terminal state.
     if (data.log_id) {
+      // REAL BUG FIXED HERE: this used to fall through to a blanket
+      // loadAll() in the finally block below, which fired almost
+      // immediately (right after this initial "queued" response, NOT
+      // after Gemini actually finishes) -- that rebuilds the whole
+      // table from scratch, which ORPHANS this exact rowEl (replaced by
+      // a brand new <tr>). Every subsequent color update from
+      // pollUploadStatus was then silently writing to a detached,
+      // invisible node while the real visible row just sat there
+      // reverted to its base (or stale "viewed") look, appearing dead.
+      // pollUploadStatus now owns calling loadAll() itself, only once
+      // truly done -- nothing here reloads out from under it.
       pollUploadStatus(data.log_id, file.name, line, rowEl);
-    } else {
-      line.innerHTML = `${file.name} — queued, processing in the background now`;
+      startAutoRefresh();
+      return;
     }
+    line.innerHTML = `${file.name} — queued, processing in the background now`;
     startAutoRefresh();
   } catch(e) {
     line.textContent = `❌ ${file.name} — ${e.message}`;
     if (rowEl) setRowState(rowEl, 'error', 'FAILED');
-  } finally {
-    await loadAll();
   }
+  await loadAll();
 }
 
 function setRowState(rowEl, state, label) {
@@ -488,6 +499,10 @@ async function pollUploadStatus(logId, filename, lineEl, rowEl) {
         const rowLabels = {success: 'DONE ✅', partial: 'PARTIAL ⚠️', empty: 'EMPTY 🚫', error: 'FAILED ❌'};
         const rowState = (row.status === 'success' || row.status === 'partial') ? 'success' : 'error';
         setRowState(rowEl, rowState, rowLabels[row.status]);
+        // Let the final color actually be seen for a moment before the
+        // table rebuilds under it -- without this pause the reload could
+        // fire the instant the color changed, defeating the whole point.
+        await new Promise(res => setTimeout(res, 2000));
       }
       await loadAll();
       return;
@@ -564,7 +579,14 @@ async function loadUpdatesToMake() {
     let html = `<table><thead><tr><th>Title</th><th>Status</th><th></th><th></th></tr></thead><tbody>`;
     for (const it of items) {
       const isBlank = !!it.blank_marked_at;
-      const isViewed = viewedCatalogUrls.has(it.catalog_url);
+      // REAL BUG FIXED HERE: "viewed" is just a transient "I looked at
+      // this" marker -- "marked blank" is the VA's actual, definitive
+      // conclusion about the catalog. A row viewed earlier and THEN
+      // marked blank was showing both at once (dim grey blank styling
+      // with a red "VIEWING" badge still layered on top), which looked
+      // like the mark-blank never actually took. Blank now fully
+      // overrides viewed in the render.
+      const isViewed = !isBlank && viewedCatalogUrls.has(it.catalog_url);
       const bidspotterUrl = reconstructBidspotterUrl(it.catalog_url);
       const rowClass = isViewed ? ' class="row-viewed"' : '';
       const rowStyle = isBlank ? ' style="opacity:0.55;"' : '';
