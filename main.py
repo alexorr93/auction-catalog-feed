@@ -743,8 +743,23 @@ def _parse_bidspotter_listing_page_from_dom(html: str) -> list:
     confirmed live), not a partial miss. Now: track the best title seen so
     far PER catalog_url, so a later anchor with real text can fill in for
     an earlier title-less one instead of being blocked by it."""
+    # REAL BUG FIXED HERE: this parser never captured an end date at all --
+    # the returned listing dicts only ever had catalog_url/title/full_url,
+    # so every downstream `item.get("end_date")` came back None
+    # unconditionally. That's the actual reason 100% of queued rows show no
+    # date, not a flaky per-catalog extraction issue. BidSpotter's rendered
+    # card text includes the date directly (e.g. "Aug 13, 2026 10am ET" or
+    # "Ends from Aug 18, 2026 10am CT") -- pulled via a generic text regex
+    # over the anchor's nearest card-sized ancestor, same resilience
+    # tradeoff already used elsewhere in this codebase (e.g. current-bid
+    # scraping) since a bespoke CSS selector for this page isn't reliably
+    # known and is easy to silently break on a layout tweak.
+    date_pattern = re.compile(
+        r'((?:Ends\s+(?:today|from)\s+)?[A-Z][a-z]{2}\s+\d{1,2},\s*\d{4}'
+        r'(?:\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)\s*[A-Za-z]{2,3})?)'
+    )
     soup = BeautifulSoup(html, "html.parser")
-    best_by_url = {}  # catalog_url -> {"full_url":..., "title": "" or real text}
+    best_by_url = {}  # catalog_url -> {"full_url":..., "title": "" or real text, "end_date": ...}
     order = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
@@ -755,15 +770,32 @@ def _parse_bidspotter_listing_page_from_dom(html: str) -> list:
         full_url = href if href.startswith("http") else f"https://www.bidspotter.com{href}"
         catalog_url = _full_url_to_catalog_url(full_url)
         title = a.get_text(strip=True)
+        end_date = None
+        if title:
+            node = a
+            for _ in range(6):  # small hop count -- stay within this one card, not a whole page/section
+                node = node.parent
+                if node is None:
+                    break
+                card_text = node.get_text(" ", strip=True)
+                if title in card_text:
+                    m = date_pattern.search(card_text)
+                    if m:
+                        end_date = m.group(1).strip()
+                        break
         if catalog_url not in best_by_url:
-            best_by_url[catalog_url] = {"full_url": full_url, "title": title}
+            best_by_url[catalog_url] = {"full_url": full_url, "title": title, "end_date": end_date}
             order.append(catalog_url)
-        elif title and not best_by_url[catalog_url]["title"]:
-            # An earlier anchor for this same catalog had no text (the
-            # image-wrapper) -- this later one does, so use it.
-            best_by_url[catalog_url]["title"] = title
+        else:
+            if title and not best_by_url[catalog_url]["title"]:
+                # An earlier anchor for this same catalog had no text (the
+                # image-wrapper) -- this later one does, so use it.
+                best_by_url[catalog_url]["title"] = title
+            if end_date and not best_by_url[catalog_url]["end_date"]:
+                best_by_url[catalog_url]["end_date"] = end_date
     listings = [
-        {"catalog_url": u, "title": best_by_url[u]["title"], "full_url": best_by_url[u]["full_url"]}
+        {"catalog_url": u, "title": best_by_url[u]["title"], "full_url": best_by_url[u]["full_url"],
+         "end_date": best_by_url[u]["end_date"]}
         for u in order if best_by_url[u]["title"]  # still require SOME real title before including it
     ]
     return listings
@@ -969,6 +1001,22 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
     except Exception as e:
         print(f"BidSpotter scan: failed to fetch staged catalog_urls (non-fatal, continuing): {e}")
 
+    # REAL BUG FIXED HERE: a catalog already sitting UNRESOLVED in
+    # catalog_updates_queue (kind='new' or kind='blank') was never added to
+    # known_urls, so it kept showing up in `candidates` below on every
+    # subsequent Job 1 run and getting silently re-verified and overwritten
+    # a second time -- on top of the dedicated backlog-cleanup loop above
+    # that already owns re-checking blank rows. Two uncoordinated code
+    # paths writing the same row, each trusting a single fetch with no
+    # retry, is exactly how a correct kind='new' classification could get
+    # clobbered back to 'blank' (or vice versa) by one bad/blocked
+    # response. Each unresolved row now has exactly one owner: the backlog
+    # loop above. This loop only ever handles a catalog_url it has never
+    # seen before.
+    already_queued = await loop.run_in_executor(None, lambda: _fetch_all_paginated(lambda: supabase_client.table("catalog_updates_queue").select("catalog_url").eq("business_id", business_id).eq("resolved", False)))
+    for r in already_queued:
+        known_urls.add(r["catalog_url"])
+
     new_count = 0
     skipped_no_lots_yet = 0
     candidates = [(catalog_url, item) for catalog_url, item in all_listings.items() if catalog_url not in known_urls]
@@ -1068,6 +1116,17 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
                     resp = await _brightdata_get(verify_client, real_url)
                     if resp.status_code == 200:
                         category_count = len(re.findall(r'search-filter\?CategoryCode=', resp.text))
+                        # A WAF/bot-check interstitial can return a real 200
+                        # with placeholder content -- that would read as 0
+                        # categories and get confidently written as
+                        # "confirmed blank" for a catalog that actually has
+                        # real lots. Only trust a 0 when the page actually
+                        # mentions this catalog's own title (a real render);
+                        # otherwise treat it the same as a failed fetch.
+                        title_text = (item.get("title") or "").strip().lower()
+                        if category_count == 0 and title_text and title_text not in resp.text.lower():
+                            print(f"Job 1: verify fetch for {catalog_url} returned 0 categories but page doesn't mention its own title -- likely a blocked/placeholder page, not trusting the 0")
+                            category_count = 1  # fail open, same reasoning as a failed fetch below
                 except Exception as e:
                     print(f"Job 1: verify fetch failed for {catalog_url} (queuing anyway rather than losing it): {type(e).__name__}: {e}")
                     category_count = 1  # fail open -- don't silently drop a real new catalog over a flaky verify fetch
