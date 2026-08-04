@@ -447,7 +447,7 @@ async function loadSystemStatus() {
       const activityAt = new Date(d.activity_updated_at);
       const finishedCleanly = lastRunAt && d.last_success && Math.abs(lastRunAt - activityAt) < 90000;
       if (finishedCleanly) {
-        const nextRun = new Date(lastRunAt.getTime() + 12 * 60 * 60 * 1000);
+        const nextRun = new Date(lastRunAt.getTime() + 7 * 24 * 60 * 60 * 1000);
         const untilNext = Math.round((nextRun - Date.now()) / 1000);
         el.innerHTML = `✅ Job 1 finished successfully at ${lastRunAt.toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})}` +
           (untilNext > 0 ? ` — next run in ~${formatDuration(untilNext)}` : ` — next run due any moment`);
