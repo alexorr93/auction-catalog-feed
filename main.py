@@ -19,7 +19,7 @@ import uuid
 import asyncio
 import concurrent.futures
 from typing import Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import fitz  # PyMuPDF
 from fastapi import FastAPI, Request, HTTPException
@@ -1803,18 +1803,33 @@ async def _pull_lots_for_queued_catalogs(supabase_client, business_id: str) -> d
         pass
     return {"attempted": attempted, "succeeded": succeeded, "total_lots_written": total_lots_written}
 
-async def _daily_bidspotter_scan_loop():
-    """Runs once at startup (after a short delay so the app is fully up
-    first), then once every 12 hours after that, for every business_id that
-    has ever used this app. No manual trigger needed for normal operation --
-    /api/updates/trigger-scan exists purely for on-demand debugging.
+def _seconds_until_next_friday(hour_utc: int = 13) -> float:
+    """Seconds from now until the next Friday at hour_utc:00 UTC. 13:00 UTC
+    is ~6-7am Mountain time depending on DST -- a reasonable default
+    Friday-morning run time; change hour_utc if a different time is
+    wanted. If it's already Friday and before that hour today, targets
+    today instead of a week out."""
+    now = datetime.now(timezone.utc)
+    days_until_friday = (4 - now.weekday()) % 7  # Monday=0 ... Friday=4
+    target = (now + timedelta(days=days_until_friday)).replace(hour=hour_utc, minute=0, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=7)
+    return (target - now).total_seconds()
 
-    PAUSE_SCAN=1 skips this entirely -- added during the Supabase Disk IO
-    Budget incident so the background jobs can be fully silenced (zero
-    further database load) while the budget recovers, without needing a
-    code change/redeploy each time. Checked every cycle, not just once at
-    startup, so flipping it off takes effect on the very next 12h tick too."""
-    await asyncio.sleep(30)
+
+async def _daily_bidspotter_scan_loop():
+    """Runs once a week, Fridays at ~13:00 UTC (see
+    _seconds_until_next_friday), for every business_id that has ever used
+    this app. Per direct instruction: was every 12 hours, now weekly.
+    Manual runs remain available separately -- /api/updates/trigger-scan
+    for on-demand debugging, and the password-protected admin recalc
+    button on the page itself.
+
+    PAUSE_SCAN=1 skips a cycle entirely -- added during the Supabase Disk
+    IO Budget incident so the background job can be fully silenced (zero
+    further database load) without needing a code change/redeploy.
+    Checked at the top of every cycle, not just once at startup."""
+    await asyncio.sleep(_seconds_until_next_friday())
     while True:
         if os.environ.get("PAUSE_SCAN") == "1":
             print("PAUSE_SCAN=1 -- skipping this cycle entirely (no DB/BidSpotter activity)")
@@ -1829,8 +1844,8 @@ async def _daily_bidspotter_scan_loop():
                         break
                     await _run_bidspotter_scan_for_business(supabase_client, business_id)
             except Exception as e:
-                print(f"BidSpotter daily scan loop failed: {e}")
-        await asyncio.sleep(12 * 60 * 60)
+                print(f"BidSpotter weekly scan loop failed: {e}")
+        await asyncio.sleep(7 * 24 * 60 * 60)  # exactly 7 days until the next Friday run
 
 def _scan_for_count(html: str, label: str) -> None:
     for pattern_name, pattern in [
