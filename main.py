@@ -1346,43 +1346,39 @@ def _reconstruct_full_url(catalog_url: str) -> Optional[str]:
     return f"https://{m.group(1)}/en-us/auction-catalogues/{m.group(2)}/{m.group(3)}"
 
 async def _run_bidspotter_scan_for_business(supabase_client, business_id: str):
-    """Runs Job 1 (detect new/existing catalogs), then IMMEDIATELY pulls real
-    lot data for anything newly queued (the actual point of this whole
-    pipeline), THEN runs Job 2 (recheck blanks + growth detection) -- Job 2
-    doesn't need to happen before the lot-pull, and was previously blocking
-    it for no real reason. Writes the outcome into bidspotter_scan_status --
-    so what actually happened is checkable via a normal query, not lost in
-    server logs nobody can reach.
+    """JOB 1 ONLY, permanently -- per direct instruction. Job 2 (blank
+    recheck) and Job 3 (auto lot-pull) are REMOVED from this pipeline
+    entirely, not paused: both were automated Bright Data consumers that
+    directly contradicted the whole point of the VA review queue built
+    today (real Bright Data usage, real cost, running for hours in the
+    background without the person watching realizing it) -- and Job 2
+    was found actively running (rechecking catalog 81/93) well after
+    the VA workflow was supposed to have fully replaced that need. This
+    function now does exactly one thing: the discovery scan, so
+    catalog_updates_queue gets populated for the VA and nothing else
+    ever touches Bright Data on its own.
 
-    Set SKIP_JOB1=1 as a Railway variable to skip straight to the lot-pull
-    using whatever's already queued -- avoids re-running the ~10-page
-    listing scan on every single restart during active debugging."""
+    Set SKIP_JOB1=1 as a Railway variable to skip the scan for a given
+    restart (rarely needed now that there's nothing after it to skip
+    to)."""
     if os.environ.get("SKIP_JOB1") == "1":
-        print(f"SKIP_JOB1 is set -- skipping Job 1, going straight to the lot-pull for {business_id}")
+        print(f"SKIP_JOB1 is set -- skipping Job 1 for {business_id}")
         scan_result = {"ok": True, "error": None, "pages": 0, "listings": 0, "new_flagged": 0}
     else:
         scan_result = await _scan_bidspotter_new_catalogs(supabase_client, business_id)
-    lot_pull_result = await _pull_lots_for_queued_catalogs(supabase_client, business_id)
-    print(f"BidSpotter lot pull for {business_id}: {lot_pull_result}")
-    recheck_result = await _recheck_blank_catalogs(supabase_client, business_id)
-    error_parts = []
-    if not scan_result["ok"]:
-        error_parts.append(f"New-catalog scan: {scan_result['error']}")
-    if recheck_result["first_error"]:
-        error_parts.append(f"Blank-catalog recheck: {recheck_result['first_error']}")
     status_row = {
         "business_id": business_id,
         "last_run_at": datetime.now(timezone.utc).isoformat(),
         "last_success": scan_result["ok"],
-        "last_error": " | ".join(error_parts) if error_parts else None,
+        "last_error": scan_result["error"],
         "pages_scanned": scan_result["pages"],
         "listings_found": scan_result["listings"],
         "new_flagged": scan_result["new_flagged"],
-        "reactivated_flagged": recheck_result["reactivated"],
-        "growing_flagged": recheck_result["growing"],
+        "reactivated_flagged": 0,
+        "growing_flagged": 0,
     }
     supabase_client.table("bidspotter_scan_status").upsert(status_row, on_conflict="business_id").execute()
-    print(f"BidSpotter scan for {business_id}: {status_row}")
+    print(f"BidSpotter scan (Job 1 only) for {business_id}: {status_row}")
     _invalidate_cache(f"catalogs:{business_id}")
     _invalidate_cache(f"lots:{business_id}")
     _invalidate_cache(f"bright-lots:{business_id}")
