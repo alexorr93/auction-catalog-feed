@@ -2285,6 +2285,38 @@ def api_mark_blank(queue_id: str):
     return {"ok": True}
 
 
+@app.post("/api/admin/recalc-job1")
+async def api_recalc_job1(request: Request):
+    """Password-protected admin action: wipes the ENTIRE review queue for
+    this business, then runs ONLY Job 1 (the discovery scan) fresh --
+    deliberately never touches lot-pull or Job 2, calling
+    _scan_bidspotter_new_catalogs directly instead of going through
+    _run_bidspotter_scan_for_business (which chains all three). Exists
+    purely to verify Job 1's accuracy from a clean slate: with nothing
+    pre-existing to skip, every catalog it finds gets freshly evaluated
+    and inserted, so what comes back IS the real, current answer. Runs
+    as a background task -- the actual scan takes minutes, this returns
+    immediately."""
+    body = await request.json()
+    if (body.get("password") or "") != "claude666":
+        raise HTTPException(403, "wrong password")
+    supabase_client, business_id = _require_config()
+    deleted = supabase_client.table("catalog_updates_queue").delete().eq("business_id", business_id).execute()
+    deleted_count = len(deleted.data or [])
+    _invalidate_cache(f"updates-to-make:{business_id}")
+
+    async def _run_job1_only():
+        try:
+            result = await _scan_bidspotter_new_catalogs(supabase_client, business_id)
+            print(f"Job 1 ONLY recalc for {business_id}: {result}")
+        except Exception as e:
+            print(f"Job 1 ONLY recalc failed for {business_id}: {type(e).__name__}: {e}")
+        finally:
+            _invalidate_cache(f"updates-to-make:{business_id}")
+    asyncio.create_task(_run_job1_only())
+    return {"ok": True, "cleared": deleted_count, "started": True}
+
+
 @app.get("/api/catalogs")
 def api_catalogs():
     supabase_client, business_id = _require_config()

@@ -109,6 +109,10 @@ tr.row-blanking { background: rgba(148,163,184,0.25) !important; border-left: 4p
   <div id="bright-panel" style="display:none;"><div class="empty">Loading...</div></div>
 </div>
 
+<div style="margin-top:80px;padding-top:20px;border-top:1px solid var(--border);text-align:center;">
+  <button class="btn" style="opacity:0.4;font-size:11px;padding:5px 10px;" onclick="recalcJob1Only()">⚙️ Admin: Recalc Job 1 Only</button>
+</div>
+
 <script>
 let catalogs = [], lots = [], uploads = [], brightLots = [];
 let currentView = 'catalogs';
@@ -657,6 +661,23 @@ async function loadNeedsUpdateQueue() {
     renderNeedsUpdateTable();
   } catch(e) {
     el.innerHTML = `<div class="empty">Failed to load: ${e.message}</div>`;
+  }
+}
+
+async function recalcJob1Only() {
+  const pw = prompt('Admin password:');
+  if (pw === null) return;  // cancelled
+  if (!confirm('This clears the ENTIRE review queue and runs a fresh Job 1 scan from scratch. Already-marked-blank rows lose that status and will need re-checking. Continue?')) return;
+  try {
+    const r = await fetch('/api/admin/recalc-job1', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({password: pw}),
+    });
+    const data = await r.json();
+    if (!r.ok) { alert(data.detail || 'Failed'); return; }
+    alert(`Cleared ${data.cleared} row(s). Job 1 is now running fresh in the background -- reload in a bit to watch results come back in.`);
+    await loadAll();
+  } catch(e) {
+    alert('Request failed: ' + e.message);
   }
 }
 
