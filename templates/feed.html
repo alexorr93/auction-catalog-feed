@@ -433,10 +433,30 @@ async function loadSystemStatus() {
     const el = document.getElementById('status-scan');
     if (d.activity_updated_at) {
       const agoSec = Math.max(0, Math.round((Date.now() - new Date(d.activity_updated_at)) / 1000));
-      const stale = agoSec > 300;  // over 5 min with no update -- flag it rather than just saying "alive"
-      el.innerHTML = stale
-        ? `⚠️ Background scan: no update in ${formatDuration(agoSec)} (may be stuck) — last: ${escapeHtml(d.current_activity || '')}`
-        : `🟢 Background scan: ${escapeHtml(d.current_activity || 'idle')} (${formatDuration(agoSec)} ago)`;
+      // REAL FIX: this used to treat ANY silence over 5 minutes as "may be
+      // stuck" -- that made sense back when Job 1/2/3 ran continuously
+      // for potentially hours, but now that it's Job 1 only (finishes in
+      // a few minutes, then sits idle for ~12h until its next scheduled
+      // run), that same rule fired a false "stuck" warning almost the
+      // entire time the app was just working correctly. Now checks
+      // whether the last activity update WAS the completion of a
+      // successful run (last_run_at lands within ~90s of it) -- if so,
+      // that's normal idle time, not a stuck job, regardless of how long
+      // ago it was.
+      const lastRunAt = d.last_run_at ? new Date(d.last_run_at) : null;
+      const activityAt = new Date(d.activity_updated_at);
+      const finishedCleanly = lastRunAt && d.last_success && Math.abs(lastRunAt - activityAt) < 90000;
+      if (finishedCleanly) {
+        const nextRun = new Date(lastRunAt.getTime() + 12 * 60 * 60 * 1000);
+        const untilNext = Math.round((nextRun - Date.now()) / 1000);
+        el.innerHTML = `✅ Job 1 finished successfully at ${lastRunAt.toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})}` +
+          (untilNext > 0 ? ` — next run in ~${formatDuration(untilNext)}` : ` — next run due any moment`);
+      } else {
+        const stale = agoSec > 300;  // no update in 5+ min WHILE a run is actively in progress -- that's the real stuck signal
+        el.innerHTML = stale
+          ? `⚠️ Background scan: no update in ${formatDuration(agoSec)} (may be stuck) — last: ${escapeHtml(d.current_activity || '')}`
+          : `🟢 Background scan: ${escapeHtml(d.current_activity || 'idle')} (${formatDuration(agoSec)} ago)`;
+      }
     } else {
       el.textContent = 'Background scan: no activity recorded yet';
     }
