@@ -69,14 +69,23 @@ async def _start_pdf_worker():
 
 async def _recover_orphaned_uploads():
     """Runs once, ~10s after startup. Finds any upload stuck at
-    status='processing' with a real storage_path (meaning the file itself
-    survived, per _create_upload_record's durability fix) -- these are
-    uploads whose queued processing job was wiped by a container restart
-    before it ran. Downloads the file back from storage and re-queues it
-    for real, automatically. This is the recovery half of the durability
-    fix: the file being safe in storage only matters if something also
-    goes and finishes the job later, or it just sits there forever looking
-    like 'processing' with no path to actually resolve."""
+    status='processing' from BEFORE this boot -- these are uploads whose
+    queued processing job was wiped by a container restart before it ran.
+    Two cases, handled differently:
+    (1) storage_path is set -- the file itself survived (per
+        _create_upload_record's durability fix). Downloads it back from
+        storage and re-queues it for real, automatically. This is the
+        recovery half of the durability fix: the file being safe in
+        storage only matters if something also goes and finishes the job
+        later, or it just sits there forever looking like 'processing'
+        with no path to actually resolve.
+    (2) storage_path is null -- the file itself was never durably saved
+        (a storage failure, now rare but not impossible). REAL GAP FIXED
+        HERE: this case used to be silently skipped entirely, leaving the
+        row stuck at 'processing' forever with zero visible indication
+        anything was wrong -- confirmed live, two such rows sat invisibly
+        broken for 26+ hours and 3+ days. Now marked as a clear, visible
+        error immediately instead."""
     await asyncio.sleep(10)
     try:
         supabase_client, business_id, error = _get_supabase_and_business_id()
@@ -84,12 +93,25 @@ async def _recover_orphaned_uploads():
             return
         stuck = supabase_client.table("auction_pdf_uploads") \
             .select("id,filename,catalog_url,catalog_title,storage_path") \
-            .eq("business_id", business_id).eq("status", "processing") \
-            .not_.is_("storage_path", "null").execute().data or []
+            .eq("business_id", business_id).eq("status", "processing").execute().data or []
         if not stuck:
             return
-        print(f"[upload-recovery] found {len(stuck)} orphaned upload(s) from a prior container restart, re-queuing")
-        for row in stuck:
+        recoverable = [r for r in stuck if r.get("storage_path")]
+        unrecoverable = [r for r in stuck if not r.get("storage_path")]
+        if unrecoverable:
+            print(f"[upload-recovery] found {len(unrecoverable)} orphaned upload(s) with no recoverable file -- marking as error instead of leaving them silently stuck")
+            for row in unrecoverable:
+                try:
+                    supabase_client.table("auction_pdf_uploads").update({
+                        "status": "error",
+                        "error_message": "Interrupted by a server restart before the file could be archived to storage -- no recoverable copy exists. Please re-upload this catalog.",
+                    }).eq("id", row["id"]).execute()
+                except Exception as e:
+                    print(f"[upload-recovery] failed to mark {row['filename']} as error: {e}")
+        if not recoverable:
+            return
+        print(f"[upload-recovery] found {len(recoverable)} orphaned upload(s) from a prior container restart, re-queuing")
+        for row in recoverable:
             try:
                 file_bytes = supabase_client.storage.from_("auction-pdfs").download(row["storage_path"])
             except Exception as e:
@@ -2387,28 +2409,38 @@ def _create_upload_record(supabase_client, business_id: str, filename: str, cont
     log_id = log_res.data[0]["id"] if log_res.data else None
 
     storage_path = None
-    try:
-        storage_path = f"{catalog_key}.pdf"
-        supabase_client.storage.from_("auction-pdfs").upload(
-            path=storage_path, file=contents,
-            file_options={"content-type": "application/pdf", "upsert": "true"}
-        )
-        if log_id:
-            supabase_client.table("auction_pdf_uploads").update({"storage_path": storage_path}).eq("id", log_id).execute()
-    except Exception as e:
+    storage_error = None
+    for attempt in range(2):  # one retry -- a transient blip shouldn't be the difference between a recoverable and unrecoverable upload
+        try:
+            storage_path = f"{catalog_key}.pdf"
+            supabase_client.storage.from_("auction-pdfs").upload(
+                path=storage_path, file=contents,
+                file_options={"content-type": "application/pdf", "upsert": "true"}
+            )
+            if log_id:
+                supabase_client.table("auction_pdf_uploads").update({"storage_path": storage_path}).eq("id", log_id).execute()
+            storage_error = None
+            break
+        except Exception as e:
+            storage_error = e
+            storage_path = None
+            if attempt == 0:
+                time.sleep(1.5)
+    if storage_error is not None:
         # Real bug this caught before: the "auction-pdfs" bucket never
         # actually existed, so every single upload silently failed here for
         # this app's entire lifetime -- nothing ever got archived, and the
         # only trace was a print() statement nobody was watching. Now also
         # written into the upload log itself so a storage failure is
         # actually visible somewhere a human will see it, instead of only
-        # existing in Railway's console output.
-        print(f"PDF storage warning (upload still proceeds): {e}")
+        # existing in Railway's console output. Retried once above first --
+        # this only fires if BOTH attempts failed.
+        print(f"PDF storage warning (upload still proceeds, both attempts failed): {storage_error}")
         storage_path = None
         if log_id:
             try:
                 supabase_client.table("auction_pdf_uploads").update({
-                    "storage_warning": f"PDF was not archived to storage: {e}"[:500],
+                    "storage_warning": f"PDF was not archived to storage after 2 attempts: {storage_error}"[:500],
                 }).eq("id", log_id).execute()
             except Exception:
                 pass  # never let a logging failure break the actual upload
