@@ -342,10 +342,10 @@ Text:
 
 def _extract_catalog_metadata_via_gemini(raw_text: str, filename: str) -> dict:
     """Auction catalog PDFs almost always state their location and sale date
-    on the cover page/header -- pulls auctioneer/state/zip_code/end_date out
-    automatically so nobody has to type them in by hand. Only fills in
-    whichever fields the upload form left blank; a typed-in value always
-    wins."""
+    on the cover page/header -- pulls title/auctioneer/state/zip_code/
+    end_date out automatically so nobody has to type them in by hand. Only
+    fills in whichever fields the upload form left blank; a typed-in value
+    always wins."""
     import google.generativeai as genai
     gemini_key = os.getenv("GEMINI_API_KEY", "")
     if not gemini_key:
@@ -354,13 +354,15 @@ def _extract_catalog_metadata_via_gemini(raw_text: str, filename: str) -> dict:
     model = genai.GenerativeModel("gemini-2.5-flash")
     prompt = f"""This is raw text extracted from an auction catalog PDF named "{filename}".
 Find the auction's own details, usually stated on the cover page or in a header/footer:
-the auctioneer/company name running the sale, the US state the auction or item pickup
-location is in (2-letter abbreviation if possible, e.g. "CO"), the ZIP code of that
-location, and the auction's sale/closing date.
+the auction's own title/headline (e.g. "Surplus to the Ongoing Operations of XYZ Corp" or
+"2-Day Machine Shop Liquidation" -- the name of THIS SPECIFIC SALE, NOT the auctioneer
+company running it), the auctioneer/company name running the sale, the US state the
+auction or item pickup location is in (2-letter abbreviation if possible, e.g. "CO"),
+the ZIP code of that location, and the auction's sale/closing date.
 
 Return ONLY a JSON object, no other text, in this exact shape (use null for anything
 not found -- do not guess):
-{{"auctioneer": "..." or null, "state": "..." or null, "zip_code": "..." or null, "end_date": "..." or null}}
+{{"title": "..." or null, "auctioneer": "..." or null, "state": "..." or null, "zip_code": "..." or null, "end_date": "..." or null}}
 
 Text:
 {raw_text[:20000]}"""
@@ -451,18 +453,27 @@ def _upsert_catalog_summary(supabase_client, business_id: str, catalog_url: str,
 
 
 def _backfill_catalog_metadata(supabase_client, business_id: str, catalog_url: str, raw_text: str, filename: str,
-                                 state: str, zip_code: str, end_date: str) -> None:
+                                 state: str, zip_code: str, end_date: str, title: str = "") -> None:
     """Runs AFTER the upload response has already gone out, as a background
-    task -- keeps uploads fast. Fills in whichever of state/zip/date the
-    form left blank, a few seconds after the VA already sees 'success'.
+    task -- keeps uploads fast. Fills in whichever of title/state/zip/date
+    the form left blank, a few seconds after the VA already sees 'success'.
 
-    Real bug fixed here: this only ever updated bidspotter_catalog_lots (the
-    per-lot rows) -- it never touched auction_catalogs, which is the actual
-    summary row the Catalogs list displays (title/auctioneer/state/end date
-    columns). So an auto-extracted catalog (no form fields typed in, the
-    common case for zip-batch uploads) would show real lots but a blank
-    State/End Date forever, while anything with the fields typed in by hand
-    looked fine -- making it look like typed-in uploads worked and
+    REAL GAP FIXED HERE: this backfilled state/zip/end_date but never
+    title, even though Gemini already reads the whole PDF and the prompt
+    now explicitly asks for it too -- an upload through the per-row button
+    (which only ever sends catalog_url, never a title) always fell back to
+    the raw filename as the permanent title, e.g. a URL-shaped string
+    instead of the real auction name. Now backfills title the same way as
+    the other fields: only if the form left it blank, never overriding
+    something the VA actually typed in.
+
+    Earlier bug fixed here: this only ever updated bidspotter_catalog_lots
+    (the per-lot rows) -- it never touched auction_catalogs, which is the
+    actual summary row the Catalogs list displays (title/auctioneer/state/
+    end date columns). So an auto-extracted catalog (no form fields typed
+    in, the common case for zip-batch uploads) would show real lots but a
+    blank State/End Date forever, while anything with the fields typed in
+    by hand looked fine -- making it look like typed-in uploads worked and
     auto-extracted ones didn't, which is exactly what was happening."""
     try:
         auto_meta = _extract_catalog_metadata_via_gemini(raw_text, filename)
@@ -482,6 +493,9 @@ def _backfill_catalog_metadata(supabase_client, business_id: str, catalog_url: s
                 .eq("business_id", business_id).eq("catalog_url", catalog_url).execute()
 
         catalog_patch = {}
+        if not title and auto_meta.get("title"):
+            catalog_patch["title"] = auto_meta["title"]
+            catalog_patch["display_title"] = auto_meta["title"]
         if not state and auto_meta.get("state"):
             catalog_patch["state"] = auto_meta["state"]
         if not end_date and auto_meta.get("end_date"):
@@ -2621,7 +2635,7 @@ async def upload_pdf(request: Request):
                                    title, auctioneer, end_date, state, zip_code, existing_record=record)
         if result.get("needs_backfill") and result.get("raw_text"):
             _backfill_catalog_metadata(supabase_client, business_id, result["catalog_url"],
-                                        result["raw_text"], file.filename, state, zip_code, end_date)
+                                        result["raw_text"], file.filename, state, zip_code, end_date, title)
         _invalidate_cache(f"catalogs:{business_id}")
         _invalidate_cache(f"pdf-uploads:{business_id}")
         _invalidate_cache(f"needs-update:{business_id}")
