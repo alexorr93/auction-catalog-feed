@@ -51,6 +51,12 @@ tr.row-blanking { background: rgba(148,163,184,0.25) !important; border-left: 4p
   <h1>📋 Auction Catalog Feed</h1>
   <div class="sub">Public view of tracked auction catalogs and lots. Anyone with this link can see and add catalogs — no login required.</div>
 
+  <div id="system-status-bar" style="position:sticky;top:0;z-index:10;background:var(--card);border:1px solid var(--border);border-radius:10px;padding:10px 16px;margin-bottom:18px;font-size:13px;">
+    <span id="status-uploads">⏳ Checking status...</span>
+    <span style="color:var(--border);margin:0 10px;">|</span>
+    <span id="status-scan">⏳ Checking status...</span>
+  </div>
+
   <div style="display:flex;gap:10px;margin-bottom:18px;">
     <div style="flex:1;background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px 16px;">
       <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.03em;margin-bottom:4px;">📋 Catalogs Needing Review</div>
@@ -393,6 +399,52 @@ function startAutoRefresh() {
   }, 20000);
 }
 
+function formatDuration(seconds) {
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
+  return `${Math.round(seconds / 3600)}h`;
+}
+
+async function loadSystemStatus() {
+  // REAL FIX, per direct instruction: with a VA batch-uploading 25 files
+  // at once and the single-worker queue taking hours to work through
+  // them, there was no single place to just glance and confirm "yes,
+  // it's alive." Polls independently on its own fast 5s cycle (not tied
+  // to the main 20s table refresh) so this stays responsive even while
+  // scrolling a long list -- the bar is sticky/pinned so it's always in
+  // view regardless of scroll position.
+  try {
+    const r = await fetch('/api/pdf-queue-status');
+    const d = await r.json();
+    const el = document.getElementById('status-uploads');
+    if (d.processing_count > 0) {
+      const startedAgo = d.oldest_uploaded_at ? formatDuration(Math.max(0, Math.round((Date.now() - new Date(d.oldest_uploaded_at)) / 1000))) : null;
+      el.innerHTML = `<span class="spinner"></span><strong>${d.processing_count}</strong> upload(s) still processing — working on: ${escapeHtml(d.oldest_filename || '?')}${startedAgo ? ` (started ${startedAgo} ago)` : ''}`;
+    } else {
+      el.innerHTML = `✅ All uploads processed`;
+    }
+  } catch(e) {
+    document.getElementById('status-uploads').textContent = '⚠️ Could not check upload status';
+  }
+
+  try {
+    const r = await fetch('/api/scan-status');
+    const d = await r.json();
+    const el = document.getElementById('status-scan');
+    if (d.activity_updated_at) {
+      const agoSec = Math.max(0, Math.round((Date.now() - new Date(d.activity_updated_at)) / 1000));
+      const stale = agoSec > 300;  // over 5 min with no update -- flag it rather than just saying "alive"
+      el.innerHTML = stale
+        ? `⚠️ Background scan: no update in ${formatDuration(agoSec)} (may be stuck) — last: ${escapeHtml(d.current_activity || '')}`
+        : `🟢 Background scan: ${escapeHtml(d.current_activity || 'idle')} (${formatDuration(agoSec)} ago)`;
+    } else {
+      el.textContent = 'Background scan: no activity recorded yet';
+    }
+  } catch(e) {
+    document.getElementById('status-scan').textContent = '⚠️ Could not check scan status';
+  }
+}
+
 async function uploadPdfFile(file, catalogUrl, rowEl) {
   const statusEl = document.getElementById('pdf-upload-status');
   const line = document.createElement('div');
@@ -683,6 +735,8 @@ async function recalcJob1Only() {
 
 loadAll();
 startAutoRefresh();
+loadSystemStatus();
+setInterval(loadSystemStatus, 5000);
 </script>
 </body>
 </html>

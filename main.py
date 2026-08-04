@@ -2762,6 +2762,43 @@ def api_pdf_upload_status(log_id: str):
     return row
 
 
+@app.get("/api/pdf-queue-status")
+def api_pdf_queue_status():
+    """One persistent, always-fresh signal for 'is the whole upload
+    pipeline actually alive right now' -- separate from any single row's
+    status. Built for exactly this: a VA batch-uploading 25 files at once,
+    where the single-worker queue processes them one at a time and the
+    whole backlog can legitimately take hours. status='processing' is set
+    on EVERY queued file immediately at upload time (not just the one
+    actively running), so counting them gives a true 'how many are still
+    waiting to finish' number -- and since the worker processes strictly
+    oldest-first (a plain FIFO queue), the oldest still-processing row is
+    a reliable proxy for 'what it's actively working on right now'.
+    Deliberately uncached, deliberately cheap (one small query)."""
+    supabase_client, business_id = _require_config()
+    rows = (supabase_client.table("auction_pdf_uploads").select("filename,uploaded_at")
+            .eq("business_id", business_id).eq("status", "processing")
+            .order("uploaded_at", desc=False).execute().data or [])
+    return {
+        "processing_count": len(rows),
+        "oldest_filename": rows[0]["filename"] if rows else None,
+        "oldest_uploaded_at": rows[0]["uploaded_at"] if rows else None,
+    }
+
+
+@app.get("/api/scan-status")
+def api_scan_status():
+    """The background BidSpotter scan (Job 1/2/3) writes its own live
+    current_activity to the DB the whole time it runs, but nothing ever
+    exposed it to the page itself -- the only way to see it was querying
+    Supabase directly. Same 'is this actually alive' need as the upload
+    queue status above, just for the other background process."""
+    supabase_client, business_id = _require_config()
+    row = (supabase_client.table("bidspotter_scan_status").select("current_activity,activity_updated_at,last_run_at,last_success")
+           .eq("business_id", business_id).limit(1).execute().data or [None])[0]
+    return row or {}
+
+
 @app.get("/api/needs-update")
 def api_needs_update():
     supabase_client, business_id = _require_config()
