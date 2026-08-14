@@ -1182,7 +1182,7 @@ async def _scan_bidspotter_new_catalogs(supabase_client, business_id: str) -> di
             def _insert(catalog_url=catalog_url, item=item):
                 supabase_client.table("catalog_updates_queue").insert({
                     "business_id": business_id, "catalog_url": catalog_url, "title": item.get("title"),
-                    "end_date": item.get("end_date"), "resolved": False,
+                    "end_date": item.get("end_date"), "resolved": False, "kind": "new",
                 }).execute()
             await loop.run_in_executor(None, _insert)
             new_count += 1
