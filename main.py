@@ -208,6 +208,56 @@ def _require_config():
 # Monitor feature (auction-monitor-dev branch), same logic, same behavior.
 # ---------------------------------------------------------------------------
 
+# 10/13: switched catalog parsing from Gemini to ChatGPT (Gemini was the
+# source of the recurring Google Cloud bills -- ~20k lots/batch day). Key comes
+# from OPENAI_API_KEY env var, else the key saved on Lister's Settings page
+# (app_settings), same as the scanner. Plain httpx -- no new dependency.
+OPENAI_CATALOG_MODEL = os.getenv("OPENAI_CATALOG_MODEL", "gpt-5-mini")
+_openai_key_cache = None
+
+
+def _get_openai_key() -> str:
+    global _openai_key_cache
+    if _openai_key_cache:
+        return _openai_key_cache
+    k = os.getenv("OPENAI_API_KEY", "").strip()
+    if not k:
+        try:
+            sb, biz, err = _get_supabase_and_business_id()
+            if not err:
+                rows = (sb.table("app_settings").select("value")
+                        .eq("business_id", biz).eq("key", "OPENAI_API_KEY").execute().data or [])
+                k = ((rows[0].get("value") if rows else "") or "").strip()
+        except Exception as e:
+            print(f"Couldn't read OPENAI_API_KEY from app_settings: {e}")
+    _openai_key_cache = k or None
+    return k
+
+
+def _openai_text(prompt: str, timeout: int = 120) -> str:
+    """One ChatGPT call, returns the reply text. Raises on any error."""
+    import httpx as _hx
+    key = _get_openai_key()
+    if not key:
+        raise Exception("No OpenAI key -- set OPENAI_API_KEY on this service or save it in Lister Settings")
+    r = _hx.post(
+        "https://api.openai.com/v1/responses",
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        json={"model": OPENAI_CATALOG_MODEL, "input": prompt, "reasoning": {"effort": "minimal"}},
+        timeout=timeout,
+    )
+    if r.status_code != 200:
+        raise Exception(f"OpenAI {r.status_code}: {r.text[:300]}")
+    data = r.json()
+    out = []
+    for item in data.get("output", []) or []:
+        if item.get("type") == "message":
+            for c in item.get("content", []) or []:
+                if c.get("type") == "output_text":
+                    out.append(c.get("text", ""))
+    return "".join(out)
+
+
 def _extract_lots_via_gemini(raw_text: str, filename: str, on_chunk_lots=None) -> tuple:
     """Reads the actual catalog text and pulls out every lot directly --
     called whenever the fast regex pass didn't account for every single
@@ -245,12 +295,9 @@ def _extract_lots_via_gemini(raw_text: str, filename: str, on_chunk_lots=None) -
     anything went wrong. Now every failure's message is collected and
     handed back so the caller can tell the two apart and show the real
     reason instead of a misleading 'empty'."""
-    import google.generativeai as genai
-    gemini_key = os.getenv("GEMINI_API_KEY", "")
-    if not gemini_key:
-        return [], ["GEMINI_API_KEY is not set on this Railway service -- nothing can be extracted without it."]
-    genai.configure(api_key=gemini_key)
-    model = genai.GenerativeModel("gemini-2.5-flash")
+    # (name kept for callers; this now runs on ChatGPT, not Gemini)
+    if not _get_openai_key():
+        return [], ["No OpenAI key -- set OPENAI_API_KEY on this service or save it in Lister Settings."]
 
     # Real bug fixed here: 25,000 chars still packed 500+ lots into a single
     # chunk for a dense catalog (short descriptions, e.g. "1501\nTool box with
@@ -298,13 +345,15 @@ Text:
         last_error = None
         for attempt in range(3):
             try:
-                resp = model.generate_content(prompt, request_options={"timeout": 120})
-                text = resp.text.strip()
+                text = _openai_text(prompt, timeout=120).strip()
                 if text.startswith("```"):
                     text = text.split("```")[1]
                     if text.startswith("json"):
                         text = text[4:]
-                parsed = json.loads(text.strip())
+                text = text.strip()
+                if not text.startswith("[") and "[" in text:
+                    text = text[text.index("["):text.rindex("]") + 1]
+                parsed = json.loads(text)
                 chunk_lots = []
                 for r in parsed:
                     lot_number = str(r.get("lot_number", "")).strip()
@@ -326,12 +375,12 @@ Text:
                 last_error = e
                 if attempt < 2:
                     wait_s = 4 if attempt == 0 else 10
-                    print(f"Gemini call failed for {filename} chunk {chunk_i + 1}/{len(chunks)} "
+                    print(f"ChatGPT call failed for {filename} chunk {chunk_i + 1}/{len(chunks)} "
                           f"(attempt {attempt + 1}/3, retrying in {wait_s}s): {e}")
                     time.sleep(wait_s)
         if last_error is not None:
             err_msg = f"Chunk {chunk_i + 1}/{len(chunks)} (after 3 attempts): {str(last_error)[:300]}"
-            print(f"Gemini lot extraction failed for {filename} ({err_msg})")
+            print(f"ChatGPT lot extraction failed for {filename} ({err_msg})")
             errors.append(err_msg)
             # Keep going with whatever other chunks succeed, rather than
             # losing the whole catalog over one bad chunk
@@ -346,12 +395,8 @@ def _extract_catalog_metadata_via_gemini(raw_text: str, filename: str) -> dict:
     end_date out automatically so nobody has to type them in by hand. Only
     fills in whichever fields the upload form left blank; a typed-in value
     always wins."""
-    import google.generativeai as genai
-    gemini_key = os.getenv("GEMINI_API_KEY", "")
-    if not gemini_key:
+    if not _get_openai_key():
         return {}
-    genai.configure(api_key=gemini_key)
-    model = genai.GenerativeModel("gemini-2.5-flash")
     prompt = f"""This is raw text extracted from an auction catalog PDF named "{filename}".
 Find the auction's own details, usually stated on the cover page or in a header/footer:
 the auction's own title/headline (e.g. "Surplus to the Ongoing Operations of XYZ Corp" or
@@ -367,8 +412,7 @@ not found -- do not guess):
 Text:
 {raw_text[:20000]}"""
     try:
-        resp = model.generate_content(prompt, request_options={"timeout": 60})
-        text = resp.text.strip()
+        text = _openai_text(prompt, timeout=60).strip()
         if text.startswith("```"):
             text = text.split("```")[1]
             if text.startswith("json"):
@@ -376,7 +420,7 @@ Text:
         parsed = json.loads(text.strip())
         return {k: v for k, v in parsed.items() if v}
     except Exception as e:
-        print(f"Gemini catalog metadata extraction failed for {filename}: {e}")
+        print(f"ChatGPT catalog metadata extraction failed for {filename}: {e}")
         return {}
 
 
